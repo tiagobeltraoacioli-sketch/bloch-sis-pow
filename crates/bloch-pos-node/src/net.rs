@@ -3340,9 +3340,53 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    /// How long a page that must cross two real meshes is waited for. A bound
+    /// on a hang, not a performance expectation.
+    ///
+    /// The cases below push a 4 MiB page each way through a sealed session,
+    /// and in an unoptimised test build ChaCha20-Poly1305 is the whole cost:
+    /// about 1.5 s to seal and 1.5 s to open one page on an idle 16-core
+    /// machine, against about 0.05 s to read it off the socket. The four
+    /// tests that use this helper start together and the suite runs sixteen
+    /// tests at once, so a page that needs 3 s alone was measured at 6 s with
+    /// every core busy and at 10 to 11 s with the cores oversubscribed more
+    /// than twice, whole and equal each time. The 8 s this used to wait was
+    /// missed by those runs, by the same cases and in the same way with and
+    /// without the audit fixes of 2026-11-23: it measured the load of the
+    /// machine, not the mesh.
+    ///
+    /// A session that stalls still fails here: the test retries nothing, and
+    /// the page has to arrive, whole and equal, in both directions.
+    /// Production timeouts are not involved and are unchanged.
+    const SYNC_ARRIVAL_BOUND: Duration = Duration::from_secs(60);
+    /// The least time two meshes that must stay apart are watched.
+    const SYNC_SILENCE_FLOOR: Duration = Duration::from_secs(8);
+    /// The slowest page that did cross, in milliseconds, over every case run
+    /// so far in this process; see [`sync_silence_window`].
+    static SLOWEST_SYNC_ARRIVAL_MS: AtomicU64 = AtomicU64::new(0);
+
+    /// How long two meshes that must stay apart are watched: twice the
+    /// slowest page that has crossed in this process, and never less than
+    /// [`SYNC_SILENCE_FLOOR`] nor more than [`SYNC_ARRIVAL_BOUND`].
+    ///
+    /// "Nothing arrived" proves a refusal only if a page between two meshes
+    /// that had been let together would have arrived in that time. On a
+    /// loaded machine such a page takes longer than the fixed 8 s (see
+    /// [`SYNC_ARRIVAL_BOUND`]), and a fixed window would then pass whether
+    /// the session was refused or not. Every test that expects silence runs
+    /// a case that must deliver first, so the window follows the machine.
+    fn sync_silence_window() -> Duration {
+        sync_silence_window_after(Duration::from_millis(SLOWEST_SYNC_ARRIVAL_MS.load(Ordering::Relaxed)))
+    }
+
+    fn sync_silence_window_after(slowest_arrival: Duration) -> Duration {
+        slowest_arrival.saturating_mul(2).clamp(SYNC_SILENCE_FLOOR, SYNC_ARRIVAL_BOUND)
+    }
+
     /// Two real meshes, right dialling left, each holding one 4 MiB block and
     /// asking the other for it. True when both sides received the other's
-    /// page within the timeout.
+    /// page within [`SYNC_ARRIVAL_BOUND`]. For two meshes that must be let
+    /// together; [`kept_apart`] is the assertion for two that must not.
     fn sync_across(left: crate::mesh_pq::MeshSecurity, right: crate::mesh_pq::MeshSecurity, tag: &str) -> bool {
         sync_across_with(left, |_| right, tag)
     }
@@ -3354,6 +3398,47 @@ mod tests {
         right: impl FnOnce(&str) -> crate::mesh_pq::MeshSecurity,
         tag: &str,
     ) -> bool {
+        let (sides, took) = pages_cross(left, right, tag, SYNC_ARRIVAL_BOUND);
+        if sides == 2 {
+            SLOWEST_SYNC_ARRIVAL_MS.fetch_max(u64::try_from(took.as_millis()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        } else {
+            eprintln!("{tag}: {sides} of 2 pages crossed within {SYNC_ARRIVAL_BOUND:?}");
+        }
+        sides == 2
+    }
+
+    /// The same two meshes, which must NOT be let together. True when no
+    /// page crossed in either direction for the whole of
+    /// [`sync_silence_window`].
+    fn kept_apart(left: crate::mesh_pq::MeshSecurity, right: crate::mesh_pq::MeshSecurity, tag: &str) -> bool {
+        kept_apart_with(left, |_| right, tag)
+    }
+
+    /// [`kept_apart`], with the dialing side built from the address it dials.
+    fn kept_apart_with(
+        left: crate::mesh_pq::MeshSecurity,
+        right: impl FnOnce(&str) -> crate::mesh_pq::MeshSecurity,
+        tag: &str,
+    ) -> bool {
+        let window = sync_silence_window();
+        let (sides, took) = pages_cross(left, right, tag, window);
+        if sides != 0 {
+            eprintln!("{tag}: {sides} of 2 pages crossed within {took:?}, between two meshes that must stay apart (watched for {window:?})");
+        }
+        sides == 0
+    }
+
+    /// Start the two meshes of [`sync_across`] and wait at most `window`,
+    /// counted from the start of the dialing mesh, for each side to receive
+    /// the other's page. How many of the two sides did (a side that received
+    /// anything else first did not), and how long the wait lasted: until the
+    /// second page, or the whole window.
+    fn pages_cross(
+        left: crate::mesh_pq::MeshSecurity,
+        right: impl FnOnce(&str) -> crate::mesh_pq::MeshSecurity,
+        tag: &str,
+        window: Duration,
+    ) -> (usize, Duration) {
         let base = std::env::temp_dir().join(format!("bloch-mesh-pq-{tag}-{}-{}", std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         let left_dir = base.join("left");
@@ -3373,13 +3458,33 @@ mod tests {
         let right = right(&dialed);
         let right_mesh = start("127.0.0.1", 0, vec![dialed], right_tx, right_dir,
             Arc::new(AtomicU64::new(42)), QueueBudget::new(), Arc::new(right)).unwrap();
-        let delivered = [left_rx, right_rx].into_iter().all(|received| {
-            matches!(received.recv_timeout(Duration::from_secs(8)),
+        // One window for both directions. Both sides are always looked at:
+        // once the window is spent the second wait is a look at what is
+        // already there, so a page that crossed one way only is counted.
+        let started = Instant::now();
+        let sides = [left_rx, right_rx].into_iter().filter(|received| {
+            let left_of_window = window.saturating_sub(started.elapsed());
+            matches!(received.recv_timeout(left_of_window),
                 Ok(EngineEvent::Net(NetEvent::Block(actual, _))) if actual.body.transactions == block.body.transactions)
-        });
+        }).count();
+        let took = started.elapsed();
         drop((left_mesh, right_mesh, left_store, right_store));
         let _ = std::fs::remove_dir_all(base);
-        delivered
+        (sides, took)
+    }
+
+    /// The window two meshes that must stay apart are watched for is the
+    /// old fixed one on an idle machine and follows the slowest page that
+    /// did cross on a loaded one, up to the bound on a hang.
+    #[test]
+    fn the_silence_window_follows_the_slowest_page_that_crossed() {
+        let after = |ms| sync_silence_window_after(Duration::from_millis(ms));
+        assert_eq!(after(0), SYNC_SILENCE_FLOOR, "no page has crossed yet");
+        assert_eq!(after(3_000), SYNC_SILENCE_FLOOR, "an idle machine keeps the old window");
+        assert_eq!(after(10_500), Duration::from_secs(21), "a loaded machine is watched for twice its slowest page");
+        assert_eq!(after(45_000), SYNC_ARRIVAL_BOUND, "never past the bound on a hang");
+        assert_eq!(after(u64::MAX), SYNC_ARRIVAL_BOUND);
+        assert!(SYNC_SILENCE_FLOOR < SYNC_ARRIVAL_BOUND);
     }
 
     #[test]
@@ -3394,9 +3499,9 @@ mod tests {
         assert!(sync_across(pq(Mode::Offer), MeshSecurity::plain(), "offer-plain"));
         assert!(sync_across(MeshSecurity::plain(), pq(Mode::Offer), "plain-offer"));
         // `require` does not, in either direction, and neither does another network.
-        assert!(!sync_across(pq(Mode::Require), MeshSecurity::plain(), "req-plain"));
-        assert!(!sync_across(MeshSecurity::plain(), pq(Mode::Require), "plain-req"));
-        assert!(!sync_across(pq(Mode::Require), MeshSecurity::ephemeral(Mode::Require, [8; 32], None), "other-net"));
+        assert!(kept_apart(pq(Mode::Require), MeshSecurity::plain(), "req-plain"));
+        assert!(kept_apart(MeshSecurity::plain(), pq(Mode::Require), "plain-req"));
+        assert!(kept_apart(pq(Mode::Require), MeshSecurity::ephemeral(Mode::Require, [8; 32], None), "other-net"));
     }
 
     #[test]
@@ -3407,7 +3512,7 @@ mod tests {
         let gate = |allowed| MeshSecurity::ephemeral(Mode::Require, net, Some(std::collections::HashSet::from([allowed])));
         let member_id = member.identity_id().unwrap();
         assert!(sync_across(gate(member_id), member, "allow-member"));
-        assert!(!sync_across(gate(member_id), MeshSecurity::ephemeral(Mode::Require, net, None), "allow-stranger"));
+        assert!(kept_apart(gate(member_id), MeshSecurity::ephemeral(Mode::Require, net, None), "allow-stranger"));
     }
 
     #[test]
@@ -3431,10 +3536,10 @@ mod tests {
         // An exception for another address changes nothing here: refused in
         // both directions, and the refusals are counted.
         let refused = count(&NODE.mesh_plain_refused_total);
-        assert!(!sync_across(require().with_plain_allow_ip(elsewhere), MeshSecurity::plain(), "req-other-in"));
+        assert!(kept_apart(require().with_plain_allow_ip(elsewhere), MeshSecurity::plain(), "req-other-in"));
         assert!(count(&NODE.mesh_plain_refused_total) > refused);
         let refused = count(&NODE.mesh_plain_refused_total);
-        assert!(!sync_across(MeshSecurity::plain(), require().with_plain_allow_ip(elsewhere), "req-other-out"));
+        assert!(kept_apart(MeshSecurity::plain(), require().with_plain_allow_ip(elsewhere), "req-other-out"));
         assert!(count(&NODE.mesh_plain_refused_total) > refused);
 
         // Upgraded peers are sealed with an excepting node as with any other.
@@ -3569,11 +3674,11 @@ mod tests {
         let left_id = left.identity_id().unwrap();
         assert!(sync_across_with(left, |addr| pq(Mode::Require).with_pin(addr, left_id), "pin-match"));
         // The listener holds another key than the pinned one: no session.
-        assert!(!sync_across_with(pq(Mode::Require), |addr| pq(Mode::Require).with_pin(addr, [0x11; 32]), "pin-mismatch"));
+        assert!(kept_apart_with(pq(Mode::Require), |addr| pq(Mode::Require).with_pin(addr, [0x11; 32]), "pin-mismatch"));
         // `offer` falls back to plain for an unpinned legacy peer (asserted
         // in `mesh_security_modes_interoperate_as_documented`), but never
         // for a pinned one.
-        assert!(!sync_across_with(MeshSecurity::plain(), |addr| pq(Mode::Offer).with_pin(addr, [0x11; 32]), "pin-no-plain"));
+        assert!(kept_apart_with(MeshSecurity::plain(), |addr| pq(Mode::Offer).with_pin(addr, [0x11; 32]), "pin-no-plain"));
     }
 
     #[test]
