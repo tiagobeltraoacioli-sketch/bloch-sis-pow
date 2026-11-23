@@ -90,13 +90,104 @@ const CERT_CACHE: usize = 8;
 const REFUSAL_CACHE: usize = 256;
 
 /// Certificates assembled from the block log per wall slot, across all
-/// callers. Assembly reads up to two epochs of blocks on the consensus
+/// REMOTE callers. Assembly reads up to two epochs of blocks on the consensus
 /// thread and the method needs no authentication, so the work one slot can be
-/// made to do is bounded here. Cached answers and refusals decided before the
-/// first read are not counted. A light client at the head needs one assembly
-/// per epoch; a prover's follower catching up over the verifier's whole
-/// 256-epoch bound is served in 32 slots, retrying on [`rpc::NODE_UNAVAILABLE`].
-const CERT_BUILDS_PER_SLOT: u32 = 8;
+/// made to do is bounded here. Cached answers, refusals decided before the
+/// first read, and certificates whose two links are already held
+/// ([`LINKS_CACHE`]) are not counted. A light client at the head needs one
+/// assembly per epoch; a prover's follower catching up over the verifier's
+/// whole 256-epoch bound is served in 32 slots from the local share and in 64
+/// as one remote caller, retrying on [`rpc::NODE_UNAVAILABLE`].
+pub(super) const CERT_BUILDS_PER_SLOT: u32 = 8;
+
+/// One remote caller's share of [`CERT_BUILDS_PER_SLOT`] (audit L1N-03, red
+/// team W3-4). The budget used to be one counter for everybody, so the first
+/// eight uncached requests of a slot, from anyone, refused every other caller
+/// until the next slot. Half of the total: one address can no longer take it
+/// all, and a prover's follower reached over a private network still catches
+/// up at half the old rate.
+pub(super) const CERT_BUILDS_PER_SOURCE_PER_SLOT: u32 = 4;
+
+/// Assemblies per wall slot kept for local callers, which no remote caller
+/// can spend (audit L1N-03): an in-process call and an RPC client on the
+/// loopback address, which is where a prover's follower runs. Counted apart
+/// from [`CERT_BUILDS_PER_SLOT`], so the work one slot can be made to do is
+/// at most the sum of the two.
+pub(super) const CERT_LOCAL_BUILDS_PER_SLOT: u32 = 8;
+
+/// Link pairs kept, one per finalized epoch (audit L1N-03). The two vote
+/// scans are the whole cost of an assembly and depend on the epoch alone:
+/// not on the requested `block`, and not on the set source. A request naming
+/// a different `block` used to be a new, uncached assembly; it now reuses
+/// the links and reads only the ancestry headers it asks for. When full, the
+/// entry of the OLDEST epoch goes first, so requests cycling through old
+/// epochs never displace the newest ones, which is what clients at the head
+/// ask for.
+pub(super) const LINKS_CACHE: usize = 8;
+
+/// The expensive half of a certificate: the justifying source the votes
+/// chose and the two links, as scanned from the canonical block bodies.
+pub(super) struct CertLinks {
+    pub(super) source: (u64, [u8; 32]),
+    pub(super) links: [Link; 2],
+}
+
+/// The verification source of an RPC client on the loopback address.
+fn loopback_caller(source: &[u8; 32]) -> bool {
+    static LOOPBACK: std::sync::OnceLock<[[u8; 32]; 2]> = std::sync::OnceLock::new();
+    LOOPBACK
+        .get_or_init(|| {
+            [
+                crate::net::verification_source_for_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+                crate::net::verification_source_for_ip(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+            ]
+        })
+        .contains(source)
+}
+
+/// Who pays for assemblies in one wall slot; see [`CERT_BUILDS_PER_SLOT`].
+#[derive(Default)]
+pub(super) struct BuildShares {
+    slot: u64,
+    local: u32,
+    remote: u32,
+    /// Remote callers that assembled in `slot`. An entry is added only while
+    /// `remote` is below its ceiling, so the map holds at most that many.
+    by_source: BTreeMap<[u8; 32], u32>,
+}
+
+impl BuildShares {
+    /// Take one assembly of `slot` for `caller` (`None`: in-process), or say
+    /// which bound refused it. Every message says "per slot": the caller's
+    /// documented reaction is to retry in the next one.
+    pub(super) fn reserve(&mut self, slot: u64, caller: Option<[u8; 32]>) -> Result<(), String> {
+        if self.slot != slot {
+            *self = BuildShares { slot, ..BuildShares::default() };
+        }
+        let Some(source) = caller.filter(|source| !loopback_caller(source)) else {
+            if self.local >= CERT_LOCAL_BUILDS_PER_SLOT {
+                return Err(format!(
+                    "this node assembles at most {CERT_LOCAL_BUILDS_PER_SLOT} finality certificates per slot for local callers; retry in the next slot"
+                ));
+            }
+            self.local += 1;
+            return Ok(());
+        };
+        if self.by_source.get(&source).copied().unwrap_or(0) >= CERT_BUILDS_PER_SOURCE_PER_SLOT {
+            return Err(format!(
+                "this node assembles at most {CERT_BUILDS_PER_SOURCE_PER_SLOT} finality certificates per slot for one caller; retry in the next slot"
+            ));
+        }
+        if self.remote >= CERT_BUILDS_PER_SLOT {
+            return Err(format!(
+                "this node assembles at most {CERT_BUILDS_PER_SLOT} finality certificates per slot; retry in the next slot"
+            ));
+        }
+        self.remote += 1;
+        *self.by_source.entry(source).or_insert(0) += 1;
+        Ok(())
+    }
+}
 
 /// Most ancestry headers one certificate may carry.
 const MAX_ANCESTRY: usize = bloch_finality_cert::MAX_ANCESTRY;
@@ -121,13 +212,48 @@ pub(super) struct FinalityCertStore {
     /// (every block it was decided from is below the finality latch) and
     /// otherwise the head it was decided at, the only one it is replayed for.
     refused: VecDeque<((u64, Option<[u8; 32]>, Option<u64>), Option<[u8; 32]>, RpcError)>,
-    /// `(wall slot, assemblies started in it)`; see [`CERT_BUILDS_PER_SLOT`].
+    /// `(wall slot, assemblies started in it)` by every caller, local and
+    /// remote: the ceiling on the whole slot, whoever asked.
     pub(super) builds: (u64, u32),
+    /// The same assemblies by who asked for them (audit L1N-03).
+    pub(super) shares: BuildShares,
+    /// `((epoch, checkpoint root, next checkpoint root), links)`, ascending
+    /// by epoch; see [`LINKS_CACHE`]. The roots are part of the key, so a
+    /// reorg above the finalized checkpoint that changes the next epoch's
+    /// checkpoint never serves the links scanned on the old branch.
+    links: VecDeque<((u64, [u8; 32], [u8; 32]), Arc<CertLinks>)>,
     /// Set when the last assembly failed on a block read: a fault of this
     /// node's disk, not a property of the request, and so never remembered.
     read_failed: bool,
     /// Vote scans (one epoch of blocks read back each) since boot.
     pub(super) vote_scans: u64,
+}
+
+impl FinalityCertStore {
+    /// Keep `links` for `key`, ascending by epoch. Past [`LINKS_CACHE`] the
+    /// entry of the oldest epoch is dropped, also when it is the new one.
+    pub(super) fn remember_links(&mut self, key: (u64, [u8; 32], [u8; 32]), links: Arc<CertLinks>) {
+        // One entry per epoch: links scanned on a branch since reorged away
+        // are replaced, not kept beside the current ones.
+        self.links.retain(|(k, _)| k.0 != key.0);
+        let at = self.links.partition_point(|(k, _)| k.0 < key.0);
+        self.links.insert(at, (key, links));
+        while self.links.len() > LINKS_CACHE {
+            self.links.pop_front();
+        }
+    }
+
+    /// Drop the held link pairs, as a node that never assembled them.
+    #[cfg(test)]
+    pub(super) fn forget_links(&mut self) {
+        self.links.clear();
+    }
+
+    /// The epochs whose link pairs are held, ascending.
+    #[cfg(test)]
+    pub(super) fn held_link_epochs(&self) -> Vec<u64> {
+        self.links.iter().map(|(key, _)| key.0).collect()
+    }
 }
 
 impl Engine {
@@ -263,8 +389,12 @@ impl Engine {
         ))
     }
 
+    /// `caller` is the RPC client's verification source (`None` for an
+    /// in-process call). It decides only whose share of the per-slot
+    /// assembly budget an uncached request draws on.
     pub(super) fn finality_certificate(
         &mut self,
+        caller: Option<[u8; 32]>,
         epoch: Option<u64>,
         block: Option<[u8; 32]>,
         set_source_epoch: Option<u64>,
@@ -283,7 +413,7 @@ impl Engine {
         }
         let scans_before = self.finality_certs.vote_scans;
         self.finality_certs.read_failed = false;
-        let result = self.assemble_finality_certificate(e, finalized, block, set_source_epoch);
+        let result = self.assemble_finality_certificate(caller, e, finalized, block, set_source_epoch);
         if let Err(err) = &result {
             // Only a refusal that cost block reads is worth remembering, and
             // not the one that says "ask again shortly".
@@ -305,6 +435,7 @@ impl Engine {
 
     fn assemble_finality_certificate(
         &mut self,
+        caller: Option<[u8; 32]>,
         e: u64,
         finalized: u64,
         block: Option<[u8; 32]>,
@@ -385,51 +516,78 @@ impl Engine {
                 }
             }
         }
-        let slot = self.wall_slot();
-        if self.finality_certs.builds.0 != slot {
-            self.finality_certs.builds = (slot, 0);
-        }
-        if self.finality_certs.builds.1 >= CERT_BUILDS_PER_SLOT {
-            return Err(RpcError::unavailable(format!(
-                "this node assembles at most {CERT_BUILDS_PER_SLOT} finality certificates per slot; retry in the next slot"
-            )));
-        }
-        self.finality_certs.builds.1 += 1;
-
-        // Justifying link: the source with the most votes for (e, root).
-        self.finality_certs.vote_scans += 1;
-        let v_e = self.canonical_votes(e).inspect_err(|_| self.finality_certs.read_failed = true)?;
-        let mut by_source: BTreeMap<(u64, [u8; 32]), usize> = BTreeMap::new();
-        for (d, _) in v_e.values() {
-            if d.target_root == root && d.source_epoch < e {
-                *by_source.entry((d.source_epoch, d.source_root)).or_insert(0) += 1;
+        // Audit L1N-03: the two vote scans depend on the epoch alone. Links
+        // already held serve any `block` and any set source of that epoch
+        // with no block body read and no unit of the assembly budget.
+        let links_key = (e, root, next_root);
+        let held = self.finality_certs.links.iter().find(|(k, _)| *k == links_key).map(|(_, l)| Arc::clone(l));
+        let (source, src_epoch, key, links) = match held {
+            Some(held) => {
+                let src_epoch = set_source_epoch.unwrap_or(held.source.0);
+                if src_epoch >= e {
+                    return Err(RpcError::invalid_params("`set_source_epoch` must be before `epoch`"));
+                }
+                let key = (e, block, src_epoch);
+                if let Some((_, j)) = self.finality_certs.cache.iter().find(|(k, _)| *k == key) {
+                    return Ok(j.clone());
+                }
+                (held.source, src_epoch, key, held)
             }
-        }
-        let Some((&source, _)) = by_source.iter().max_by_key(|(k, n)| (**n, k.0)) else {
-            return Err(RpcError::new(
-                rpc::BLOCK_NOT_FOUND,
-                format!("no canonical votes justify epoch {e}; it is final only as an ancestor of a later checkpoint — ask for that one"),
-            ));
-        };
-        let src_epoch = set_source_epoch.unwrap_or(source.0);
-        if src_epoch >= e {
-            return Err(RpcError::invalid_params("`set_source_epoch` must be before `epoch`"));
-        }
-        let key = (e, block, src_epoch);
-        if let Some((_, j)) = self.finality_certs.cache.iter().find(|(k, _)| *k == key) {
-            return Ok(j.clone());
-        }
+            None => {
+                let slot = self.wall_slot();
+                if self.finality_certs.builds.0 != slot {
+                    self.finality_certs.builds = (slot, 0);
+                }
+                // The whole slot's ceiling first, whoever asked; then the
+                // caller's own share of it (audit L1N-03).
+                if self.finality_certs.builds.1 >= CERT_BUILDS_PER_SLOT + CERT_LOCAL_BUILDS_PER_SLOT {
+                    return Err(RpcError::unavailable(format!(
+                        "this node assembles at most {} finality certificates per slot; retry in the next slot",
+                        CERT_BUILDS_PER_SLOT + CERT_LOCAL_BUILDS_PER_SLOT
+                    )));
+                }
+                self.finality_certs.shares.reserve(slot, caller).map_err(RpcError::unavailable)?;
+                self.finality_certs.builds.1 += 1;
 
-        let l0 = Self::link_from(&v_e, source, (e, root));
-        self.finality_certs.vote_scans += 1;
-        let v_next = self.canonical_votes(e + 1).inspect_err(|_| self.finality_certs.read_failed = true)?;
-        let l1 = Self::link_from(&v_next, (e, root), (e + 1, next_root));
-        if l1.votes.is_empty() {
-            return Err(RpcError::new(
-                rpc::BLOCK_NOT_FOUND,
-                format!("epoch {e} was not finalized by the consecutive link {e}→{}; ask for a later finalized checkpoint", e + 1),
-            ));
-        }
+                // Justifying link: the source with the most votes for (e, root).
+                self.finality_certs.vote_scans += 1;
+                let v_e = self.canonical_votes(e).inspect_err(|_| self.finality_certs.read_failed = true)?;
+                let mut by_source: BTreeMap<(u64, [u8; 32]), usize> = BTreeMap::new();
+                for (d, _) in v_e.values() {
+                    if d.target_root == root && d.source_epoch < e {
+                        *by_source.entry((d.source_epoch, d.source_root)).or_insert(0) += 1;
+                    }
+                }
+                let Some((&source, _)) = by_source.iter().max_by_key(|(k, n)| (**n, k.0)) else {
+                    return Err(RpcError::new(
+                        rpc::BLOCK_NOT_FOUND,
+                        format!("no canonical votes justify epoch {e}; it is final only as an ancestor of a later checkpoint — ask for that one"),
+                    ));
+                };
+                let src_epoch = set_source_epoch.unwrap_or(source.0);
+                if src_epoch >= e {
+                    return Err(RpcError::invalid_params("`set_source_epoch` must be before `epoch`"));
+                }
+                let key = (e, block, src_epoch);
+                if let Some((_, j)) = self.finality_certs.cache.iter().find(|(k, _)| *k == key) {
+                    return Ok(j.clone());
+                }
+
+                let l0 = Self::link_from(&v_e, source, (e, root));
+                self.finality_certs.vote_scans += 1;
+                let v_next = self.canonical_votes(e + 1).inspect_err(|_| self.finality_certs.read_failed = true)?;
+                let l1 = Self::link_from(&v_next, (e, root), (e + 1, next_root));
+                if l1.votes.is_empty() {
+                    return Err(RpcError::new(
+                        rpc::BLOCK_NOT_FOUND,
+                        format!("epoch {e} was not finalized by the consecutive link {e}→{}; ask for a later finalized checkpoint", e + 1),
+                    ));
+                }
+                let links = Arc::new(CertLinks { source, links: [l0, l1] });
+                self.finality_certs.remember_links(links_key, Arc::clone(&links));
+                (source, src_epoch, key, links)
+            }
+        };
 
         let src_root = self.checkpoint_root(src_epoch);
         let registry = self
@@ -470,7 +628,7 @@ impl Engine {
             }
         }
 
-        let cert = Certificate { checkpoint_header, registry: (*registry).clone(), links: [l0, l1], ancestry };
+        let cert = Certificate { checkpoint_header, registry: (*registry).clone(), links: links.links.clone(), ancestry };
         let bytes = cert.encode();
         let reply = Json::Obj(vec![
             ("epoch".into(), Json::u(e)),
@@ -504,6 +662,7 @@ impl Engine {
     /// unchanged, apart from dropping votes its set source cannot judge.
     pub(super) fn lc_proof(
         &mut self,
+        caller: Option<[u8; 32]>,
         epoch: Option<u64>,
         set_source_epoch: Option<u64>,
         block: Option<[u8; 32]>,
@@ -513,7 +672,7 @@ impl Engine {
         if let Some((_, j)) = self.finality_certs.lc_cache.iter().find(|(k, _)| *k == key) {
             return Ok(j.clone());
         }
-        let reply = self.finality_certificate(Some(e), block, set_source_epoch)?;
+        let reply = self.finality_certificate(caller, Some(e), block, set_source_epoch)?;
         let field = |name: &str| reply.get(name).cloned().ok_or_else(|| RpcError::unavailable(format!("certificate reply has no `{name}`")));
         let cert_hex = field("certificate")?;
         let cert_bytes = cert_hex

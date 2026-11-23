@@ -2442,6 +2442,8 @@ mod verification;
 mod finality_cert;
 #[cfg(test)]
 mod finality_cert_tests;
+#[cfg(test)]
+mod finality_cert_share_tests;
 // Bloch Sentinel hooks: node-local, read-only, off by default.
 mod sentinel_hooks;
 
@@ -9694,10 +9696,12 @@ impl Engine {
             RpcRequest::TxStatus(txid) => Ok(rpc::tx_status_json(self.tx_status(&txid))),
 
             RpcRequest::FinalityCertificate { epoch, block, set_source_epoch } => {
-                self.finality_certificate(epoch, block, set_source_epoch)
+                self.finality_certificate(verification_source, epoch, block, set_source_epoch)
             }
 
-            RpcRequest::LcProof { epoch, set_source_epoch, block } => self.lc_proof(epoch, set_source_epoch, block),
+            RpcRequest::LcProof { epoch, set_source_epoch, block } => {
+                self.lc_proof(verification_source, epoch, set_source_epoch, block)
+            }
 
             // Bloch Sentinel (node-local). The RPC backend answers it before
             // the queue, where the caller's address is known; a request that
