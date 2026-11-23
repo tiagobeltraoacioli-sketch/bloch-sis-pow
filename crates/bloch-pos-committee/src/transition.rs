@@ -4354,10 +4354,15 @@ impl CommittedState {
         signature: &[u8],
         verifier: &dyn SignatureVerifier,
     ) -> Result<(), TxReject> {
+        // Read before the check: both are pure functions of this state.
+        let correction = self.kes_correction_open(validator);
         let public = self.check_kes_register(validator, depth, root, signature, verifier)?;
         // A rescue keeps the expired key in the history (review R-1), so
-        // evidence it signed stays provable.
+        // evidence it signed stays provable. A pre-bind correction (audit
+        // L1C-61) replaces a tree that never signed anything consensus
+        // accepts: the corrected entry is the new tree alone.
         let entry = match self.kes.get(&validator) {
+            Some(_) if correction => public.into(),
             Some(old) => old.replaced_by(public, crate::params::kes_period(self.epoch).unwrap_or(0)),
             None => public.into(),
         };
@@ -4398,7 +4403,24 @@ impl CommittedState {
             (true, Some(p)) => p.saturating_add(1),
             _ => 0,
         };
-        if let Some(entry) = self.kes.get(&validator) {
+        // Audit L1C-61, behind `KES_PREBIND_CORRECTION_ACTIVATION_EPOCH`
+        // (inert): the tree a pre-bind correction replaces. `None` on every
+        // other path, which is then exactly the code below as it was.
+        let corrected = self
+            .kes
+            .get(&validator)
+            .filter(|_| self.kes_correction_open(validator))
+            .map(|entry| entry.current);
+        if let Some(replaced) = corrected {
+            if replaced.root == *root {
+                return Err(TxReject::StakingRule);
+            }
+            start_period = crate::params::KES_CORRECTED_START_PERIOD;
+            // Never a tree that is already expired at inclusion.
+            if crate::kes::KesPublic::new(depth, *root, start_period).leaf_index(period.unwrap_or(0)).is_none() {
+                return Err(TxReject::StakingRule);
+            }
+        } else if let Some(entry) = self.kes.get(&validator) {
             // Registration is once-only, except as a RESCUE (readiness B3):
             // after KES binds, once the key in force has EXPIRED with no
             // successor pending, the static key may register a fresh tree,
@@ -4426,7 +4448,10 @@ impl CommittedState {
         // one captured from the chain cannot be rebroadcast into a later
         // rescue window once its tree has left the pruned history. Before the
         // flag day it is the legacy message, byte for byte.
-        let message = crate::kes::register_signing_root_at(&domain, validator, &public, self.epoch);
+        let message = match corrected {
+            Some(replaced) => crate::kes::correct_signing_root(&domain, validator, self.epoch, &replaced, &public),
+            None => crate::kes::register_signing_root_at(&domain, validator, &public, self.epoch),
+        };
         if !verifier.verify_with_key(&rec.pubkey, &message, signature) {
             return Err(TxReject::StakingRule);
         }
@@ -4536,6 +4561,27 @@ impl CommittedState {
         let bound = self.kes_enforced_from.is_some_and(|from| self.epoch >= from);
         let p = crate::params::kes_period(self.epoch).unwrap_or(0);
         bound && p >= entry.in_force(p).end_period() && entry.pending_at(p).is_none()
+    }
+
+    /// May `validator` CORRECT its registered tree with its static key now
+    /// (audit L1C-61, [`crate::params::KES_PREBIND_CORRECTION_ACTIVATION_EPOCH`])?
+    /// Only with the gate in force, while the bind is not yet decided, at
+    /// global period [`crate::params::KES_CORRECTED_START_PERIOD`] or later,
+    /// and for a first, uncorrected tree (start period 0, no successor, no
+    /// history): once per validator. The one rule `check_kes_register` and
+    /// the node's mempool dedupe share. Always false while the gate is
+    /// inert.
+    pub fn kes_correction_open(&self, validator: u32) -> bool {
+        if !crate::params::kes_prebind_correction_active(self.epoch) || self.kes_enforced_from.is_some() {
+            return false;
+        }
+        let Some(entry) = self.kes.get(&validator) else {
+            return false;
+        };
+        crate::params::kes_period(self.epoch).is_some_and(|p| p >= crate::params::KES_CORRECTED_START_PERIOD)
+            && entry.current.start_period == 0
+            && entry.next.is_none()
+            && entry.retired.is_empty()
     }
 
     /// The epoch KES enforcement bound on chain, if it has.

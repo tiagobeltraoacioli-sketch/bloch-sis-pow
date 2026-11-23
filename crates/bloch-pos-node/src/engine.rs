@@ -1485,6 +1485,99 @@ const SYNC_REWIND_BACKOFF_MAX_SHIFT: u32 = 5;
 /// cadences is 8 slots. See [`SyncRewindBackoff::causes`].
 const SYNC_REWIND_NEW_CAUSE_SHIFT: u32 = 2;
 
+/// Distinct proposers whose authenticated orphans must be parked at or above
+/// the head slot, together with a head more than one slot behind the wall
+/// clock, before this node treats its head as orphaned (audit L1C-60;
+/// [`Engine::orphaned_head_evidence`]).
+///
+/// One registered key can sign an orphan on a parent nobody has, at will,
+/// so one proposer is not evidence. Two distinct proposers building where
+/// this node cannot follow, while its own head has missed a slot, is what
+/// the 2026-11-19 freeze looked like from the second slot on. The number is
+/// deliberately not a stake threshold: stake would take tens of slots to
+/// accumulate, and every consequence of this evidence is bounded on its own:
+/// a rewind is still sent at most once per sync cadence to at most two
+/// peers, and the attestation hold is rationed
+/// ([`ORPHANED_HEAD_HOLD_MAX_SLOTS`]).
+const ORPHANED_HEAD_MIN_PROPOSERS: usize = 2;
+
+/// Wall slots of attestation hold one [`OrphanedHeadHold`] window allows.
+/// Eight slots is four sync cadences: with the head overlap and the targeted
+/// rewind a real repair takes one or two.
+const ORPHANED_HEAD_HOLD_MAX_SLOTS: u64 = 8;
+
+/// Length of one [`OrphanedHeadHold`] window in wall slots (two epochs).
+const ORPHANED_HEAD_HOLD_WINDOW_SLOTS: u64 = 2 * SLOTS_PER_EPOCH;
+
+/// Holds this validator's ATTESTATION while its head is known to be orphaned
+/// and the repair is pending (audit L1C-60).
+///
+/// On 2026-11-19 stranded validators kept voting on the orphaned head
+/// between two quarantine windows of [`DutySyncGate`]. At an epoch boundary
+/// that vote names a target the network does not have, is never included,
+/// and spends the slashing-protection watermark of the epoch, so the correct
+/// vote is refused once the node is repaired. While
+/// [`Engine::orphaned_head_evidence`] holds, the vote waits instead;
+/// `retry_missed_attestation` signs the duty after the repair, in the same
+/// epoch.
+///
+/// The hold is rationed, because the evidence can be manufactured: two
+/// registered keys can park authenticated orphans above any head, and an
+/// empty slot supplies the gap. At most [`ORPHANED_HEAD_HOLD_MAX_SLOTS`]
+/// wall slots are held per [`ORPHANED_HEAD_HOLD_WINDOW_SLOTS`]; after that
+/// the ordinary gates decide alone, exactly as before this type existed.
+/// Proposals are deliberately NOT held by it: a hold on block production,
+/// triggered on every node at once by forged evidence after an empty slot,
+/// would itself keep the head from moving. Only [`DutySyncGate`] (unchanged)
+/// blocks proposals.
+#[derive(Default)]
+struct OrphanedHeadHold {
+    /// First wall slot of the current rationing window.
+    window_start: Option<u64>,
+    /// Distinct wall slots held in the current window.
+    held_slots: u64,
+    /// The latest wall slot counted in `held_slots`.
+    last_held: Option<u64>,
+}
+
+impl OrphanedHeadHold {
+    /// Whether the attestation of `wall_slot` is held.
+    fn update(&mut self, evidence: bool, wall_slot: u64) -> bool {
+        if self.window_start.is_some_and(|start| {
+            wall_slot >= start.saturating_add(ORPHANED_HEAD_HOLD_WINDOW_SLOTS)
+        }) {
+            *self = Self::default();
+        }
+        if !evidence {
+            return false;
+        }
+        if self.last_held == Some(wall_slot) {
+            return true;
+        }
+        if self.held_slots >= ORPHANED_HEAD_HOLD_MAX_SLOTS {
+            return false;
+        }
+        self.window_start.get_or_insert(wall_slot);
+        self.held_slots = self.held_slots.saturating_add(1);
+        self.last_held = Some(wall_slot);
+        true
+    }
+}
+
+/// The cursor put on the wire for an engine-driven sync request (audit
+/// L1C-60). A rewind (`after_slot` below the head) is sent as it is; a
+/// head-forward request reaches [`net::SYNC_HEAD_OVERLAP_SLOTS`] below the
+/// head, like the transport's own timer-driven request, so that it can
+/// return a block of the network's branch at or just below this node's own
+/// head slot.
+fn sync_wire_cursor(after_slot: u64, head_slot: u64) -> u64 {
+    if after_slot < head_slot {
+        after_slot
+    } else {
+        after_slot.min(head_slot.saturating_sub(net::SYNC_HEAD_OVERLAP_SLOTS))
+    }
+}
+
 /// Node-local back-off for sync rewinds that yield nothing (P2P-6).
 ///
 /// A "rewind" is a `get_blocks` request whose cursor is below the applied
@@ -1532,6 +1625,13 @@ struct SyncRewindBackoff {
     causes: Vec<[u8; 32]>,
     /// Earliest time a new cause may again pass a back-off.
     new_cause_at_ms: u64,
+    /// Mesh connections that delivered the latest authenticated orphans,
+    /// most recent first, at most `net::SYNC_PREFERRED_PEERS` (audit
+    /// L1C-60). On the mesh a block is pushed by its proposer only, so the
+    /// connection an orphan arrived on is a peer that holds the orphan's
+    /// branch: the peer a rewind should be asked of, instead of the next two
+    /// in rotation, which on 2026-11-19 held the same orphaned head.
+    deliverers: VecDeque<u64>,
 }
 
 /// Distinct authenticated proposals retained per genesis validator duty.
@@ -2466,6 +2566,11 @@ mod reject_roots;
 pub(crate) use reject_roots::{parse_reject_block_root, ENV_REJECT_BLOCK_ROOTS};
 #[cfg(test)]
 mod side_branch_tests;
+#[cfg(test)]
+mod orphaned_head_tests;
+mod kes_local_check;
+#[cfg(test)]
+mod own_body_vote_tests;
 mod verification;
 mod finality_cert;
 #[cfg(test)]
@@ -3894,6 +3999,49 @@ impl Engine {
         );
     }
 
+    /// Votes of THIS key carried in the body of a block that just became
+    /// canonical (audit L1C-31).
+    ///
+    /// The gossip door and the block door's proposer check were the only
+    /// feeds of [`Self::note_own_signature`], so a vote of this key that
+    /// reached the node only inside a block (while it was catching up, when
+    /// the gossip copy was dropped or never routed here, or signed before
+    /// this node subscribed) was ignored even after the transition had
+    /// verified its signature: a second instance went unnoticed, and the
+    /// record still admitted a second vote for a target already signed.
+    ///
+    /// Called only after the transition accepted the whole block, so every
+    /// body vote is authentic: a forged vote makes the block invalid and
+    /// never reaches this. A vote the record covers is this node's own work
+    /// and does nothing. An uncovered one raises the record; when the node
+    /// is live it also stops duties (during boot replay it only raises the
+    /// record, which is what `SlashingProtection::settle_missing_history`
+    /// already documented).
+    ///
+    /// Deliberately NOT fed to [`Self::note_possible_doppelganger`]: that
+    /// check halts on any duty of this index dated inside the observation
+    /// window, covered or not. Gossip never hands a node its own vote back,
+    /// but a block does: a node restarted within the slot it voted in would
+    /// read its own vote in the next block and halt. An uncovered vote halts
+    /// through the record check above, inside the window and after it.
+    fn note_own_body_votes(&mut self, env: &BlockEnvelope) {
+        if self.keys.is_none() || env.body.attestations.is_empty() {
+            return;
+        }
+        let Some(my_index) = self.duty_index(&self.state) else { return };
+        let live = self.live;
+        let mine: Vec<crate::slashprot::Published> = env
+            .body
+            .attestations
+            .iter()
+            .filter(|att| att.validator == my_index)
+            .map(published_attestation)
+            .collect();
+        for seen in mine {
+            self.note_own_signature(my_index, seen, live);
+        }
+    }
+
     /// Rollback guard, runtime half (node-local). An authenticated signature
     /// of THIS key that the signing record does not cover means the record is
     /// stale (restored data dir) or another instance of the key is signing.
@@ -4573,6 +4721,54 @@ impl Engine {
         missing_before.saturating_sub(SLOTS_PER_EPOCH.saturating_mul(2)).max(floor)
     }
 
+    /// Whether this node has corroborated evidence that its head is orphaned
+    /// (audit L1C-60): the head is more than one slot behind `wall_slot`,
+    /// and at least [`ORPHANED_HEAD_MIN_PROPOSERS`] distinct proposers have
+    /// an authenticated orphan parked at or above the head slot, i.e. the
+    /// network is building where this node cannot follow. Node-local; read
+    /// by the rewind back-off and by [`OrphanedHeadHold`] only, never by
+    /// fork choice or block validity.
+    fn orphaned_head_evidence(&self, wall_slot: u64) -> bool {
+        let head = self.state.slot();
+        if head.saturating_add(1) >= wall_slot {
+            return false;
+        }
+        let mut proposers: Vec<u32> = Vec::with_capacity(ORPHANED_HEAD_MIN_PROPOSERS);
+        for (_, env, _, authentication, _) in &self.orphans {
+            if authentication.is_none() || env.header.slot < head {
+                continue;
+            }
+            if !proposers.contains(&env.header.proposer_index) {
+                proposers.push(env.header.proposer_index);
+                if proposers.len() >= ORPHANED_HEAD_MIN_PROPOSERS {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The block `id` was just judged; if it is now parked as an
+    /// authenticated orphan, remember the mesh connection that delivered it
+    /// ([`SyncRewindBackoff::deliverers`]).
+    fn note_orphan_deliverer(&mut self, id: &[u8; 32], connection: Option<u64>) {
+        let Some(connection) = connection else { return };
+        if !self.orphans.back().is_some_and(|(seen, _, _, authentication, _)| {
+            seen == id && authentication.is_some()
+        }) {
+            return;
+        }
+        let deliverers = &mut self.sync_rewind.deliverers;
+        deliverers.retain(|held| *held != connection);
+        deliverers.push_front(connection);
+        deliverers.truncate(net::SYNC_PREFERRED_PEERS);
+    }
+
+    /// The connections a rewind issued now should be asked of first.
+    fn sync_rewind_preferred_peers(&self) -> Vec<u64> {
+        self.sync_rewind.deliverers.iter().copied().collect()
+    }
+
     /// The cursor for the sync request being sent now, with rewinds that
     /// keep yielding nothing backed off. See [`SyncRewindBackoff`].
     fn sync_request_after_slot(&mut self, now_ms: u64, cadence_ms: u64) -> u64 {
@@ -4606,15 +4802,30 @@ impl Engine {
             && wanted >= self.sync_rewind.floor
             && now_ms < self.sync_rewind.retry_at_ms
         {
+            // Audit L1C-60: while the head is orphaned on corroborated
+            // evidence the rewind is not held back; the slot loop's own
+            // cadence (one request per two slots, two peers) is its bound.
+            // The back-off is evidence that the peers asked held nothing
+            // new; two distinct proposers building above a head that has
+            // missed a slot is evidence that some peer does, and each
+            // attempt is asked of the peers that delivered those blocks.
+            // Without that evidence the P2P-6 schedule is unchanged (8
+            // slots for a new cause, up to 64 for an unchanged one). Two
+            // keys and an empty slot can therefore buy a rewind per cadence
+            // only while the head stays behind; the next applied block ends
+            // it.
+            let orphaned_head = self.orphaned_head_evidence(self.wall_slot());
             let new_cause = now_ms >= self.sync_rewind.new_cause_at_ms
                 && causes.iter().any(|parent| !self.sync_rewind.causes.contains(parent));
-            if !new_cause {
+            if !orphaned_head && !new_cause {
                 // Held back, not forgotten: sync forward now, rewind later.
                 self.sync_rewind.deferred = true;
                 return head;
             }
-            self.sync_rewind.new_cause_at_ms = now_ms
-                .saturating_add(cadence_ms.saturating_mul(1u64 << SYNC_REWIND_NEW_CAUSE_SHIFT));
+            if !orphaned_head {
+                self.sync_rewind.new_cause_at_ms = now_ms
+                    .saturating_add(cadence_ms.saturating_mul(1u64 << SYNC_REWIND_NEW_CAUSE_SHIFT));
+            }
         }
         self.sync_rewind.causes = causes;
         self.sync_rewind.awaiting = Some(wanted);
@@ -4633,7 +4844,10 @@ impl Engine {
         if (self.sync_rewind.awaiting.is_some() || self.sync_rewind.fruitless > 0)
             && slot <= self.sync_rewind.yield_ceiling
         {
-            self.sync_rewind = SyncRewindBackoff::default();
+            // The deliverers are not back-off state: a page chase that walks
+            // further back still wants the peers that hold the branch.
+            let deliverers = std::mem::take(&mut self.sync_rewind.deliverers);
+            self.sync_rewind = SyncRewindBackoff { deliverers, ..SyncRewindBackoff::default() };
         }
     }
 
@@ -7324,6 +7538,10 @@ impl Engine {
                 // finality ratchet, which may release bodies. A no-op on the
                 // replay path, where the block is stored after this returns.
                 self.blocks.mark_validated(id.as_bytes());
+                // Audit L1C-31: the transition just verified every body
+                // vote; one of this key that the record does not cover is
+                // the evidence a gossip sighting is.
+                self.note_own_body_votes(env);
                 // RPC-only: retain the registry proof of a checkpoint block
                 // when this block opened a new epoch (once per epoch).
                 self.note_checkpoint_registry();
@@ -8076,6 +8294,12 @@ impl Engine {
             self.chain.push((env.header.slot, id));
         }
         self.canonical = canonical;
+        // Audit L1C-31: every block of the adopted branch passed the
+        // transition above, body votes included. Same hook as the
+        // pure-extension path (`apply_canonical`).
+        for env in &branch {
+            self.note_own_body_votes(env);
+        }
         // RPC-only: the reorg ring holds the new head and its parent, so
         // the head's boundary (if it opened an epoch) can be retained.
         self.note_checkpoint_registry();
@@ -9769,7 +9993,7 @@ impl Engine {
             // Identity of the binary, not of the chain: no state read, no
             // lock taken, constant cost at any height.
             RpcRequest::L2Settlement => Ok(rpc::l2_settlement_json(&self.state)),
-            RpcRequest::Kes => Ok(rpc::kes_json(&self.state)),
+            RpcRequest::Kes => Ok(self.kes_rpc_json()),
             RpcRequest::BlockRaw(id) => {
                 let env = self.envelope_by_id(&id).ok_or_else(|| RpcError::new(rpc::BLOCK_NOT_FOUND, "unknown block"))?;
                 Ok(rpc::Json::s(crate::codec::hex(&crate::codec::encode_envelope(&env))))
@@ -10901,6 +11125,11 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let mut last_built: u64 = engine.state.slot();
     let mut last_sync_req: u64 = 0;
     let mut duty_sync_gate = DutySyncGate::default();
+    let mut orphaned_head_hold = OrphanedHeadHold::default();
+    let mut orphaned_head_reported: Option<u64> = None;
+    // Audit L1C-61: the wall epoch the registered KES tree was last compared
+    // with this node's key file. `None` makes the first turn the boot check.
+    let mut kes_local_checked_epoch: Option<u64> = None;
     // GATE-06: boot grace runs from here, the end of replay and of the boot
     // checks, not from engine construction.
     engine.booted_ms = now_ms();
@@ -10969,6 +11198,13 @@ pub fn run(cfg: Config) -> io::Result<()> {
             (slot, genesis_ms + slot * slot_ms)
         };
         let wall_epoch = epoch_of(slot);
+        // Audit L1C-61: at boot and once per epoch, say so loudly when the
+        // KES tree registered for this validator is not the one this node
+        // holds. Before the bind nothing else notices.
+        if kes_local_checked_epoch != Some(wall_epoch) {
+            engine.warn_kes_local_mismatch(kes_local_checked_epoch.is_none());
+            kes_local_checked_epoch = Some(wall_epoch);
+        }
         if slot != engine.wall_slot {
             engine.wall_slot = slot;
             // Drop everything the acceptance window has moved past. The pool
@@ -11065,7 +11301,28 @@ pub fn run(cfg: Config) -> io::Result<()> {
             engine.last_applied_ms,
             two_slots_ms,
         );
-        let sync_needed = behind || engine.needs_sync || engine.sync_rewind_due(now);
+        // Audit L1C-60: authenticated orphans of several proposers above a
+        // head that has missed a slot. Keeps the repair request alive and,
+        // for a rationed number of slots, holds this validator's vote.
+        let orphaned_head = engine.orphaned_head_evidence(slot);
+        let sync_needed = behind || engine.needs_sync || engine.sync_rewind_due(now) || orphaned_head;
+        let attestation_held_on_orphaned_head = orphaned_head_hold.update(orphaned_head, slot);
+        // Reported once per rationing window, not per head: a node that is
+        // catching up moves its head many times inside one wall slot.
+        if attestation_held_on_orphaned_head
+            && orphaned_head_reported
+                .is_none_or(|reported| slot >= reported.saturating_add(ORPHANED_HEAD_HOLD_WINDOW_SLOTS))
+        {
+            orphaned_head_reported = Some(slot);
+            eprintln!(
+                "ORPHANED HEAD: head slot {} is behind wall slot {slot} and blocks of at least \
+                 {ORPHANED_HEAD_MIN_PROPOSERS} proposers are parked above it on a parent this node does not have. \
+                 Asking the peers that delivered them for the missing blocks; this validator's attestation waits \
+                 (at most {ORPHANED_HEAD_HOLD_MAX_SLOTS} slots per {ORPHANED_HEAD_HOLD_WINDOW_SLOTS}) and is \
+                 signed after the repair.",
+                engine.state.slot()
+            );
+        }
         let stale_head_quarantined = duty_sync_gate.update(
             behind,
             engine.state.slot(),
@@ -11093,9 +11350,17 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // duties immediately below it.
         if sync_needed && now.saturating_sub(last_sync_req) > two_slots_ms {
             let after_slot = engine.sync_request_after_slot(now, two_slots_ms);
+            let head_slot = engine.state.slot();
+            // Audit L1C-60: a rewind is asked first of the peers that
+            // delivered the orphans it is trying to connect.
+            let preferred = if after_slot < head_slot {
+                engine.sync_rewind_preferred_peers()
+            } else {
+                Vec::new()
+            };
             engine
                 .net
-                .broadcast(net::get_blocks_frame(after_slot));
+                .request_blocks(sync_wire_cursor(after_slot, head_slot), &preferred);
             engine.needs_sync = false;
             last_sync_req = now;
         }
@@ -11112,6 +11377,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // duplicate work within one run; `slashprot` is what stops a second
         // signature across runs and across processes.
         if !duties_blocked
+            && !attestation_held_on_orphaned_head
             && slot > last_attested
             && attestation_due(engine.state.slot(), slot, now, slot_start, slot_ms)
         {
@@ -11322,11 +11588,19 @@ pub fn run(cfg: Config) -> io::Result<()> {
                             // contract the attestation arm below runs on.
                             let source = origin.verification_source();
                             let sentinel_seen = sentinel_hooks::header_seen(&env, source);
+                            // Audit L1C-60: only a mesh block carries a
+                            // connection, so only then is the id computed.
+                            let delivered_on = origin
+                                .mesh_connection()
+                                .map(|connection| (*env.block_id().as_bytes(), connection));
                             let verdict = if origin.directed_block() {
                                 engine.ingest_from_judged(env, Source::Directed(source))
                             } else {
                                 engine.ingest_judged_from_source(env, source)
                             };
+                            if let Some((id, connection)) = delivered_on {
+                                engine.note_orphan_deliverer(&id, Some(connection));
+                            }
                             engine.net.report(&origin, verdict);
                             if let Some(seen) = sentinel_seen {
                                 engine.sentinel_observe_block(seen, verdict);

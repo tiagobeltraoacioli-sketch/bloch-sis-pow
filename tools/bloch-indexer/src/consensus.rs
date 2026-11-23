@@ -115,6 +115,10 @@ gates!(
     // Security review CR-5: epoch-bound KES registration message. Same wire
     // form and ledger effect as 0x17; nothing new to index.
     KES_REGISTER_EPOCH_BINDING_EPOCH,
+    // AUDIT-L1L2-20261123 L1C-61 (inert): one static-key correction of a
+    // registered KES tree before the bind. Same wire form and ledger effect
+    // as 0x17 (the validator's KES entry is replaced); nothing new to index.
+    KES_PREBIND_CORRECTION_ACTIVATION_EPOCH,
     HF3_SLH_SUITE_EPOCH,
     HF3_PQ_MIGRATION_EPOCH,
     LATTICE_EMERGENCY_ACTIVATION_EPOCH,

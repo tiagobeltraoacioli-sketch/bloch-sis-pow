@@ -23,9 +23,16 @@
 //! `PosTransaction::SlashingEvidence` (tag 0x05, attestation arm 0x02) bytes
 //! that `sendrawtransaction` would accept. The tool never submits it.
 //!
-//! Memory is bounded: per validator only votes whose target epoch is within
-//! `--window-epochs` of the newest target are retained, with a hard per-
-//! validator cap, and signatures are NOT retained — the first message of a
+//! Memory is bounded in the live (`--rpc`) mode: per validator only votes
+//! whose target epoch is within `--window-epochs` of the newest target are
+//! retained, with a hard per-validator cap (an eviction by the cap is
+//! reported on stderr, because a pair with an evicted vote can no longer be
+//! found). The offline modes (`--block-log`, `--block-dir`) keep EVERY vote
+//! of every validator unless `--window-epochs` is given, and are never
+//! capped: they are the instrument for "no offence in this history", and a
+//! surround vote can span the whole history (audit L1C-30). Their memory is
+//! bounded by the logs (some hundreds of bytes per distinct vote).
+//! Signatures are NOT retained — the first message of a
 //! pair is re-fetched by block id when a finding is materialised. State
 //! (cursor, retained votes, recent block ids, reported evidence ids) is
 //! written atomically to `--state`, so a restart resumes without duplicates.
@@ -51,6 +58,10 @@ const STATE_MAGIC: &str = "bloch-equivocation-watch-state v1";
 const MAX_SIGHTINGS: usize = 4;
 const MAX_VOTES_PER_VALIDATOR: usize = 4_096;
 const MAX_REPORTED: usize = 1 << 20;
+/// The window of an offline scan that keeps everything. An index with this
+/// window (or more) has no per-validator cap either: "keep everything" and
+/// "drop the oldest past 4,096" cannot both hold (audit L1C-30).
+const UNLIMITED_WINDOW_EPOCHS: u64 = u64::MAX / 2;
 
 // ── Pure index ──────────────────────────────────────────────────────────────
 
@@ -87,6 +98,12 @@ pub(crate) struct Index {
     window_epochs: u64,
     max_target: u64,
     reported: BTreeSet<[u8; 32]>,
+    /// Offline scan: [`MAX_VOTES_PER_VALIDATOR`] does not apply (audit
+    /// L1C-30). A property of the run, not of the saved state.
+    uncapped: bool,
+    /// Votes this run dropped because a validator passed
+    /// [`MAX_VOTES_PER_VALIDATOR`] (live mode only). Not saved.
+    cap_evictions: u64,
 }
 
 fn evidence_id(validator: u32, a: &AttestationData, b: &AttestationData) -> [u8; 32] {
@@ -113,9 +130,36 @@ impl Index {
         self.votes.values().map(Vec::len).sum()
     }
 
+    /// Configure this index for an offline scan of block logs or block
+    /// files (audit L1C-30). Logs are read one after another, so a sliding
+    /// window would drop the first log's votes before the second is
+    /// compared: unless the operator gave a window, every vote is kept. And
+    /// the per-validator cap never applies: it used to stay in force under
+    /// the lifted window and silently evicted each validator's oldest votes
+    /// past 4,096, so a surround whose inner vote was older than that was
+    /// never reported by the very scan meant to rule it out.
+    pub fn scan_offline(&mut self, window_given: bool) {
+        if !window_given {
+            self.window_epochs = UNLIMITED_WINDOW_EPOCHS;
+        }
+        self.uncapped = true;
+    }
+
+    /// Does [`MAX_VOTES_PER_VALIDATOR`] apply? Only to a windowed live index.
+    fn capped(&self) -> bool {
+        !self.uncapped && self.window_epochs < UNLIMITED_WINDOW_EPOCHS
+    }
+
+    /// Votes dropped by the per-validator cap in this run.
+    #[cfg(test)]
+    pub fn cap_evictions(&self) -> u64 {
+        self.cap_evictions
+    }
+
     /// Index one authentic attestation; returns every NEW offence it completes.
     pub fn observe(&mut self, validator: u32, data: AttestationData, seen: Sighting) -> Vec<Finding> {
         let root = data.signing_root();
+        let capped = self.capped();
         let votes = self.votes.entry(validator).or_default();
         if let Some(v) = votes.iter_mut().find(|v| v.root == root) {
             if v.sightings.len() < MAX_SIGHTINGS && !v.sightings.iter().any(|s| s.block_id == seen.block_id) {
@@ -140,9 +184,22 @@ impl Index {
         let stale = data.target_epoch.saturating_add(self.window_epochs) < self.max_target;
         if !stale {
             votes.push(new);
-            if votes.len() > MAX_VOTES_PER_VALIDATOR {
+            if capped && votes.len() > MAX_VOTES_PER_VALIDATOR {
                 let (i, _) = votes.iter().enumerate().min_by_key(|(_, v)| v.data.target_epoch).expect("non-empty");
-                votes.swap_remove(i);
+                let evicted = votes.swap_remove(i);
+                // Never silent (audit L1C-30): a pair with this vote can no
+                // longer be found. First time per run, then every 4,096th.
+                if self.cap_evictions % MAX_VOTES_PER_VALIDATOR as u64 == 0 {
+                    eprintln!(
+                        "watch-equivocation: validator {validator} holds more than {MAX_VOTES_PER_VALIDATOR} votes \
+                         inside the window; its oldest vote (target epoch {}) was dropped and can no longer be \
+                         compared ({} dropped so far). Use a smaller --window-epochs, or scan the history offline \
+                         (--block-log / --block-dir), which keeps every vote.",
+                        evicted.data.target_epoch,
+                        self.cap_evictions.saturating_add(1)
+                    );
+                }
+                self.cap_evictions = self.cap_evictions.saturating_add(1);
             }
         }
         if data.target_epoch > self.max_target {
@@ -177,6 +234,15 @@ enum RpcErr {
 /// frame; hex doubles it, and the slack covers the HTTP head and the JSON-RPC
 /// envelope. An endpoint cannot make the watcher buffer past this.
 const MAX_RPC_RESPONSE_BYTES: usize = 2 * crate::p2p::MAX_GOSSIP_BYTES + 64 * 1024;
+
+/// One parameterless JSON-RPC query for other offline tools of this binary
+/// (`kes register --rpc`), with the same bounded reader; errors as text.
+pub(crate) fn rpc_query(addr: &str, method: &str) -> Result<Json, String> {
+    rpc_call(addr, method, Vec::new()).map_err(|e| match e {
+        RpcErr::Node(code, message) => format!("{addr}: {method}: node error {code}: {message}"),
+        RpcErr::Transport(message) => message,
+    })
+}
 
 fn rpc_call(addr: &str, method: &str, params: Vec<Json>) -> Result<Json, RpcErr> {
     let request = Json::obj(vec![
@@ -833,10 +899,9 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         let (from, to) = (r.o.from_slot.unwrap_or(0), r.o.to_slot.unwrap_or(u64::MAX));
         // Logs are read one after another, so a sliding window would drop the
         // first log's votes before the second is compared. Offline runs are
-        // bounded by the logs themselves; keep everything unless told not to.
-        if !r.o.window_given {
-            r.st.index.window_epochs = u64::MAX / 2;
-        }
+        // bounded by the logs themselves; keep everything unless told not to,
+        // and never apply the per-validator cap (audit L1C-30).
+        r.st.index.scan_offline(r.o.window_given);
         r.st.start = from;
         for path in r.o.logs.clone() {
             let label = format!("{LOG_PREFIX}{path}");
@@ -895,8 +960,12 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         r.st.proposals.clear();
         r.st.save(&r.o.state)?;
         eprintln!(
-            "done (offline): blocks {} attestations {} findings {}",
-            r.n.blocks, r.n.attestations, r.n.findings
+            "done (offline): blocks {} attestations {} findings {} retained votes {} (none dropped by a cap{})",
+            r.n.blocks,
+            r.n.attestations,
+            r.n.findings,
+            r.st.index.retained(),
+            if r.o.window_given { "; votes older than --window-epochs were dropped as asked" } else { "" }
         );
         return Ok(());
     }
@@ -1037,6 +1106,70 @@ mod tests {
         for t in 5..40 {
             assert!(ix.observe(3, d(t * 32, 1, 4, t), seen(t as u8)).is_empty());
         }
+    }
+
+    /// Audit L1C-30. The offline scan (window unlimited, as `run` configures
+    /// it) used to keep only each validator's 4,096 highest-target votes, so
+    /// a surround whose inner vote was older than that was never reported.
+    #[test]
+    fn an_offline_scan_finds_a_surround_older_than_the_live_cap() {
+        let n = MAX_VOTES_PER_VALIDATOR as u64 + 104;
+        for window_given in [false, true] {
+            // What `run` builds for `--block-log` / `--block-dir`, with and
+            // without an explicit (here: generous) `--window-epochs`.
+            let mut ix = Index::new(if window_given { 1_000_000 } else { 1024 });
+            ix.scan_offline(window_given);
+            // Inner vote on a side branch: source 1000, target 1001.
+            assert!(ix.observe(7, d(1001 * 32, 1, 1000, 1001), seen(1)).is_empty());
+            // One honest vote per epoch afterwards, more than the cap.
+            for e in 0..n {
+                let t = 1002 + e;
+                assert!(ix.observe(7, d(t * 32, 1, t - 1, t), seen(2)).is_empty());
+            }
+            assert_eq!(ix.retained() as u64, n + 1, "nothing was dropped");
+            assert_eq!(ix.cap_evictions(), 0);
+            // Outer vote: source 999 below the inner source, target far later.
+            let outer = 1002 + n + 10;
+            let found = ix.observe(7, d(outer * 32, 1, 999, outer), seen(3));
+            // It surrounds every vote in between as well: one finding per
+            // retained vote, the oldest included.
+            assert_eq!(found.len() as u64, n + 1, "window_given {window_given}");
+            assert!(found.iter().all(|f| f.offense == SlashableOffense::SurroundVote));
+            assert!(
+                found.iter().any(|f| f.first.data.target_epoch == 1001 && f.first.data.source_epoch == 1000),
+                "the surround over the oldest vote is reported (window_given {window_given})",
+            );
+        }
+    }
+
+    /// The live mode keeps its memory bound, and no longer drops in silence:
+    /// the eviction is counted (and printed).
+    #[test]
+    fn the_live_cap_still_bounds_memory_and_counts_what_it_drops() {
+        let mut ix = Index::new(1_000_000);
+        let n = MAX_VOTES_PER_VALIDATOR as u64 + 104;
+        for e in 0..n {
+            let t = 1002 + e;
+            ix.observe(7, d(t * 32, 1, t - 1, t), seen(2));
+        }
+        assert_eq!(ix.retained(), MAX_VOTES_PER_VALIDATOR);
+        assert_eq!(ix.cap_evictions(), 104);
+        // An index built with the unlimited window is not capped, however
+        // it was built (a state file saved by an offline scan, for one).
+        let mut ix = Index::new(UNLIMITED_WINDOW_EPOCHS);
+        for e in 0..n {
+            let t = 1002 + e;
+            ix.observe(7, d(t * 32, 1, t - 1, t), seen(2));
+        }
+        assert_eq!((ix.retained() as u64, ix.cap_evictions()), (n, 0));
+        // An explicit offline window is still a window.
+        let mut ix = Index::new(8);
+        ix.scan_offline(true);
+        for t in 1..1000u64 {
+            ix.observe(1, d(t * 32, 1, t - 1, t), seen(1));
+        }
+        assert!(ix.retained() <= 9);
+        assert_eq!(ix.cap_evictions(), 0);
     }
 
     #[test]

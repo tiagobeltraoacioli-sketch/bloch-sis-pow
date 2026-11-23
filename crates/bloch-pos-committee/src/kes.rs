@@ -65,6 +65,7 @@ const DS_REGISTER_V2: &[u8] = b"BLOCH-KES-v2/register";
 const DS_SIGN: &[u8] = b"BLOCH-KES-v2/sign";
 const DS_AUTHORITY: &[u8] = b"BLOCH-KES-v1/authority";
 const DS_ROTATE: &[u8] = b"BLOCH-KES-v1/rotate";
+const DS_CORRECT: &[u8] = b"BLOCH-KES-v1/correct";
 
 /// Transaction tag of `PosTransaction::KesRegister`. Free on the mainnet line
 /// (highest 0x16, the L2 range 0x12-0x16) and the same byte devnet4 used.
@@ -493,6 +494,32 @@ pub fn register_signing_root_at(network_domain: &[u8; 32], validator: u32, publi
     } else {
         register_signing_root(network_domain, validator, public)
     }
+}
+
+/// The root a validator's static key signs to CORRECT its registered tree
+/// `replaced` to `public` in a block of `epoch`
+/// (`params::KES_PREBIND_CORRECTION_ACTIVATION_EPOCH`, audit L1C-61). Its own
+/// domain tag, so it can never be taken for a first registration (either
+/// form) or the other way round; bound to the network, the validator, the
+/// inclusion epoch (valid in that epoch only) and the tree being replaced
+/// (a correction signed against one tree says nothing about another).
+pub fn correct_signing_root(
+    network_domain: &[u8; 32],
+    validator: u32,
+    epoch: u64,
+    replaced: &KesPublic,
+    public: &KesPublic,
+) -> [u8; 32] {
+    h(&[
+        DS_CORRECT,
+        network_domain,
+        &validator.to_le_bytes(),
+        &epoch.to_le_bytes(),
+        &[replaced.depth],
+        &replaced.root,
+        &[public.depth],
+        &public.root,
+    ])
 }
 
 /// The root the CURRENT leaf of `validator`'s key in force signs (through

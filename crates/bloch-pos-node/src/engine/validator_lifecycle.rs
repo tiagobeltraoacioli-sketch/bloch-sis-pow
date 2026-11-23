@@ -105,8 +105,9 @@ pub(super) fn kes_register_conflict(
         ));
     }
     // Mirrors consensus (`check_kes_register`): an existing key refuses a
-    // re-registration unless it is an expired key's static-key rescue.
-    if state.kes_public(*validator).is_some() && !state.kes_rescue_open(*validator) {
+    // re-registration unless it is an expired key's static-key rescue, or
+    // (audit L1C-61, behind an inert gate) the one pre-bind correction.
+    if state.kes_public(*validator).is_some() && !state.kes_rescue_open(*validator) && !state.kes_correction_open(*validator) {
         return Err(Refusal::Invalid(
             "KES key already registered for this validator: registration (tag 0x17) \
              is once-only and consensus refuses a re-registration",

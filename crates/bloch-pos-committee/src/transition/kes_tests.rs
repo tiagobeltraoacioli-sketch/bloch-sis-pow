@@ -1979,4 +1979,7 @@ mod kes_rules {
         assert_eq!(kes::signing_mode(&view(&st), 3, 7), kes::SigningMode::Kes(5));
         assert_eq!(evidence_outcome(&st, &pair), Ok(()), "still provable after the history is pruned");
     }
+
+    // AUDIT-L1L2-20261123 L1C-61: the pre-bind correction rule (inert gate).
+    include!("audit_20261123_l1c61_tests.rs");
 }
