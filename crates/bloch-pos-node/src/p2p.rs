@@ -717,9 +717,22 @@ pub struct Origin {
     /// the operator configured. Node-local scheduling only: such a block is
     /// verified under the allowance gossip cannot spend, never trusted more.
     directed_block: bool,
+    /// The devnet-mesh connection a block was read from (audit L1C-60;
+    /// `net::next_connection_id`). Node-local scheduling only: it chooses
+    /// which peer a sync rewind is asked of, and nothing else.
+    mesh_connection: Option<u64>,
 }
 
 impl Origin {
+    /// See the `mesh_connection` field.
+    pub(crate) fn mesh_connection(&self) -> Option<u64> {
+        self.mesh_connection
+    }
+
+    pub(crate) fn set_mesh_connection(&mut self, connection: u64) {
+        self.mesh_connection = Some(connection);
+    }
+
     pub(crate) fn set_reservation(&mut self, guard: Arc<crate::net::SourceReservation>) {
         self.reservation = Some(guard);
     }
@@ -763,6 +776,7 @@ impl Origin {
             block_hint: None,
             reservation: None,
             directed_block: false,
+            mesh_connection: None,
         }
     }
 
@@ -773,6 +787,7 @@ impl Origin {
             block_hint: Some((peer, slot)),
             reservation: None,
             directed_block: true,
+            mesh_connection: None,
         }
     }
 }
@@ -2558,6 +2573,7 @@ fn on_gossip(
                     block_hint: Some((source, slot)),
                     reservation: None,
                     directed_block: st.is_configured_peer(&source),
+                    mesh_connection: None,
                 };
                 let mut event = NetEvent::Block(env, origin);
                 if crate::net::queued_bytes(&event) != message.data.len() {
@@ -2590,6 +2606,7 @@ fn on_gossip(
                     block_hint: None,
                     reservation: None,
                     directed_block: false,
+                    mesh_connection: None,
                 };
                 let mut event = NetEvent::Attestation(att, origin);
                 if crate::net::queued_bytes(&event) != message.data.len() {
@@ -2618,6 +2635,7 @@ fn on_gossip(
                     block_hint: None,
                     reservation: None,
                     directed_block: false,
+                    mesh_connection: None,
                 };
                 let mut event = NetEvent::Transaction(tx, origin);
                 if crate::net::queued_bytes(&event) != message.data.len() {
@@ -4093,6 +4111,7 @@ mod tests {
                 block_hint: None,
                 reservation: Some(guard),
                 directed_block: false,
+                mesh_connection: None,
             },
         );
         assert_eq!(
