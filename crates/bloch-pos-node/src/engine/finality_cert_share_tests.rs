@@ -123,21 +123,74 @@ fn another_block_of_one_epoch_is_not_a_new_assembly_and_callers_have_shares() {
         )
     };
 
-    // Eight requests in one slot from one remote address, each naming a
-    // different canonical ancestor of the checkpoint of epoch 4.
+    // Requests in one slot from one remote address, each naming a different
+    // canonical ancestor of the checkpoint of epoch 4. The first one scans
+    // (one unit of the assembly budget); the others reuse its links.
     let root = engine.checkpoint_root(4);
     let top = engine.height_of(&root).expect("the checkpoint is canonical") as usize;
     let scans_before = engine.finality_certs.vote_scans;
     let mut replies = Vec::new();
-    for back in 1..=8usize {
+    let from_held = CERT_BUILDS_PER_SOURCE_PER_SLOT as usize;
+    for back in 1..=(1 + from_held) {
         let ancestor = *engine.chain[top - back].1.as_bytes();
         let reply = certificate(&mut engine, remote(9), 4, Some(ancestor)).unwrap_or_else(|e| panic!("request {back}: {e:?}"));
         assert_eq!(reply.get("ancestry").and_then(Json::as_u64), Some(back as u64), "it carries the ancestry asked for");
         replies.push(reply);
     }
-    assert_eq!(engine.finality_certs.vote_scans - scans_before, 2, "one assembly: two epoch scans, not sixteen");
+    assert_eq!(engine.finality_certs.vote_scans - scans_before, 2, "one assembly: two epoch scans, not ten");
     assert_eq!(engine.finality_certs.builds, (slot, 1), "and one unit of the budget");
-    assert!(replies.windows(2).all(|pair| pair[0] != pair[1]), "eight different certificates");
+    assert!(replies.windows(2).all(|pair| pair[0] != pair[1]), "five different certificates");
+
+    // Review of f83800bf: a certificate from held links is not a scan, but
+    // it is not unmetered either. Each distinct `block` misses the reply
+    // cache and walks headers on the consensus thread, so one caller gets
+    // CERT_BUILDS_PER_SOURCE_PER_SLOT of them per slot, remote callers
+    // together CERT_BUILDS_PER_SLOT, and local callers their own share.
+    let ancestor = |engine: &Engine, back: usize| *engine.chain[top - back].1.as_bytes();
+    let sixth = ancestor(&engine, 2 + from_held);
+    let spent = certificate(&mut engine, remote(9), 4, Some(sixth)).unwrap_err();
+    assert_eq!(spent.code, rpc::NODE_UNAVAILABLE);
+    assert!(spent.message.contains("per slot") && spent.message.contains("one caller"), "{spent:?}");
+    // What it was already given is a cached reply and stays free.
+    let again = ancestor(&engine, 2);
+    assert_eq!(certificate(&mut engine, remote(9), 4, Some(again)).expect("a cached reply"), replies[1]);
+    // Another address has its own share; the remote ceiling is shared.
+    certificate(&mut engine, remote(11), 4, Some(sixth)).expect("another address still has its share");
+    let mut served = from_held + 1;
+    let mut back = 3 + from_held;
+    let mut address = 12u8;
+    while served < CERT_BUILDS_PER_SLOT as usize {
+        for _ in 0..from_held.min(CERT_BUILDS_PER_SLOT as usize - served) {
+            let block = ancestor(&engine, back);
+            certificate(&mut engine, remote(address), 4, Some(block)).unwrap_or_else(|e| panic!("held certificate {served}: {e:?}"));
+            served += 1;
+            back += 1;
+        }
+        address += 1;
+    }
+    let block = ancestor(&engine, back);
+    let full = certificate(&mut engine, remote(60), 4, Some(block)).unwrap_err();
+    assert_eq!(full.code, rpc::NODE_UNAVAILABLE);
+    assert!(full.message.contains("per slot") && !full.message.contains("one caller"), "{full:?}");
+    // Local callers are not refused by anything remote callers did, and
+    // have a ceiling of their own.
+    for n in 0..CERT_LOCAL_BUILDS_PER_SLOT as usize {
+        let block = ancestor(&engine, back + n);
+        let caller = if n % 2 == 0 { loopback() } else { None };
+        certificate(&mut engine, caller, 4, Some(block)).unwrap_or_else(|e| panic!("local held certificate {n}: {e:?}"));
+    }
+    let block = ancestor(&engine, back + CERT_LOCAL_BUILDS_PER_SLOT as usize);
+    let local_full = certificate(&mut engine, loopback(), 4, Some(block)).unwrap_err();
+    assert_eq!(local_full.code, rpc::NODE_UNAVAILABLE);
+    assert!(local_full.message.contains("local callers"), "{local_full:?}");
+    // None of it was a scan or a unit of the scan budget.
+    assert_eq!(engine.finality_certs.vote_scans - scans_before, 2);
+    assert_eq!(engine.finality_certs.builds, (slot, 1));
+    // The next slot serves the first caller again.
+    {
+        let _next = validator_lifecycle::clock_at(slot + 1);
+        certificate(&mut engine, remote(9), 4, Some(sixth)).expect("the share is per slot");
+    }
 
     // Everybody else, same slot: the newest finalized epoch, by either
     // method, from another address and from this host.

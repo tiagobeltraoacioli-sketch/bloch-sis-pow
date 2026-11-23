@@ -92,9 +92,11 @@ const REFUSAL_CACHE: usize = 256;
 /// Certificates assembled from the block log per wall slot, across all
 /// REMOTE callers. Assembly reads up to two epochs of blocks on the consensus
 /// thread and the method needs no authentication, so the work one slot can be
-/// made to do is bounded here. Cached answers, refusals decided before the
-/// first read, and certificates whose two links are already held
-/// ([`LINKS_CACHE`]) are not counted. A light client at the head needs one
+/// made to do is bounded here. Cached answers and refusals decided before the
+/// first read are not counted. A certificate whose two links are already held
+/// ([`LINKS_CACHE`]) is not counted here either: it reads no block body, and
+/// is counted in a budget of its own with the same figures
+/// ([`FinalityCertStore::held_shares`]). A light client at the head needs one
 /// assembly per epoch; a prover's follower catching up over the verifier's
 /// whole 256-epoch bound is served in 32 slots from the local share and in 64
 /// as one remote caller, retrying on [`rpc::NODE_UNAVAILABLE`].
@@ -217,6 +219,18 @@ pub(super) struct FinalityCertStore {
     pub(super) builds: (u64, u32),
     /// The same assemblies by who asked for them (audit L1N-03).
     pub(super) shares: BuildShares,
+    /// Certificates put together from HELD links, per wall slot and per
+    /// caller (review of f83800bf). Such a certificate reads no block body,
+    /// which is why it takes nothing from `shares`, but it is not free: each
+    /// distinct `block` or set source misses the reply cache, walks up to
+    /// `MAX_ANCESTRY` headers and encodes a whole certificate on the
+    /// consensus thread, for a caller that needs no authentication. Same
+    /// figures as the scan budget, counted apart: [`CERT_BUILDS_PER_SLOT`]
+    /// for remote callers, [`CERT_BUILDS_PER_SOURCE_PER_SLOT`] for one of
+    /// them, [`CERT_LOCAL_BUILDS_PER_SLOT`] for local ones. One slot can
+    /// therefore be made to do at most 16 scans and 16 header walks. A reply
+    /// already in the cache stays free.
+    pub(super) held_shares: BuildShares,
     /// `((epoch, checkpoint root, next checkpoint root), links)`, ascending
     /// by epoch; see [`LINKS_CACHE`]. The roots are part of the key, so a
     /// reorg above the finalized checkpoint that changes the next epoch's
@@ -518,7 +532,10 @@ impl Engine {
         }
         // Audit L1N-03: the two vote scans depend on the epoch alone. Links
         // already held serve any `block` and any set source of that epoch
-        // with no block body read and no unit of the assembly budget.
+        // with no block body read and no unit of the scan budget. The header
+        // walk and the encoding that remain are bounded by a budget of their
+        // own (`held_shares`), taken after the reply cache and before the
+        // first header is read.
         let links_key = (e, root, next_root);
         let held = self.finality_certs.links.iter().find(|(k, _)| *k == links_key).map(|(_, l)| Arc::clone(l));
         let (source, src_epoch, key, links) = match held {
@@ -531,6 +548,8 @@ impl Engine {
                 if let Some((_, j)) = self.finality_certs.cache.iter().find(|(k, _)| *k == key) {
                     return Ok(j.clone());
                 }
+                let slot = self.wall_slot();
+                self.finality_certs.held_shares.reserve(slot, caller).map_err(RpcError::unavailable)?;
                 (held.source, src_epoch, key, held)
             }
             None => {
