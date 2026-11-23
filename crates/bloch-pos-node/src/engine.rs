@@ -1564,6 +1564,46 @@ impl OrphanedHeadHold {
     }
 }
 
+/// The slot loop's attestation step: sign the duty of wall slot `slot`, and
+/// the epoch's missed duty if there is one, unless duties are blocked, the
+/// vote is held on an orphaned head ([`OrphanedHeadHold`], audit L1C-60), the
+/// slot was already attested in this run, or the attestation is not due yet.
+/// Returns whether the step ran (`last_attested` then names `slot`).
+///
+/// The body of `run`'s loop, moved here unchanged so that the gates are
+/// tested as the loop applies them (`orphaned_head_tests`), not only as
+/// types.
+#[allow(clippy::too_many_arguments)]
+fn attestation_turn(
+    engine: &mut Engine,
+    duties_blocked: bool,
+    attestation_held_on_orphaned_head: bool,
+    last_attested: &mut u64,
+    slot: u64,
+    now: u64,
+    slot_start: u64,
+    slot_ms: u64,
+    wall_epoch: u64,
+) -> bool {
+    if !duties_blocked
+        && !attestation_held_on_orphaned_head
+        && slot > *last_attested
+        && attestation_due(engine.state.slot(), slot, now, slot_start, slot_ms)
+    {
+        engine.maintain_validator_lifecycle(wall_epoch);
+        engine.maintain_kes(wall_epoch);
+        engine.attest(slot);
+        *last_attested = slot;
+        // A duty slot of this epoch skipped while duties were blocked
+        // (empty-slot run, sync, boot grace) is voted now, at most once
+        // per epoch; see `retry_missed_attestation` for the safety case.
+        // Inside the `attestation_due` gate, like the on-time duty.
+        engine.retry_missed_attestation(slot);
+        return true;
+    }
+    false
+}
+
 /// The cursor put on the wire for an engine-driven sync request (audit
 /// L1C-60). A rewind (`after_slot` below the head) is sent as it is; a
 /// head-forward request reaches [`net::SYNC_HEAD_OVERLAP_SLOTS`] below the
@@ -11376,21 +11416,17 @@ pub fn run(cfg: Config) -> io::Result<()> {
         // this function's stack — a restart forgets them entirely. They stop
         // duplicate work within one run; `slashprot` is what stops a second
         // signature across runs and across processes.
-        if !duties_blocked
-            && !attestation_held_on_orphaned_head
-            && slot > last_attested
-            && attestation_due(engine.state.slot(), slot, now, slot_start, slot_ms)
-        {
-            engine.maintain_validator_lifecycle(wall_epoch);
-            engine.maintain_kes(wall_epoch);
-            engine.attest(slot);
-            last_attested = slot;
-            // A duty slot of this epoch skipped while duties were blocked
-            // (empty-slot run, sync, boot grace) is voted now, at most once
-            // per epoch; see `retry_missed_attestation` for the safety case.
-            // Inside the `attestation_due` gate, like the on-time duty.
-            engine.retry_missed_attestation(slot);
-        }
+        attestation_turn(
+            &mut engine,
+            duties_blocked,
+            attestation_held_on_orphaned_head,
+            &mut last_attested,
+            slot,
+            now,
+            slot_start,
+            slot_ms,
+            wall_epoch,
+        );
         let propose_at = slot_start.saturating_add(slot_ms / 3); // a deadline
         if !duties_blocked && now >= propose_at && slot > last_built {
             engine.propose(slot);
@@ -16282,8 +16318,10 @@ mod missed_duty_retry_tests {
     #[test]
     fn the_slot_loop_retries_after_the_on_time_attest() {
         let source = include_str!("engine.rs");
+        // The attest branch of the slot loop is `attestation_turn` (moved out
+        // of `run` unchanged so that its gates can be tested as wired).
         let call = source
-            .find("            engine.attest(slot);\n")
+            .find("        engine.attest(slot);\n")
             .expect("slot-loop attest call");
         let retry = source[call..]
             .find("engine.retry_missed_attestation(slot);")
@@ -16291,9 +16329,13 @@ mod missed_duty_retry_tests {
         // Integration with hf-node-only: its gate test pins `attest` directly
         // followed by the `last_attested` latch, so the retry follows the
         // latch; it must still sit inside the same gated branch, i.e. before
-        // the proposer step that follows that branch.
-        let end = source[call..].find("let propose_at").expect("end of the attest branch");
+        // the branch returns.
+        let end = source[call..].find("return true;").expect("end of the attest branch");
         assert!(retry < end && retry < 600, "the retry must sit inside the unblocked attest branch");
+        // ... and the loop runs that branch before the proposer step.
+        let turn = source.find("        attestation_turn(\n            &mut engine,").expect("the slot loop calls the attest branch");
+        let propose = source[turn..].find("let propose_at").expect("the proposer step follows");
+        assert!(propose < 600, "the attest branch must run just before the proposer step");
     }
 }
 
@@ -23101,7 +23143,7 @@ mod stale_head_duty_gate_tests {
     fn the_slot_loop_gates_attest_on_attestation_due() {
         let source = include_str!("engine.rs");
         let call = source
-            .find("            engine.attest(slot);\n            last_attested = slot;")
+            .find("        engine.attest(slot);\n        *last_attested = slot;")
             .expect("slot-loop attest call");
         let gate = source[..call]
             .rfind("&& attestation_due(engine.state.slot(), slot, now, slot_start, slot_ms)")

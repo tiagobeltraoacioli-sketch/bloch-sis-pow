@@ -40,6 +40,13 @@ const N: usize = 8;
 /// not propose the network's block of the same slot. Returns the engine
 /// sitting on `X`, and the network's branch (which it has never seen).
 fn orphaned_head_fixture(network_len: u64) -> (Engine, perf_support::TestDir, Vec<BlockEnvelope>, [u8; 32]) {
+    let (engine, dir, network, x, _validators) = orphaned_head_fixture_with_validators(network_len);
+    (engine, dir, network, x)
+}
+
+/// [`orphaned_head_fixture`], plus the validators' keys with the signing
+/// records they hold on the orphaned branch.
+fn orphaned_head_fixture_with_validators(network_len: u64) -> (Engine, perf_support::TestDir, Vec<BlockEnvelope>, [u8; 32], Validators) {
     let (mut engine, dir, others) = perf_support::proposing_engine_n(&[], N as u32);
     let mut vals = validators(&mut engine, &dir, others, "n");
     let everyone: Vec<usize> = (0..N).collect();
@@ -94,7 +101,7 @@ fn orphaned_head_fixture(network_len: u64) -> (Engine, perf_support::TestDir, Ve
     }
     let x = *engine.head_id().as_bytes();
     engine.needs_sync = false;
-    (engine, dir, network, x)
+    (engine, dir, network, x, fresh)
 }
 
 /// Distinct proposers of the authenticated orphans parked at or above the
@@ -281,6 +288,106 @@ fn one_proposer_or_a_current_head_is_not_orphaned_head_evidence() {
     now += 1;
     assert!(now < held_until);
     assert_eq!(engine.sync_request_after_slot(now, CADENCE), floor, "not held back on an orphaned head");
+
+    // Review item N8. The request above also carried a NEW cause (the second
+    // proposer's parent), which the P2P-6 schedule lets through by itself,
+    // so it did not show the evidence at work. Asked again with nothing new
+    // parked, inside the back-off: only the orphaned-head evidence lets the
+    // rewind out, at every request.
+    for _ in 0..3 {
+        now += 1;
+        let causes = engine.sync_rewind.causes.clone();
+        assert!(engine.orphaned_head_evidence(engine.wall_slot()));
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), floor, "an unchanged cause inside the back-off: the evidence alone sends the rewind");
+        assert!(!engine.sync_rewind.deferred);
+        assert_eq!(engine.sync_rewind.causes, causes, "no new cause was involved");
+        assert!(engine.sync_rewind.fruitless > 0 && now < engine.sync_rewind.retry_at_ms, "the back-off itself is running");
+    }
+    // Control: the same engine, the same orphans, the same instant in the
+    // back-off, but a head that has missed no slot. No evidence, no new
+    // cause: held back exactly as before the fix.
+    {
+        let _clock = validator_lifecycle::clock_at(head + 1);
+        assert!(!engine.orphaned_head_evidence(engine.wall_slot()));
+        now += 1;
+        assert_eq!(engine.sync_request_after_slot(now, CADENCE), head, "without the evidence the unchanged cause is held back");
+        assert!(engine.sync_rewind.deferred);
+    }
+}
+
+/// Review item N3: the hold as the slot loop applies it. `attestation_turn`
+/// is the loop's own attest branch; the hold computed from the engine's
+/// evidence, exactly as the loop computes it, must keep every validator of
+/// a stranded node from signing, for the rationed slots and no longer.
+#[test]
+fn the_slot_loop_does_not_sign_a_vote_held_on_an_orphaned_head() {
+    let (mut engine, _dir, network, x, mut vals) = orphaned_head_fixture_with_validators(40);
+    let head_slot = engine.state.slot();
+    const SLOT_MS: u64 = 30_000;
+    let everyone: Vec<usize> = (0..N).collect();
+    // One `last_attested` latch per validator (each is its own node's loop).
+    let latches: Vec<std::cell::Cell<u64>> = (0..N).map(|_| std::cell::Cell::new(head_slot)).collect();
+    let mut hold = OrphanedHeadHold::default();
+    let mut later = network.iter().skip(1);
+    let (mut held_slots, mut free_slots) = (Vec::new(), Vec::new());
+    let mut signed_while_held = 0usize;
+    let mut signed_when_free = 0usize;
+    let votes = |engine: &Engine| engine.pool.len();
+    // One full rationing window and the ration of the next one.
+    for k in 1..=(ORPHANED_HEAD_HOLD_WINDOW_SLOTS + 2 * ORPHANED_HEAD_HOLD_MAX_SLOTS + 2) {
+        let wall = head_slot + k;
+        let slot_start = k * SLOT_MS;
+        // Past half of the slot: `attestation_due` holds in every case.
+        let now = slot_start + SLOT_MS / 2;
+        let _clock = validator_lifecycle::clock_at(wall);
+        if let Some(block) = later.next() {
+            assert_eq!(engine.ingest_judged(block.clone()), Verdict::Ignore);
+        }
+        assert_eq!(*engine.head_id().as_bytes(), x);
+        // The loop's own two lines.
+        let orphaned_head = engine.orphaned_head_evidence(wall);
+        let attestation_held_on_orphaned_head = hold.update(orphaned_head, wall);
+        let before = votes(&engine);
+        let mut ran = Vec::new();
+        for &i in &everyone {
+            let latch = &latches[i];
+            let ran_here = std::cell::Cell::new(false);
+            as_validators(&mut engine, &mut vals, &[i], &|e| {
+                let mut last_attested = latch.get();
+                ran_here.set(attestation_turn(
+                    e,
+                    false,
+                    attestation_held_on_orphaned_head,
+                    &mut last_attested,
+                    wall,
+                    now,
+                    slot_start,
+                    SLOT_MS,
+                    epoch_of(wall),
+                ));
+                latch.set(last_attested);
+            });
+            ran.push(ran_here.get());
+        }
+        let signed = votes(&engine) - before;
+        if attestation_held_on_orphaned_head {
+            held_slots.push(k);
+            signed_while_held += signed;
+            assert!(ran.iter().all(|ran| !ran), "slot +{k}: the attest branch ran while the vote is held");
+            assert!(latches.iter().all(|latch| latch.get() < wall), "slot +{k}: a held slot is not latched as attested");
+        } else {
+            free_slots.push(k);
+            signed_when_free += signed;
+            assert!(ran.iter().all(|ran| *ran), "slot +{k}: nothing else blocks the duty in this replay");
+            assert!(latches.iter().all(|latch| latch.get() == wall));
+        }
+    }
+    assert_eq!(held_slots.len() as u64, 2 * ORPHANED_HEAD_HOLD_MAX_SLOTS, "one ration in each of the two windows the replay crosses: {held_slots:?}");
+    assert_eq!(signed_while_held, 0, "no validator signed on the orphaned head while its vote was held");
+    // The replay is not vacuous: the same validators, on the same orphaned
+    // head, do sign once the ration is spent (the pre-fix behaviour, which
+    // the ration deliberately falls back to).
+    assert!(signed_when_free > 0, "free slots {free_slots:?} produced no vote: the fixture cannot show the hold");
 }
 
 #[test]
