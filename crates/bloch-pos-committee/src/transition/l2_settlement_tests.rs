@@ -4178,5 +4178,6 @@ mod l2_tests {
         include!("audit_20261123_l1x04_tests.rs");
         include!("audit_20261123_l1x01_tests.rs");
         include!("audit_20261123_l1x03_tests.rs");
+        include!("audit_20261123_l2n01_switch_tests.rs");
     }
 }

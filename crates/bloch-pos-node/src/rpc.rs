@@ -3632,6 +3632,42 @@ pub fn kes_json(state: &bloch_pos_committee::transition::CommittedState) -> Json
     ])
 }
 
+/// `getl2settlement.program`: the program identities in force, which set
+/// they are, and the pinned switch of this build, if any.
+fn l2_program_json(l2: &bloch_pos_committee::l2_settlement::State) -> Json {
+    use bloch_pos_committee::l2_settlement::{mainnet, ProgramIdentities, SupplyCap};
+    use bloch_pos_committee::params::L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH as GATE;
+    let identities = |ids: &ProgramIdentities| vec![
+        ("configuration", Json::hex(&ids[0])), ("elf", Json::hex(&ids[1])),
+        ("vkey_koalabear", Json::hex(&ids[2])), ("vkey_bn254", Json::hex(&ids[3])),
+    ];
+    let cap = |cap: SupplyCap| Json::s(match cap {
+        SupplyCap::GrossMinted => "gross-minted",
+        SupplyCap::Outstanding => "outstanding",
+    }.to_string());
+    let switched = l2.program_switched();
+    let pending = l2.pending_program_switch();
+    let mut out = vec![("set", Json::s(if switched.is_some() { "switched" } else { "initial" }.to_string()))];
+    out.extend(identities(&l2.program()));
+    out.push(("proof_policy", Json::hex(&l2.policy().proof_policy)));
+    out.push(("supply_cap", cap(l2.supply_cap())));
+    // The switch this build pins for this L2: null when it pins none (every
+    // L2 but the mainnet one). `activation_epoch` null = the gate is inert;
+    // `final` false = the successor identities are candidate placeholders
+    // and the gate cannot be armed in this build.
+    out.push(("switch", switched.or(pending).map_or(Json::Null, |switch| {
+        let mut to = identities(&switch.to);
+        to.push(("supply_cap", cap(switch.supply_cap)));
+        Json::obj(vec![
+            ("activation_epoch", if GATE == u64::MAX { Json::Null } else { Json::u(GATE) }),
+            ("taken", Json::Bool(switched.is_some())),
+            ("final", Json::Bool(mainnet::PROGRAM_SWITCH_FINAL)),
+            ("to", Json::obj(to)),
+        ])
+    })));
+    Json::obj(out)
+}
+
 pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedState) -> Json {
     let Some(l2) = state.l2_settlement() else { return Json::Null; };
     let policy = l2.policy();
@@ -3657,6 +3693,14 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
         ("asynchronous", Json::Bool(l2.asynchronous())), ("native_height", Json::u(l2.height())),
         ("network", Json::hex(&policy.identities[0])), ("genesis", Json::hex(&policy.identities[1])),
         ("chain_id", Json::u(policy.chain_id)), ("source", source),
+        // The settlement program in force (audit L2N-01): what a settlement
+        // must name and the key its proof is verified under. "set" is
+        // "initial" until this L2 takes the pinned program switch at the
+        // first epoch boundary behind
+        // L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH, "switched" from that
+        // block on. "supply_cap" is the deposit cap that program enforces,
+        // which the L1 deposit rule follows (audits L1X-03, L2N-02).
+        ("program", l2_program_json(l2)),
         // What this L2 admits, fixed at installation: a development genesis
         // follows the node's devnet features; the running-network flag day
         // ("activated") admits everything on every build.

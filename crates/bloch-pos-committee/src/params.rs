@@ -3193,6 +3193,73 @@ pub(crate) mod l2_deposit_inflow_bound_rehearsal {
     }
 }
 
+/// AUDIT-L1L2-20261123 L2N-01 (and L2N-02), the L1 half of the proper fix:
+/// the settlement program switch. `u64::MAX` means INERT.
+///
+/// The deployed guest program accepts a prover-chosen block context
+/// (L2N-01) and caps the lifetime mint (L2N-02); the fix is a new guest
+/// program, and the L1 pins the program a settlement must name and the key
+/// its proof is verified under. At the first epoch boundary whose new epoch
+/// is `>=` this value, an installed L2 whose policy names the program part
+/// of `l2_settlement::mainnet::PROGRAM` names the pinned successor instead
+/// (`l2_settlement::mainnet::PROGRAM_SWITCH`, applied by
+/// `l2_settlement::State::switch_program`): configuration commitment, guest
+/// ELF, KoalaBear key and BN254 key. The proof policy commitment, the
+/// network identities, the L2 genesis and the pinned source do not change.
+///
+/// No overlap: up to the last block before that boundary only a proof of
+/// the old program settles, from the boundary block on only a proof of the
+/// new one (`l2_settlement::ProgramSwitch` says why). A pending proof of
+/// the old program is refused and the block is proved again.
+///
+/// The deposit rule of `L2_CUMULATIVE_DEPOSIT_CAP_ACTIVATION_EPOCH`
+/// (L1X-03) follows the program in force, so the two gates may be armed in
+/// either order: lifetime total under the old program, escrow under the new
+/// one (`l2_settlement::State::deposit_within_supply_cap`).
+///
+/// Arming needs: the successor re-pinned from the reproducible release ELF
+/// with a real Groth16 fixture (`PROGRAM_SWITCH_FINAL`, asserted below), the
+/// L2 release (prover, settler, followers) that knows both programs and this
+/// epoch on every operator host, a historical replay, mixed-fleet
+/// qualification, the indexer rebuilt, and a coordinated epoch. It cannot
+/// precede the L2 itself. `l2n01_the_program_switch_gate_is_inert_and_not_final`
+/// pins the inert value.
+pub const L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH,
+    L2_SETTLEMENT_ACTIVATION_EPOCH
+));
+// An armed gate must switch to release values, never to the candidate
+// placeholders: a program nobody can prove would stop the L2 at the boundary.
+const _: () = assert!(
+    L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH == u64::MAX
+        || (crate::l2_settlement::mainnet::PROGRAM_SWITCH.is_some()
+            && crate::l2_settlement::mainnet::PROGRAM_SWITCH_FINAL)
+);
+
+pub fn l2_settlement_program_switch_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if let Some(armed) = l2_settlement_program_switch_rehearsal::armed() {
+        return epoch >= armed;
+    }
+    epoch_gate_active(epoch, L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH)
+}
+
+/// Test seam: the gate armed at a chosen epoch (the other rehearsal seams
+/// open a gate for every epoch; the switch tests need the epochs before it).
+#[cfg(test)]
+pub(crate) mod l2_settlement_program_switch_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ARMED: Cell<Option<u64>> = const { Cell::new(None) }; }
+    pub fn armed() -> Option<u64> { ARMED.with(Cell::get) }
+    pub fn arm(epoch: u64) -> impl Drop {
+        struct Restore(Option<u64>);
+        impl Drop for Restore { fn drop(&mut self) { ARMED.with(|v| v.set(self.0)); } }
+        Restore(ARMED.with(|v| v.replace(Some(epoch))))
+    }
+}
+
 /// AUDIT-L1L2-20261123 L2N-01, the L1 stop-gap: L2 settlements only from a
 /// registered settler key. `u64::MAX` means INERT.
 ///

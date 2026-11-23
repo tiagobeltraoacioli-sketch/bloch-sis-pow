@@ -2656,3 +2656,34 @@ fn the_request_head_reports_forwarding_headers() {
     assert!(read("Forwarded: for=127.0.0.1\r\n"));
     assert!(read("X-Forwarded-For: 127.0.0.1\r\n"));
 }
+
+/// Audit L2N-01: `getl2settlement.program` names the program set in force
+/// and the pinned switch. On the mainnet L2 as installed today: the deployed
+/// program ("initial"), the lifetime deposit cap, and a switch that is
+/// pinned but neither armed nor final. The "switched" side of the report is
+/// covered where the switch can be taken, in the consensus crate's tests
+/// (`State::program_switched`, `State::supply_cap`).
+#[test]
+fn getl2settlement_reports_the_program_set_in_force() {
+    use bloch_pos_committee::l2_settlement::{mainnet, State};
+    let l2 = State::activated(mainnet::activation().expect("the mainnet activation is pinned")).unwrap();
+    let json = l2_program_json(&l2);
+    let text = |json: &Json, key: &str| json.get(key).and_then(Json::as_str).map(str::to_owned);
+    let program = mainnet::PROGRAM.unwrap();
+    assert_eq!(text(&json, "set").as_deref(), Some("initial"));
+    assert_eq!(text(&json, "configuration"), Some(crate::codec::hex32(&program.identities[3])));
+    assert_eq!(text(&json, "elf"), Some(crate::codec::hex32(&program.identities[4])));
+    assert_eq!(text(&json, "vkey_koalabear"), Some(crate::codec::hex32(&program.identities[5])));
+    assert_eq!(text(&json, "vkey_bn254"), Some(crate::codec::hex32(&program.identities[6])));
+    assert_eq!(text(&json, "proof_policy"), Some(crate::codec::hex32(&program.proof_policy)));
+    assert_eq!(text(&json, "supply_cap").as_deref(), Some("gross-minted"));
+    let switch = json.get("switch").expect("the mainnet L2 has a pinned switch");
+    assert_eq!(switch.get("activation_epoch"), Some(&Json::Null), "the gate is inert");
+    assert_eq!(switch.get("taken"), Some(&Json::Bool(false)));
+    assert_eq!(switch.get("final"), Some(&Json::Bool(false)), "candidate identities, not release values");
+    let to = switch.get("to").unwrap();
+    let pinned = mainnet::PROGRAM_SWITCH.unwrap();
+    assert_eq!(text(to, "vkey_bn254"), Some(crate::codec::hex32(&pinned.to[3])));
+    assert_eq!(text(to, "configuration"), Some(crate::codec::hex32(&pinned.to[0])));
+    assert_eq!(text(to, "supply_cap").as_deref(), Some("outstanding"));
+}
