@@ -1751,6 +1751,12 @@ thread_local! {
     static L2_DEPOSIT_INFLOW_FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether consensus reserves a DA place for the settler in `epoch`
+/// (L1X-04): the proposer then packs other keys' batches around it.
+fn l2_da_settler_slot_reserved(epoch: u64) -> bool {
+    bloch_pos_committee::params::l2_da_settler_slot_active(epoch)
+}
+
 /// Whether consensus bounds the L2 deposit inflow in `epoch` (L1X-02): the
 /// proposer then packs within the same bounds.
 fn l2_deposit_inflow_bounded(epoch: u64) -> bool {
@@ -6942,6 +6948,11 @@ impl Engine {
         let mut reserved = BTreeSet::new();
         // Consensus caps DA batches per block; the highest tips win the slots.
         let mut da_batches = 0usize;
+        // L1X-04: once the gate binds on an L2 with a settler set, batches
+        // from other keys leave one place to the settler's, whatever they
+        // tip. Without the head's L2 state nothing is reserved.
+        let da_settlers = l2.filter(|l2| l2_da_settler_slot_reserved(epoch) && !l2.settlers().is_empty());
+        let mut da_others = 0usize;
         // L1X-02: once the gate binds, consensus caps L2 deposits per block
         // the same way (the highest tips win the slots) and refuses a
         // deposit while the backlog is full. A settlement takes its whole
@@ -7059,9 +7070,18 @@ impl Engine {
                 if da_batches >= bloch_pos_committee::l2_settlement::da::MAX_PER_BLOCK {
                     continue;
                 }
+                let other = da_settlers.is_some_and(|l2| !l2.is_settler_key(&batch.funding_pubkey));
+                if other
+                    && da_others
+                        >= bloch_pos_committee::l2_settlement::da::MAX_PER_BLOCK
+                            - bloch_pos_committee::l2_settlement::da::RESERVED_FOR_SETTLER
+                {
+                    continue;
+                }
                 if !da_keys.insert((batch.l2_block_number, batch.commitment())) {
                     continue;
                 }
+                da_others += usize::from(other);
                 da_batches += 1;
             }
             if let PosTransaction::L2WithdrawClaim(claim) = tx {

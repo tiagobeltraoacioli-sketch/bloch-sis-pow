@@ -6989,6 +6989,22 @@ impl<V: SignatureVerifier> Transition<V> {
         {
             return Err(TransitionError::BlockGasLimitExceeded);
         }
+        // L1X-04 (gated): on an L2 with a settler set, DA batches from other
+        // keys leave one place of the block to the settler. Judged on the
+        // set before the block's transactions; a settlement (the only thing
+        // that changes the set) takes its whole block, so the set cannot
+        // move under a DA batch.
+        if crate::params::l2_da_settler_slot_active(block_epoch) {
+            if let Some(l2) = st.l2_settlement.as_ref().filter(|l2| !l2.settlers().is_empty()) {
+                let others = transactions
+                    .iter()
+                    .filter(|tx| matches!(tx, PosTransaction::L2DataAvailability(batch) if !l2.is_settler_key(&batch.funding_pubkey)))
+                    .count();
+                if others > crate::l2_settlement::da::MAX_PER_BLOCK - crate::l2_settlement::da::RESERVED_FOR_SETTLER {
+                    return Err(TransitionError::BlockGasLimitExceeded);
+                }
+            }
+        }
         // L1X-02 (gated): deposits per block are capped like DA batches, so
         // the inbox cannot grow faster than settlements consume it.
         if crate::params::l2_deposit_inflow_bound_active(block_epoch)

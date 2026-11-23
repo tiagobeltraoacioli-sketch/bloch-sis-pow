@@ -3094,6 +3094,50 @@ pub(crate) mod l2_settler_authorization_rehearsal {
     }
 }
 
+/// AUDIT-L1L2-20261123 L1X-04: one data-availability place per native block
+/// is reserved for the registered settler. `u64::MAX` means INERT.
+///
+/// Consensus admits `l2_settlement::da::MAX_PER_BLOCK` (4) DA batches per
+/// block from any funded key, for any payload, and the proposer fills them
+/// by tip: four junk batches per block keep the sequencer's batch, and with
+/// it every L2 block that carries user transactions, off L1 for the price of
+/// their fees. Once armed, on an L2 with a settler set installed
+/// (`L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH`), a block may carry at most
+/// `MAX_PER_BLOCK - da::RESERVED_FOR_SETTLER` (3) DA batches whose funding
+/// key is not a registered settler key. The total stays 4, so the bound on
+/// stored records does not move. Without a settler set the rule does not
+/// bind: it needs the set to know whose batch to protect.
+///
+/// It changes which blocks are valid, so arming needs a historical replay,
+/// mixed-fleet qualification and a coordinated epoch. It cannot precede the
+/// L2 itself. `l1x04_the_da_slot_gate_is_inert` pins the inert value.
+pub const L2_DA_SETTLER_SLOT_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    L2_DA_SETTLER_SLOT_ACTIVATION_EPOCH,
+    L2_SETTLEMENT_ACTIVATION_EPOCH
+));
+
+pub fn l2_da_settler_slot_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_da_settler_slot_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_DA_SETTLER_SLOT_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_da_settler_slot_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// Flag day for the native L2 settlement on a network that is already running
 /// (M8 part 2), activated on mainnet at the epoch recorded below.
 ///

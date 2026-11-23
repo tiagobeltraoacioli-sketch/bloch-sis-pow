@@ -32,7 +32,12 @@ fn wire(tx: &Transaction) -> PosTransaction {
 /// installation, so the source of L2 block 1 is frozen. With `keys` the
 /// settler gate is open at that boundary and the set is installed there.
 fn settler_fixture(keys: Option<Vec<Vec<u8>>>) -> (CommittedState, Vec<RandaoChain>) {
-    let (opened, mut chains) = funded_l2(1);
+    settler_fixture_with(1, keys)
+}
+
+/// [`settler_fixture`] with `coins` funded outputs of the depositor key.
+fn settler_fixture_with(coins: u32, keys: Option<Vec<Vec<u8>>>) -> (CommittedState, Vec<RandaoChain>) {
+    let (opened, mut chains) = funded_l2(coins);
     let boundary = 2 * crate::params::SLOTS_PER_EPOCH;
     let rolled = match keys {
         None => apply(&opened, boundary, &[], &mut chains).unwrap(),

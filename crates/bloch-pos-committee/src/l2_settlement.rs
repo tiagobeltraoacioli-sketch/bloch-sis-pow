@@ -108,6 +108,11 @@ pub mod da {
     /// DA transactions per native block, like blobs per block: inclusion is
     /// a fee auction, and the stored records stay bounded (see [`MAX_RECORDS`]).
     pub const MAX_PER_BLOCK: usize = 4;
+    /// Of those, the places only a registered settler key may take once
+    /// `params::L2_DA_SETTLER_SLOT_ACTIVATION_EPOCH` binds on an L2 with a
+    /// settler set (audit L1X-04): everybody else shares the rest.
+    pub const RESERVED_FOR_SETTLER: usize = 1;
+    const _: () = assert!(RESERVED_FOR_SETTLER < MAX_PER_BLOCK);
     /// A record serves settlements in the next `RETENTION_BLOCKS` native
     /// blocks after its inclusion, then expires (re-post the batch if the
     /// settlement has not landed by then).
@@ -1661,6 +1666,10 @@ impl State {
     /// The registered settler keys; empty = settlement is permissionless.
     pub fn settlers(&self) -> &[Vec<u8>] {
         &self.settlers
+    }
+    /// Whether `key` is a registered settler key.
+    pub fn is_settler_key(&self, key: &[u8]) -> bool {
+        self.settlers.iter().any(|k| k.as_slice() == key)
     }
     /// Install the settler set at the flag day (the transition, once, while
     /// none is installed). An invalid set installs nothing.
