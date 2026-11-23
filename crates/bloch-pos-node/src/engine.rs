@@ -903,17 +903,32 @@ const LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT: usize = 256;
 /// submissions are exempt.
 const LIFECYCLE_VERIFICATIONS_PER_DELIVERER_PER_SLOT: usize = 16;
 
-/// New hybrid verifications allowed across attestation, transaction and
-/// evidence network admission in one wall slot. Blocks draw on their own
-/// allowances below, so this traffic can never spend the units a block
-/// needs. Consensus execution and this node's own
+/// New hybrid verifications allowed across transaction and evidence network
+/// admission in one wall slot. Blocks and (audit L1N-02) attestations draw on
+/// their own allowances below, so this traffic can never spend the units a
+/// block or a vote needs. Consensus execution and this node's own
 /// proposal are deliberately outside this node-local relay budget. At the
 /// 30-second cadence, 1,024 leaves large honest burst headroom while making
 /// unique-signature CPU finite even as the bounded transport queue drains.
 ///
-/// With the two block allowances the worst case is 1,024 + 256 + 512 = 1,792
-/// units per wall slot (before the separate lifecycle allowance).
+/// With the vote allowance and the two block allowances the worst case is
+/// 1,024 + 1,024 + 256 + 512 = 2,816 units per wall slot (before the separate
+/// lifecycle allowance and the node's own headroom below).
 const GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT: usize = 1_024;
+
+/// New hybrid verifications allowed for attestation network admission in one
+/// wall slot, and one source's share of them (audit L1N-02). The figures the
+/// shared allowance gave votes before they were separated from transactions:
+/// transactions, which anyone can have verified, used to spend them.
+const VOTE_VERIFICATIONS_TOTAL_PER_SLOT: usize = 1_024;
+const VOTE_VERIFICATIONS_PER_SOURCE_PER_SLOT: usize = 128;
+
+/// Verification units this node's own submissions (the engine's internal
+/// path, e.g. the automatic KES rotation) may still spend in one wall slot
+/// after remote traffic has spent [`GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT`]
+/// (audit L1N-02). No frame and no RPC call draws on it, whatever its
+/// address: a loopback client can be a reverse proxy for anyone.
+const OWN_SUBMISSION_VERIFICATIONS_PER_SLOT: usize = 32;
 
 /// Proposer-signature verifications allowed for gossiped blocks in one wall
 /// slot, and one source's share of them. Live gossip carries about one new
@@ -935,8 +950,11 @@ const DIRECTED_BLOCK_VERIFICATIONS_PER_SOURCE_PER_SLOT: usize = crate::p2p::MAX_
 /// never relays an invalid signature.
 const BLOCK_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT: usize = 8;
 
-/// The same rule for attestations, transactions and evidence, counted apart
-/// from blocks so invalid votes never close a source's block door. Wider
+/// The same rule for attestations and, counted apart from them since audit
+/// L1N-02, for transactions and evidence; both apart from blocks, so invalid
+/// votes never close a source's block door and refused transactions never
+/// close its vote door. For transactions it also counts a verification that
+/// held but admitted nothing (`note_refused_after_verification`). Wider
 /// than the block allowance because a peer on a branch with a different
 /// registry can relay votes this node's keys do not verify; a quarter of one
 /// source's share still leaves 32 sources, not 8, needed to spend the total.
@@ -2426,6 +2444,10 @@ mod hf_replay_guard;
 #[cfg(test)]
 mod proposal_revalidation_tests;
 #[cfg(test)]
+mod relay_allowance_tests;
+#[cfg(test)]
+mod finalized_floor_door_tests;
+#[cfg(test)]
 mod vote_selection_tests;
 #[cfg(test)]
 mod authority_parked_tests;
@@ -2448,6 +2470,8 @@ mod verification;
 mod finality_cert;
 #[cfg(test)]
 mod finality_cert_tests;
+#[cfg(test)]
+mod finality_cert_share_tests;
 // Bloch Sentinel hooks: node-local, read-only, off by default.
 mod sentinel_hooks;
 
@@ -2859,6 +2883,15 @@ struct Engine {
     /// checkpoint. Same reason: pruning that never fires is pruning that is
     /// not wired.
     blocks_pruned: u64,
+    /// Network blocks refused at the door for sitting below the finalized
+    /// floor without being canonical (audit L1N-01).
+    rejected_below_finality: u64,
+    /// `(floor, wall epoch)` of the last [`Self::prune_below_finalized`]
+    /// sweep; `None` before the first and after a reorg. See
+    /// [`Self::prune_below_finalized_if_due`].
+    finalized_sweep: Option<(u64, u64)>,
+    /// Sweeps of the block inventory by [`Self::prune_below_finalized`].
+    finalized_sweeps: u64,
     /// Authenticated genesis-key proposal ids observed above the finalized
     /// floor, and their per-duty counts. This prevents deferred promotion
     /// from charging the same proposal twice while bounding equivocation
@@ -5222,6 +5255,34 @@ impl Engine {
             // genesis is synthesized, never received
             return (Verdict::Reject, None);
         }
+        // Audit L1N-01 (red team X1-1 part 1): the lower half of the door. A
+        // block from the network below this node's finalized floor that is
+        // not already canonical (those were answered "already known" above)
+        // can never be adopted: every block of a chain that keeps the
+        // finalized checkpoint and comes after it sits at or above the first
+        // slot of the finalized epoch, so this one is on a branch the
+        // finality latch refuses. It used to be verified, stored, pruned by
+        // `prune_below_finalized` at the end of this very call (so unknown
+        // again) and answered `Accept`, on every delivery: each replay
+        // vouched for its sender on the mesh and bought a proposer-signature
+        // verification, a fork-choice pass and a walk of the whole block
+        // inventory on the consensus thread.
+        //
+        // The test is exactly the one `prune_below_finalized` applies to a
+        // stored non-canonical block and to a parked one, read from the same
+        // state, so nothing is refused here that the sweep would have kept:
+        // sync and reorg candidates at or above the floor, the blocks a
+        // checkpoint-synced node still needs (all above its anchor's floor)
+        // and directed sync pages are untouched. Before any signature work.
+        // `Ignore`: whoever relays it has proved nothing either way.
+        // Node-local: no block validity depends on it. This node's own
+        // proposal (`Source::Local`) is not judged against it.
+        if src.bounded_by_wall_clock()
+            && self.finalized_floor_slot().is_some_and(|floor| env.header.slot < floor)
+        {
+            self.rejected_below_finality = self.rejected_below_finality.saturating_add(1);
+            return (Verdict::Ignore, None);
+        }
         // The upper half of the same door. `header.slot` is untrusted `u64`
         // and every slot/epoch walk downstream is linear in it — see
         // [`MAX_FUTURE_SLOTS`]. Refused BEFORE `self.blocks.insert`, so a
@@ -5646,7 +5707,7 @@ impl Engine {
         // fork choice, and it should see the chain the block already moved.
         self.schedule_held_release(id);
         // After `advance`, because that is what can have moved finality.
-        self.prune_below_finalized();
+        self.prune_below_finalized_if_due();
         (Verdict::Accept, Some((id, grew_registry)))
     }
 
@@ -5828,6 +5889,59 @@ impl Engine {
         true
     }
 
+    /// The first slot of this node's finalized epoch: the floor below which
+    /// a non-canonical block can never be adopted. `None` while nothing is
+    /// final, and on an epoch whose first slot overflows `u64` (no such chain
+    /// exists, and having no floor is the right answer if one did).
+    fn finalized_floor_slot(&self) -> Option<u64> {
+        let finalized_epoch = self.state.finality().finalized.epoch;
+        if finalized_epoch == 0 {
+            return None;
+        }
+        first_slot_of_epoch(finalized_epoch)
+    }
+
+    /// [`Self::prune_below_finalized`] when it can have something to do
+    /// (audit L1N-01, part 2).
+    ///
+    /// The sweep walks every stored block, and a finalized canonical block
+    /// keeps a header-only entry for the life of the process, so the walk is
+    /// linear in chain height. It used to run after every accepted block:
+    /// about 130 ms per block at 250,000 blocks in an optimised build, for
+    /// honest blocks and replayed ones alike.
+    ///
+    /// What the sweep removes is a non-canonical block, stored or parked,
+    /// below the floor. With the door refusing those from the network before
+    /// they are stored or parked (`ingest_one_deferred`), one can only appear
+    /// where the floor or the canonical set changed since the last sweep. So
+    /// the sweep runs when:
+    ///
+    /// * the floor is not the one last swept under (finality moved, in
+    ///   either direction: a reorg can land on a state with an older one);
+    /// * a reorg changed the canonical set (`do_reorg` forgets the last
+    ///   sweep);
+    /// * a parked block sits below the floor (a scan of the bounded orphan
+    ///   queue, so this costs nothing that grows with the chain);
+    /// * the wall epoch changed. Not needed by the argument above: it bounds
+    ///   how long anything a future code path stores below the floor can
+    ///   stay, to one epoch.
+    ///
+    /// Running the sweep less often can only keep such a block longer; it
+    /// never removes more (see "Why this cannot lose a branch" below). The
+    /// per-duty proposal counts are trimmed on every call as before: those
+    /// maps hold only what sits above the floor.
+    fn prune_below_finalized_if_due(&mut self) {
+        let Some(floor) = self.finalized_floor_slot() else { return };
+        let due = self.finalized_sweep != Some((floor, epoch_of(self.wall_slot())))
+            || self.orphans.iter().any(|(_, env, _, _, _)| env.header.slot < floor);
+        if due {
+            self.prune_below_finalized();
+            return;
+        }
+        self.proposal_admission_seen.retain(|_, (_, slot)| *slot >= floor);
+        self.proposal_admission_counts.retain(|(_, slot), _| *slot >= floor);
+    }
+
     /// Drop non-canonical blocks — stored and parked — that sit below the
     /// finalized checkpoint, and descendants made unreachable by that removal.
     /// Still-connected above-floor branches are not count-capped.
@@ -5843,15 +5957,11 @@ impl Engine {
     /// `self.blocks` for the whole canonical chain, and pruning them would
     /// turn its `expect("stored")` into a panic a reorg reaches.
     fn prune_below_finalized(&mut self) {
-        let finalized_epoch = self.state.finality().finalized.epoch;
-        if finalized_epoch == 0 {
+        let Some(floor) = self.finalized_floor_slot() else {
             return; // nothing is final yet; there is no floor to prune under
-        }
-        // `None` only on an epoch whose first slot overflows `u64` — no such
-        // chain exists, and pruning nothing is the right answer if one did.
-        let Some(floor) = first_slot_of_epoch(finalized_epoch) else {
-            return;
         };
+        self.finalized_sweep = Some((floor, epoch_of(self.wall_slot())));
+        self.finalized_sweeps = self.finalized_sweeps.saturating_add(1);
         self.proposal_admission_seen.retain(|_, (_, slot)| *slot >= floor);
         self.proposal_admission_counts.retain(|(_, slot), _| *slot >= floor);
         let mut pending: VecDeque<[u8; 32]> = self.blocks.iter()
@@ -6564,7 +6674,11 @@ impl Engine {
     /// peer is not waiting on a verdict, and a duplicate arriving twice over a
     /// full mesh is the normal case rather than a fault.
     fn on_transaction(&mut self, tx: PosTransaction) -> Result<Admitted, Refusal> {
-        self.on_transaction_from(tx, None)
+        // This node's own submission: no network input reaches this call, so
+        // it alone carries the private verification headroom (audit L1N-02).
+        let key = tx.canonical_bytes();
+        self.admit_transaction(tx, key, None, OWN_SUBMISSION_VERIFICATIONS_PER_SLOT, |_, _| ())
+            .map(|(outcome, ())| outcome)
     }
 
     fn on_transaction_from(
@@ -6585,6 +6699,21 @@ impl Engine {
         tx: PosTransaction,
         key: Vec<u8>,
         verification_source: Option<[u8; 32]>,
+        prepare_result: impl FnOnce(&PosTransaction, &[u8]) -> R,
+    ) -> Result<(Admitted, R), Refusal> {
+        // A frame or RPC call, attributed or not, never draws on the node's
+        // own verification headroom (audit L1N-02).
+        self.admit_transaction(tx, key, verification_source, 0, prepare_result)
+    }
+
+    /// The one admission path. `own_headroom` is the private verification
+    /// share of [`Self::on_transaction`]; every other caller passes zero.
+    fn admit_transaction<R>(
+        &mut self,
+        tx: PosTransaction,
+        key: Vec<u8>,
+        verification_source: Option<[u8; 32]>,
+        own_headroom: usize,
         prepare_result: impl FnOnce(&PosTransaction, &[u8]) -> R,
     ) -> Result<(Admitted, R), Refusal> {
         // Identity is witness-free but not free: transfers fold every input
@@ -6653,6 +6782,16 @@ impl Engine {
         if let Some(why) = l2_admission_refusal(&tx, self.state.l2_settlement()) {
             return Err(Refusal::Invalid(why));
         }
+        // Audit L1N-02: an input that a pending, admission-verified and
+        // still-backed transaction holds is refused HERE, before any
+        // signature of the newcomer is verified, as a lookup in the outpoint
+        // index. It used to be refused only after verification, which made
+        // every conflicting variant of one funded transfer a free unit of the
+        // allowance all sources share.
+        if let Some(refusal) = self.pending_input_refusal(&tx, epoch_of(self.wall_slot())) {
+            return Err(refusal);
+        }
+        let verified_units;
         if let PosTransaction::L2SettlementAsync(settlement) = &tx {
             let state = self.state.l2_settlement().ok_or(Refusal::Invalid("L2 settlement is not configured"))?;
             if self.mempool.values().any(|pending| matches!(pending, PosTransaction::L2SettlementAsync(_))) {
@@ -6667,9 +6806,11 @@ impl Engine {
                 GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
                 verification_source,
                 GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
-            ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
+            ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT)
+                .with_own_headroom(own_headroom);
             let admission = state.validate_async(settlement, &verifier);
             let limited = verifier.limited();
+            verified_units = verifier.reserved_units();
             drop(verifier);
             if limited {
                 return Err(Refusal::GossipVerificationLimited {
@@ -6692,7 +6833,8 @@ impl Engine {
                 GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
                 verification_source,
                 GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
-            ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
+            ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT)
+                .with_own_headroom(own_headroom);
             let admission = admissible_with_network_verifier(
                 &tx,
                 epoch_of(self.wall_slot()),
@@ -6700,6 +6842,7 @@ impl Engine {
                 &verifier,
             );
             let limited = verifier.limited();
+            verified_units = verifier.reserved_units();
             drop(verifier);
             if limited {
                 return Err(Refusal::GossipVerificationLimited {
@@ -6708,39 +6851,22 @@ impl Engine {
             }
             admission.map_err(Refusal::Invalid)?;
         }
-        if let PosTransaction::SlashingEvidence(evidence) = &tx {
-            if validator_lifecycle::native_slashing_admission_active(epoch_of(self.wall_slot())) {
-                self.precheck_slashing_evidence(evidence, verification_source)?;
+        // Audit L1N-02: everything above verified the newcomer's signatures
+        // and they held. A refusal from here on is one only this node's state
+        // decides, and it used to cost its sender nothing. The units that
+        // verification spent are charged to the source like a failure.
+        let capacity = match self.plan_authenticated_admission(&tx, key.len(), verification_source) {
+            Ok(capacity) => capacity,
+            Err(refusal) => {
+                self.gossip_verifier.note_refused_after_verification(
+                    self.wall_slot(),
+                    verification::VerificationLane::Relay,
+                    verification_source,
+                    verified_units,
+                );
+                return Err(refusal);
             }
-        }
-        // Audit L1S-02: a credential rotation and a commission update pay no
-        // fee and can be signed again and again; the pool takes one per
-        // validator per epoch (admitted here or seen in a canonical block).
-        // Before the signatures: the record is written only for a message
-        // that passed them, so nobody can set it for a validator it does not
-        // control, and a repeat costs no verification.
-        if let Some((key, epoch)) = once_per_epoch_key(&tx) {
-            if self.mempool.once_per_epoch_seen(key, epoch) {
-                return Err(Refusal::StateDependent(
-                    "one credential rotation and one commission update per validator per epoch",
-                ));
-            }
-        }
-        self.validate_lifecycle_admission(&tx, verification_source)?;
-        // Plan capacity cleanup without mutating the pool. A forged incoming
-        // signature must never evict either stale or currently paying entries.
-        //
-        // Only now, after every budgeted authentication of the incoming
-        // transaction above: planning walks this source's pending entries (or
-        // the whole pool under global pressure), and it used to run first, so
-        // a transaction nobody had authenticated yet bought pool-proportional
-        // work and was answered `TooManyFromSource` before its own signature
-        // was ever looked at. The plan also reserves pending inputs: see
-        // `plan_mempool_capacity`.
-        let capacity = self.plan_mempool_capacity(&tx, key.len(), epoch_of(self.wall_slot()))?;
-        if self.funded_mempool_conflict(&tx, &capacity.stale) {
-            return Err(Refusal::Invalid("funded deposit conflicts with a pending input or validator key"));
-        }
+        };
         // Commit only after every incoming admission check succeeds. Removing
         // state-dependent failures under pressure is retention, never a bar.
         for stale in &capacity.stale {
@@ -6771,6 +6897,51 @@ impl Engine {
         self.mempool.insert_with_txid(key, tx, txid);
         self.net.broadcast_transaction(broadcast);
         Ok((Admitted::New, prepared))
+    }
+
+    /// The state-dependent checks of an incoming transaction whose signatures
+    /// admission has already verified, ending in the capacity plan. Nothing
+    /// in the pool is changed here; the caller commits the plan.
+    fn plan_authenticated_admission(
+        &mut self,
+        tx: &PosTransaction,
+        encoded: usize,
+        verification_source: Option<[u8; 32]>,
+    ) -> Result<admission::CapacityPlan, Refusal> {
+        if let PosTransaction::SlashingEvidence(evidence) = tx {
+            if validator_lifecycle::native_slashing_admission_active(epoch_of(self.wall_slot())) {
+                self.precheck_slashing_evidence(evidence, verification_source)?;
+            }
+        }
+        // Audit L1S-02: a credential rotation and a commission update pay no
+        // fee and can be signed again and again; the pool takes one per
+        // validator per epoch (admitted here or seen in a canonical block).
+        // Before the signatures: the record is written only for a message
+        // that passed them, so nobody can set it for a validator it does not
+        // control, and a repeat costs no verification.
+        if let Some((key, epoch)) = once_per_epoch_key(tx) {
+            if self.mempool.once_per_epoch_seen(key, epoch) {
+                return Err(Refusal::StateDependent(
+                    "one credential rotation and one commission update per validator per epoch",
+                ));
+            }
+        }
+        self.validate_lifecycle_admission(tx, verification_source)?;
+        // Plan capacity cleanup without mutating the pool. A forged incoming
+        // signature must never evict either stale or currently paying entries.
+        //
+        // Only now, after every budgeted authentication of the incoming
+        // transaction above: planning walks this source's pending entries (or
+        // the whole pool under global pressure), and it used to run first, so
+        // a transaction nobody had authenticated yet bought pool-proportional
+        // work and was answered `TooManyFromSource` before its own signature
+        // was ever looked at. The plan also reserves pending inputs: see
+        // `plan_mempool_capacity`.
+        let capacity = self.plan_mempool_capacity(tx, encoded, epoch_of(self.wall_slot()))?;
+        if self.funded_mempool_conflict(tx, &capacity.stale) {
+            return Err(Refusal::Invalid(admission::FUNDED_INPUT_CONFLICT));
+        }
+        Ok(capacity)
     }
 
     /// Transactions for the block this node is about to propose.
@@ -7753,6 +7924,9 @@ impl Engine {
         // that since the fold now starts at the fork point, the replay this
         // used to charge here is mostly gone rather than moved.
         let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::Reorg);
+        // Audit L1N-01: a reorg changes which stored blocks are canonical, so
+        // the next `prune_below_finalized_if_due` sweeps whatever it did.
+        self.finalized_sweep = None;
         // `ancestor` was found by walking the canonical chain, so it is on it.
         // The `else` is unreachable; it refuses the reorg (the caller's
         // "invalid branch" answer) instead of killing the node.
@@ -8258,7 +8432,7 @@ impl Engine {
             // The branch's body votes count from here. Let fork choice see
             // them; if the branch is the heavier one this is the reorg.
             self.advance();
-            self.prune_below_finalized();
+            self.prune_below_finalized_if_due();
         }
         newly_validated
     }
@@ -8652,7 +8826,7 @@ impl Engine {
             .saturating_add(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         if newly_validated {
             self.advance();
-            self.prune_below_finalized();
+            self.prune_below_finalized_if_due();
         }
         Some(newly_validated)
     }
@@ -8979,11 +9153,16 @@ impl Engine {
         // therefore `committees_at`. Membership and key must come from one
         // snapshot; the old code took membership from here and the key from a
         // boot-time genesis table, which is the inconsistency being removed.
-        let verifier = self.gossip_verifier.budgeted_for_source(
+        //
+        // Audit L1N-02: votes draw on their own lane. They used to share the
+        // relay lane with transactions, which eight source addresses could
+        // spend in full every slot with valid signatures that cost nothing.
+        let verifier = self.gossip_verifier.budgeted_lane_for_source(
             self.wall_slot(),
-            GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+            verification::VerificationLane::Vote,
+            VOTE_VERIFICATIONS_TOTAL_PER_SLOT,
             admission.verification_source(),
-            GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+            VOTE_VERIFICATIONS_PER_SOURCE_PER_SLOT,
         ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
         let decision = match admission {
             AttestationAdmission::Fresh { att, verification_source } => pool.process_from_source(
@@ -9613,10 +9792,12 @@ impl Engine {
             RpcRequest::TxStatus(txid) => Ok(rpc::tx_status_json(self.tx_status(&txid))),
 
             RpcRequest::FinalityCertificate { epoch, block, set_source_epoch } => {
-                self.finality_certificate(epoch, block, set_source_epoch)
+                self.finality_certificate(verification_source, epoch, block, set_source_epoch)
             }
 
-            RpcRequest::LcProof { epoch, set_source_epoch, block } => self.lc_proof(epoch, set_source_epoch, block),
+            RpcRequest::LcProof { epoch, set_source_epoch, block } => {
+                self.lc_proof(verification_source, epoch, set_source_epoch, block)
+            }
 
             // Bloch Sentinel (node-local). The RPC backend answers it before
             // the queue, where the caller's address is known; a request that
@@ -10315,6 +10496,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
         orphans_evicted: 0,
         orphans_admitted: 0,
         blocks_pruned: 0,
+        rejected_below_finality: 0,
+        finalized_sweep: None,
+        finalized_sweeps: 0,
         proposal_admission_seen: BTreeMap::new(),
         proposal_admission_counts: BTreeMap::new(),
         rejected_unsigned: 0,
@@ -14240,6 +14424,9 @@ mod transfer_v2_end_to_end {
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
+            rejected_below_finality: 0,
+            finalized_sweep: None,
+            finalized_sweeps: 0,
             proposal_admission_seen: BTreeMap::new(),
             proposal_admission_counts: BTreeMap::new(),
             rejected_unsigned: 0,
@@ -15628,6 +15815,9 @@ mod perf_support {
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
+            rejected_below_finality: 0,
+            finalized_sweep: None,
+            finalized_sweeps: 0,
             proposal_admission_seen: BTreeMap::new(),
             proposal_admission_counts: BTreeMap::new(),
             rejected_unsigned: 0,
@@ -18127,6 +18317,9 @@ mod duty_view_anchor {
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
+            rejected_below_finality: 0,
+            finalized_sweep: None,
+            finalized_sweeps: 0,
             proposal_admission_seen: BTreeMap::new(),
             proposal_admission_counts: BTreeMap::new(),
             rejected_unsigned: 0,
@@ -18417,6 +18610,9 @@ mod slot_horizon {
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
+            rejected_below_finality: 0,
+            finalized_sweep: None,
+            finalized_sweeps: 0,
             proposal_admission_seen: BTreeMap::new(),
             proposal_admission_counts: BTreeMap::new(),
             rejected_unsigned: 0,

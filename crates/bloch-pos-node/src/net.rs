@@ -132,6 +132,8 @@ mod source_budget;
 pub(crate) mod rejection_log;
 pub(crate) use source_budget::Reservation as SourceReservation;
 pub(crate) use source_budget::verification_source_for_ip;
+#[cfg(test)]
+mod announced_frame_tests;
 
 /// What the engine receives from a transport.
 pub enum NetEvent {
@@ -1908,9 +1910,76 @@ fn read_frame_until(sock: &mut TcpStream, deadline: Instant) -> std::io::Result<
     if len == 0 || len > crate::codec::MAX_FIELD_LEN {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad frame length"));
     }
-    let mut buf = vec![0u8; len];
-    read_exact_until(sock, &mut buf, deadline)?;
-    Ok(buf)
+    read_announced_until(sock, len, deadline)
+}
+
+/// Bytes the buffer of a frame being read is extended by at a time; see
+/// [`AnnouncedFrame`].
+pub(crate) const FRAME_READ_STEP: usize = 64 * 1024;
+
+/// The buffer of a frame whose length the peer announced and whose bytes
+/// have not arrived yet (audit L1N-04).
+///
+/// Both mesh readers used to allocate the whole announced length at once,
+/// up to [`crate::codec::MAX_FIELD_LEN`] (8 MiB), on four bytes from a
+/// connection that had proven nothing, before the frame's type was known and
+/// before any budget saw it. Whether that memory was resident before the
+/// bytes arrived was left to the allocator: a zeroed allocation served from
+/// fresh pages costs nothing until written, one served from recycled memory
+/// is cleared, and so resident, immediately.
+///
+/// This buffer grows with what was actually received instead: its capacity
+/// is never more than twice the bytes delivered plus one step, and never
+/// more than the announced length. To hold memory here a peer has to send
+/// the bytes, under the frame's one deadline. Same bytes on the wire, same
+/// frame handed to the caller.
+pub(crate) struct AnnouncedFrame {
+    buf: Vec<u8>,
+    len: usize,
+}
+
+impl AnnouncedFrame {
+    pub(crate) fn new(len: usize) -> Self {
+        AnnouncedFrame { buf: Vec::new(), len }
+    }
+
+    /// The next part of the frame to fill, at most [`FRAME_READ_STEP`]
+    /// bytes, or `None` once the announced length has been handed out. The
+    /// caller fills the whole slice before asking again.
+    pub(crate) fn next_chunk(&mut self) -> Option<&mut [u8]> {
+        let at = self.buf.len();
+        if at >= self.len {
+            return None;
+        }
+        let end = at + (self.len - at).min(FRAME_READ_STEP);
+        if self.buf.capacity() < end {
+            // Double, so a full-size frame is copied a bounded number of
+            // times, but never past what was announced.
+            let want = self.buf.capacity().saturating_mul(2).clamp(end, self.len);
+            self.buf.reserve_exact(want - at);
+        }
+        self.buf.resize(end, 0);
+        Some(&mut self.buf[at..])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
+    pub(crate) fn finish(self) -> Vec<u8> {
+        self.buf
+    }
+}
+
+/// Read exactly `len` announced bytes before `deadline`, growing the buffer
+/// as they arrive ([`AnnouncedFrame`]).
+pub(crate) fn read_announced_until(sock: &mut TcpStream, len: usize, deadline: Instant) -> std::io::Result<Vec<u8>> {
+    let mut frame = AnnouncedFrame::new(len);
+    while let Some(chunk) = frame.next_chunk() {
+        read_exact_until(sock, chunk, deadline)?;
+    }
+    Ok(frame.finish())
 }
 
 /// A single frame budget covers both its length prefix and payload. `read_exact`
