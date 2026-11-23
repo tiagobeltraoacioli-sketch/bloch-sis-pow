@@ -912,8 +912,11 @@ impl Opener {
         if exact_plain.is_some_and(|plain| len != plain + TAG_LEN) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "mesh: bad authentication record length"));
         }
-        let mut buf = vec![0u8; len];
-        crate::net::read_exact_until(sock, &mut buf, deadline)?;
+        // Audit L1N-04: grown as the bytes arrive, not allocated from the
+        // announced length (`net::AnnouncedFrame`). The authentication
+        // record above is exact and small; every other record may announce
+        // up to the general bound before anything about it is authentic.
+        let mut buf = crate::net::read_announced_until(sock, len, deadline)?;
         if self.counter == u64::MAX {
             return Err(io::Error::other("mesh: receive counter exhausted"));
         }
@@ -1234,6 +1237,34 @@ mod tests {
         ss.write_record(&mut ssock, &[b"\x01block2"]).unwrap();
         assert_eq!(co.read_record(&mut csock, far()).unwrap(), b"\x01block");
         assert_eq!(co.read_record(&mut csock, far()).unwrap(), b"\x01block2");
+    }
+
+    /// Audit L1N-04: a sealed record larger than one read step is opened
+    /// unchanged by the reader that grows its buffer as the bytes arrive.
+    #[test]
+    fn a_sealed_record_spanning_read_steps_is_opened_unchanged() {
+        let a = Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, None));
+        let b = Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, None));
+        let (cli, srv) = pair(a, b);
+        let (Session::Sealed { sealer: mut cs, .. }, mut csock) = cli.unwrap() else { panic!("client not sealed") };
+        let (Session::Sealed { opener: mut so, .. }, mut ssock) = srv.unwrap() else { panic!("server not sealed") };
+        let step = crate::net::FRAME_READ_STEP;
+        let frames: Vec<Vec<u8>> = [step - TAG_LEN, step - TAG_LEN + 1, 3 * step + 17]
+            .iter()
+            .map(|len| (0..*len).map(|i| (i.wrapping_mul(31) ^ (i >> 8)) as u8).collect())
+            .collect();
+        let sent = frames.clone();
+        let writer = std::thread::spawn(move || {
+            for frame in &sent {
+                cs.write_record(&mut csock, &[frame]).unwrap();
+            }
+            csock
+        });
+        for (n, frame) in frames.iter().enumerate() {
+            let read = so.read_record(&mut ssock, Instant::now() + Duration::from_secs(20)).unwrap();
+            assert!(read == *frame, "record {n} ({} bytes) differs", frame.len());
+        }
+        drop(writer.join().unwrap());
     }
 
     #[test]
