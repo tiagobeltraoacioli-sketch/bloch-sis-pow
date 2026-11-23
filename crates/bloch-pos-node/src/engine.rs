@@ -2418,6 +2418,8 @@ mod proposal_revalidation_tests;
 #[cfg(test)]
 mod relay_allowance_tests;
 #[cfg(test)]
+mod finalized_floor_door_tests;
+#[cfg(test)]
 mod vote_selection_tests;
 #[cfg(test)]
 mod authority_parked_tests;
@@ -2851,6 +2853,15 @@ struct Engine {
     /// checkpoint. Same reason: pruning that never fires is pruning that is
     /// not wired.
     blocks_pruned: u64,
+    /// Network blocks refused at the door for sitting below the finalized
+    /// floor without being canonical (audit L1N-01).
+    rejected_below_finality: u64,
+    /// `(floor, wall epoch)` of the last [`Self::prune_below_finalized`]
+    /// sweep; `None` before the first and after a reorg. See
+    /// [`Self::prune_below_finalized_if_due`].
+    finalized_sweep: Option<(u64, u64)>,
+    /// Sweeps of the block inventory by [`Self::prune_below_finalized`].
+    finalized_sweeps: u64,
     /// Authenticated genesis-key proposal ids observed above the finalized
     /// floor, and their per-duty counts. This prevents deferred promotion
     /// from charging the same proposal twice while bounding equivocation
@@ -5214,6 +5225,34 @@ impl Engine {
             // genesis is synthesized, never received
             return (Verdict::Reject, None);
         }
+        // Audit L1N-01 (red team X1-1 part 1): the lower half of the door. A
+        // block from the network below this node's finalized floor that is
+        // not already canonical (those were answered "already known" above)
+        // can never be adopted: every block of a chain that keeps the
+        // finalized checkpoint and comes after it sits at or above the first
+        // slot of the finalized epoch, so this one is on a branch the
+        // finality latch refuses. It used to be verified, stored, pruned by
+        // `prune_below_finalized` at the end of this very call (so unknown
+        // again) and answered `Accept`, on every delivery: each replay
+        // vouched for its sender on the mesh and bought a proposer-signature
+        // verification, a fork-choice pass and a walk of the whole block
+        // inventory on the consensus thread.
+        //
+        // The test is exactly the one `prune_below_finalized` applies to a
+        // stored non-canonical block and to a parked one, read from the same
+        // state, so nothing is refused here that the sweep would have kept:
+        // sync and reorg candidates at or above the floor, the blocks a
+        // checkpoint-synced node still needs (all above its anchor's floor)
+        // and directed sync pages are untouched. Before any signature work.
+        // `Ignore`: whoever relays it has proved nothing either way.
+        // Node-local: no block validity depends on it. This node's own
+        // proposal (`Source::Local`) is not judged against it.
+        if src.bounded_by_wall_clock()
+            && self.finalized_floor_slot().is_some_and(|floor| env.header.slot < floor)
+        {
+            self.rejected_below_finality = self.rejected_below_finality.saturating_add(1);
+            return (Verdict::Ignore, None);
+        }
         // The upper half of the same door. `header.slot` is untrusted `u64`
         // and every slot/epoch walk downstream is linear in it — see
         // [`MAX_FUTURE_SLOTS`]. Refused BEFORE `self.blocks.insert`, so a
@@ -5638,7 +5677,7 @@ impl Engine {
         // fork choice, and it should see the chain the block already moved.
         self.schedule_held_release(id);
         // After `advance`, because that is what can have moved finality.
-        self.prune_below_finalized();
+        self.prune_below_finalized_if_due();
         (Verdict::Accept, Some((id, grew_registry)))
     }
 
@@ -5820,6 +5859,59 @@ impl Engine {
         true
     }
 
+    /// The first slot of this node's finalized epoch: the floor below which
+    /// a non-canonical block can never be adopted. `None` while nothing is
+    /// final, and on an epoch whose first slot overflows `u64` (no such chain
+    /// exists, and having no floor is the right answer if one did).
+    fn finalized_floor_slot(&self) -> Option<u64> {
+        let finalized_epoch = self.state.finality().finalized.epoch;
+        if finalized_epoch == 0 {
+            return None;
+        }
+        first_slot_of_epoch(finalized_epoch)
+    }
+
+    /// [`Self::prune_below_finalized`] when it can have something to do
+    /// (audit L1N-01, part 2).
+    ///
+    /// The sweep walks every stored block, and a finalized canonical block
+    /// keeps a header-only entry for the life of the process, so the walk is
+    /// linear in chain height. It used to run after every accepted block:
+    /// about 130 ms per block at 250,000 blocks in an optimised build, for
+    /// honest blocks and replayed ones alike.
+    ///
+    /// What the sweep removes is a non-canonical block, stored or parked,
+    /// below the floor. With the door refusing those from the network before
+    /// they are stored or parked (`ingest_one_deferred`), one can only appear
+    /// where the floor or the canonical set changed since the last sweep. So
+    /// the sweep runs when:
+    ///
+    /// * the floor is not the one last swept under (finality moved, in
+    ///   either direction: a reorg can land on a state with an older one);
+    /// * a reorg changed the canonical set (`do_reorg` forgets the last
+    ///   sweep);
+    /// * a parked block sits below the floor (a scan of the bounded orphan
+    ///   queue, so this costs nothing that grows with the chain);
+    /// * the wall epoch changed. Not needed by the argument above: it bounds
+    ///   how long anything a future code path stores below the floor can
+    ///   stay, to one epoch.
+    ///
+    /// Running the sweep less often can only keep such a block longer; it
+    /// never removes more (see "Why this cannot lose a branch" below). The
+    /// per-duty proposal counts are trimmed on every call as before: those
+    /// maps hold only what sits above the floor.
+    fn prune_below_finalized_if_due(&mut self) {
+        let Some(floor) = self.finalized_floor_slot() else { return };
+        let due = self.finalized_sweep != Some((floor, epoch_of(self.wall_slot())))
+            || self.orphans.iter().any(|(_, env, _, _, _)| env.header.slot < floor);
+        if due {
+            self.prune_below_finalized();
+            return;
+        }
+        self.proposal_admission_seen.retain(|_, (_, slot)| *slot >= floor);
+        self.proposal_admission_counts.retain(|(_, slot), _| *slot >= floor);
+    }
+
     /// Drop non-canonical blocks — stored and parked — that sit below the
     /// finalized checkpoint, and descendants made unreachable by that removal.
     /// Still-connected above-floor branches are not count-capped.
@@ -5835,15 +5927,11 @@ impl Engine {
     /// `self.blocks` for the whole canonical chain, and pruning them would
     /// turn its `expect("stored")` into a panic a reorg reaches.
     fn prune_below_finalized(&mut self) {
-        let finalized_epoch = self.state.finality().finalized.epoch;
-        if finalized_epoch == 0 {
+        let Some(floor) = self.finalized_floor_slot() else {
             return; // nothing is final yet; there is no floor to prune under
-        }
-        // `None` only on an epoch whose first slot overflows `u64` — no such
-        // chain exists, and pruning nothing is the right answer if one did.
-        let Some(floor) = first_slot_of_epoch(finalized_epoch) else {
-            return;
         };
+        self.finalized_sweep = Some((floor, epoch_of(self.wall_slot())));
+        self.finalized_sweeps = self.finalized_sweeps.saturating_add(1);
         self.proposal_admission_seen.retain(|_, (_, slot)| *slot >= floor);
         self.proposal_admission_counts.retain(|(_, slot), _| *slot >= floor);
         let mut pending: VecDeque<[u8; 32]> = self.blocks.iter()
@@ -7738,6 +7826,9 @@ impl Engine {
         // that since the fold now starts at the fork point, the replay this
         // used to charge here is mostly gone rather than moved.
         let _perf = bloch_pos_committee::perf::span(bloch_pos_committee::perf::Phase::Reorg);
+        // Audit L1N-01: a reorg changes which stored blocks are canonical, so
+        // the next `prune_below_finalized_if_due` sweeps whatever it did.
+        self.finalized_sweep = None;
         // `ancestor` was found by walking the canonical chain, so it is on it.
         // The `else` is unreachable; it refuses the reorg (the caller's
         // "invalid branch" answer) instead of killing the node.
@@ -8243,7 +8334,7 @@ impl Engine {
             // The branch's body votes count from here. Let fork choice see
             // them; if the branch is the heavier one this is the reorg.
             self.advance();
-            self.prune_below_finalized();
+            self.prune_below_finalized_if_due();
         }
         newly_validated
     }
@@ -8637,7 +8728,7 @@ impl Engine {
             .saturating_add(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         if newly_validated {
             self.advance();
-            self.prune_below_finalized();
+            self.prune_below_finalized_if_due();
         }
         Some(newly_validated)
     }
@@ -10305,6 +10396,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
         orphans_evicted: 0,
         orphans_admitted: 0,
         blocks_pruned: 0,
+        rejected_below_finality: 0,
+        finalized_sweep: None,
+        finalized_sweeps: 0,
         proposal_admission_seen: BTreeMap::new(),
         proposal_admission_counts: BTreeMap::new(),
         rejected_unsigned: 0,
@@ -14230,6 +14324,9 @@ mod transfer_v2_end_to_end {
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
+            rejected_below_finality: 0,
+            finalized_sweep: None,
+            finalized_sweeps: 0,
             proposal_admission_seen: BTreeMap::new(),
             proposal_admission_counts: BTreeMap::new(),
             rejected_unsigned: 0,
@@ -15618,6 +15715,9 @@ mod perf_support {
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
+            rejected_below_finality: 0,
+            finalized_sweep: None,
+            finalized_sweeps: 0,
             proposal_admission_seen: BTreeMap::new(),
             proposal_admission_counts: BTreeMap::new(),
             rejected_unsigned: 0,
@@ -18117,6 +18217,9 @@ mod duty_view_anchor {
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
+            rejected_below_finality: 0,
+            finalized_sweep: None,
+            finalized_sweeps: 0,
             proposal_admission_seen: BTreeMap::new(),
             proposal_admission_counts: BTreeMap::new(),
             rejected_unsigned: 0,
@@ -18407,6 +18510,9 @@ mod slot_horizon {
             orphans_evicted: 0,
             orphans_admitted: 0,
             blocks_pruned: 0,
+            rejected_below_finality: 0,
+            finalized_sweep: None,
+            finalized_sweeps: 0,
             proposal_admission_seen: BTreeMap::new(),
             proposal_admission_counts: BTreeMap::new(),
             rejected_unsigned: 0,
