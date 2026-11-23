@@ -1179,6 +1179,101 @@ pub(crate) mod settler_rehearsal {
     }
 }
 
+/// Which quantity the L2 guest program caps at the L1 supply (bloch-l2-evm
+/// `ChainSpec::supply_cap`, audits L2N-02 and L1X-03). It decides which
+/// deposits the program can mint, so the L1 deposit rule behind
+/// `params::L2_CUMULATIVE_DEPOSIT_CAP_ACTIVATION_EPOCH` follows it
+/// ([`State::deposit_within_supply_cap`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SupplyCap {
+    /// Everything ever minted: withdrawals free no room. Every program
+    /// deployed so far (`ChainSpec::mainnet`, `testnet`, `testnet_v3`).
+    GrossMinted,
+    /// Minted minus withdrawn, which never exceeds the L1 escrow
+    /// (`ChainSpec::mainnet_outstanding_cap`).
+    Outstanding,
+}
+
+/// Indices of the program part of [`Policy::identities`]: L2 configuration
+/// commitment, guest ELF, KoalaBear key and BN254 key. A settlement
+/// statement names all four and its proof is verified under the last one.
+/// The network part (indices 0..3: native network, native genesis, L2
+/// domain) never changes.
+pub const PROGRAM_IDENTITIES: std::ops::Range<usize> = 3..7;
+/// The program part of a policy, in [`PROGRAM_IDENTITIES`] order.
+pub type ProgramIdentities = [[u8; 32]; 4];
+
+/// A pinned replacement of the settlement program (audit L2N-01, the L1
+/// half of the proper fix): at the first epoch boundary behind
+/// `params::L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH`, an installed L2
+/// whose policy names exactly `from` names exactly `to` instead
+/// ([`State::switch_program`]).
+///
+/// There is no overlap. In the last block before that boundary only a
+/// settlement of `from` is valid; from the boundary block on only one of
+/// `to`. A proof of `from` still pending at the boundary is refused and the
+/// same L2 block is proved again under `to` (honest blocks are identical
+/// under both programs, bloch-l2-evm `docs/MAINNET-PROGRAM.md`; about one
+/// proof time, 15 to 60 minutes, and it can be made ahead of the boundary).
+/// An overlap would keep the old program acceptable exactly when everybody
+/// knows it is about to be retired: one foreign settlement of `from` inside
+/// the window leaves a head the new program cannot extend either (its
+/// context rule needs the parent record under the settled state root), i.e.
+/// the Critical the switch exists to close, in exchange for saving one
+/// proof.
+///
+/// Unchanged by a switch: the network identities, the chain id, the L2
+/// genesis, the attestor set, the head, the inbox and the pinned source
+/// (its commitment covers identities 0..3 only), and the proof policy
+/// commitment (it commits to the SP1 circuit version, the Groth16 wrapper
+/// key and the statement tag, none of which a guest change touches).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgramSwitch {
+    pub from: ProgramIdentities,
+    pub to: ProgramIdentities,
+    /// The deposit cap `to` enforces.
+    pub supply_cap: SupplyCap,
+}
+impl ProgramSwitch {
+    /// `to` is a complete, different program: no zero identity, another ELF
+    /// and other keys. The configuration may stay (a program that changes
+    /// only the guest logic); with the same configuration the deposit cap
+    /// is the deployed one.
+    pub fn valid(&self) -> bool {
+        !self.to.contains(&[0; 32])
+            && (1..4).all(|i| self.to[i] != self.from[i])
+            && (self.to[0] != self.from[0] || self.supply_cap == SupplyCap::GrossMinted)
+    }
+}
+
+/// The program switch pinned for the L2 of `policy`, in either direction of
+/// time: the mainnet switch for the mainnet L2, none for any other policy.
+/// Whether it is still ahead or already taken is read off the policy
+/// ([`State::pending_program_switch`], [`State::program_switched`]).
+pub fn program_switch_for(policy: &Policy) -> Option<ProgramSwitch> {
+    #[cfg(test)]
+    if let Some(switch) = program_switch_rehearsal::get() {
+        return Some(switch).filter(ProgramSwitch::valid);
+    }
+    if policy.chain_id != MAINNET_CHAIN_ID {
+        return None;
+    }
+    mainnet::PROGRAM_SWITCH.filter(ProgramSwitch::valid)
+}
+
+#[cfg(test)]
+pub(crate) mod program_switch_rehearsal {
+    use super::ProgramSwitch;
+    use std::cell::Cell;
+    thread_local! { static SWITCH: Cell<Option<ProgramSwitch>> = const { Cell::new(None) }; }
+    pub fn get() -> Option<ProgramSwitch> { SWITCH.with(Cell::get) }
+    pub fn set(switch: ProgramSwitch) -> impl Drop {
+        struct Restore(Option<ProgramSwitch>);
+        impl Drop for Restore { fn drop(&mut self) { SWITCH.with(|s| s.set(self.0)); } }
+        Restore(SWITCH.with(|s| s.replace(Some(switch))))
+    }
+}
+
 /// What a running network installs at the L2 flag day
 /// ([`crate::params::L2_SETTLEMENT_ACTIVATION_EPOCH`]): the policy, whether
 /// settlement is asynchronous (wire tag [`ASYNC_WIRE_TAG`]; deposits and
@@ -1226,7 +1321,7 @@ pub const MAINNET_CHAIN_ID: u64 = 700_770;
 /// no periodic signing and no admin key; a new set is a new policy (a new
 /// flag day).
 pub mod mainnet {
-    use super::{withdrawal, Activation, Policy, MAINNET_CHAIN_ID};
+    use super::{withdrawal, Activation, Policy, ProgramIdentities, ProgramSwitch, SupplyCap, MAINNET_CHAIN_ID};
     use crate::transition::funded::ADMISSION_PQ_KEY_BYTES;
 
     /// Settlement V3 over the asynchronous wire (deposits and claims need it).
@@ -1347,6 +1442,54 @@ pub mod mainnet {
     /// after it. `None` = UNSET: the gate cannot be armed
     /// (`params` asserts it at compile time).
     pub const SETTLER_SET: Option<&str> = None;
+
+    /// The program part of [`PROGRAM`] (all zero while it is unset).
+    pub const fn deployed_program() -> ProgramIdentities {
+        match &PROGRAM {
+            Some(program) => [program.identities[3], program.identities[4], program.identities[5], program.identities[6]],
+            None => [[0; 32]; 4],
+        }
+    }
+
+    /// The successor of [`PROGRAM`]'s program part: `settlement_v3_mainnet_bound`
+    /// (audit L2N-01: the block context is derived from L1 data inside the
+    /// guest; audit L2N-02: the deposit cap bounds the outstanding supply).
+    /// Installed by `params::L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH`
+    /// (INERT).
+    ///
+    /// **CANDIDATE VALUES, NOT FINAL** ([`PROGRAM_SWITCH_FINAL`] is `false`
+    /// and the gate cannot be armed while it is). They are the identities of
+    /// the candidate ELF built on 2026-11-23 from bloch-l2-evm
+    /// `codex/audit-fixes-l2-20261123` at `21ec80c` (ELF SHA-256
+    /// `ac2e1ca568fe28ffef7f2e55d4bc493d6348882b2e786bf3e5a10fefa9b38892`,
+    /// 3 101 968 bytes), derived with `bloch-evm-sp1-settlement-v3
+    /// --mainnet-bound identity`. Any change to the guest or to the L2 core
+    /// crate changes the ELF and both keys. The release that arms the gate
+    /// must replace all four values with those of the release ELF
+    /// (`build-reproducible.sh` at the release commit, `verify-reproducible.sh`
+    /// from two checkouts), add a real Groth16 proof of that program as a
+    /// native fixture (`mainnet_bound_program_real_groth16` in the
+    /// transition tests), and only then set [`PROGRAM_SWITCH_FINAL`]. See
+    /// `docs/L2-PROGRAM-SWITCH.md`.
+    pub const PROGRAM_SWITCH: Option<ProgramSwitch> = Some(ProgramSwitch {
+        from: deployed_program(),
+        to: [
+            // NOT FINAL. Execution configuration commitment
+            // (ChainSpec::mainnet_outstanding_cap, CONFIG:3:CANCUN).
+            h32("41ddb4dd4aae492e04f500d40be8471ac785e1264d32346dc0f1620d67cc928d"),
+            // NOT FINAL. settlement_v3_mainnet_bound ELF Keccak-256.
+            h32("c1dd6066941c83fc691f6b325b51ca771c680431df54d54d508c8593fcb6da6d"),
+            // NOT FINAL. SP1 KoalaBear verifying-key hash.
+            h32("72730d65162c55a9604a8d905e125a1f332bec342419058167520c455dea4112"),
+            // NOT FINAL. SP1 BN254 verifying-key hash (the Groth16 program key).
+            h32("00e4e61aca58b156a702546c85e125a1f6657d868906416073a90622ddea4112"),
+        ],
+        supply_cap: SupplyCap::Outstanding,
+    });
+    /// Whether [`PROGRAM_SWITCH`] holds release values: re-derived from a
+    /// reproducible release build and covered by a real Groth16 fixture.
+    /// `false` = placeholders; `params` refuses an armed gate at compile time.
+    pub const PROGRAM_SWITCH_FINAL: bool = false;
 
     /// The keys of a settler set text, or `None` if it is not a valid set.
     pub fn settler_keys(text: &str) -> Option<Vec<Vec<u8>>> {
@@ -1558,9 +1701,11 @@ impl Profile {
     }
 }
 
-/// Immutable network configuration, installed only by a new genesis constructor.
+/// Network configuration, installed only by a new genesis constructor.
 /// The first seven hashes follow the V2 statement: native network/genesis,
 /// L2 domain/configuration, guest ELF, KoalaBear key and BN254 key.
+/// Immutable, with one gated exception: the program part
+/// ([`PROGRAM_IDENTITIES`]) is replaced once by a pinned [`ProgramSwitch`].
 #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
@@ -1758,6 +1903,40 @@ impl State {
     pub(crate) fn restore_settlers(&mut self, keys: Vec<Vec<u8>>) {
         self.settlers = keys;
     }
+    /// The program identities in force: what a settlement must name and
+    /// the key its proof is verified under.
+    pub fn program(&self) -> ProgramIdentities {
+        let ids = &self.policy.identities;
+        [ids[3], ids[4], ids[5], ids[6]]
+    }
+    /// The pinned program switch this L2 has not taken yet: its policy still
+    /// names the switch's `from`.
+    pub fn pending_program_switch(&self) -> Option<ProgramSwitch> {
+        program_switch_for(&self.policy).filter(|switch| self.program() == switch.from)
+    }
+    /// The pinned program switch this L2 has taken: its policy names the
+    /// switch's `to`.
+    pub fn program_switched(&self) -> Option<ProgramSwitch> {
+        program_switch_for(&self.policy).filter(|switch| self.program() == switch.to)
+    }
+    /// The deposit cap of the program in force: the deployed lifetime cap
+    /// unless this L2 has switched to a program pinned with another one.
+    /// Anything unknown is judged by the deployed rule, the stricter one on
+    /// L1: a wrongly closed deposit window is recoverable, a deposit the
+    /// guest cannot mint is not.
+    pub fn supply_cap(&self) -> SupplyCap {
+        self.program_switched().map_or(SupplyCap::GrossMinted, |switch| switch.supply_cap)
+    }
+    /// Take the pinned program switch (the transition, at an epoch boundary
+    /// behind `params::L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH`).
+    /// Idempotent: nothing is pending once it is taken, or on an L2 whose
+    /// policy is not the switch's `from`. Returns whether the program
+    /// changed. Only the four program identities are written.
+    pub(crate) fn switch_program(&mut self) -> bool {
+        let Some(switch) = self.pending_program_switch() else { return false };
+        self.policy.identities[PROGRAM_IDENTITIES].copy_from_slice(&switch.to);
+        true
+    }
     pub fn asynchronous(&self) -> bool { self.asynchronous }
     pub fn profile(&self) -> &Profile { &self.profile }
     pub fn limits(&self) -> &withdrawal::Limits { &self.profile.limits }
@@ -1933,6 +2112,29 @@ impl State {
     /// caller judges).
     pub fn deposit_within_mint_cap(&self, sats: u64, cap_sat: u128) -> bool {
         self.cumulative_deposited_sat().checked_add(u128::from(sats)).is_some_and(|total| total <= cap_sat)
+    }
+    /// Whether the program in force can mint a deposit of `sats` under its
+    /// supply cap `cap_sat` (audits L1X-03 and L2N-02; binds only behind
+    /// `params::L2_CUMULATIVE_DEPOSIT_CAP_ACTIVATION_EPOCH`, which the caller
+    /// judges). The L1 rule mirrors the guest in force, never the other one:
+    ///
+    /// * [`SupplyCap::GrossMinted`]: the lifetime deposit total stays within
+    ///   the cap ([`Self::deposit_within_mint_cap`]). Past it deposits are
+    ///   closed for good under this program.
+    /// * [`SupplyCap::Outstanding`]: the escrow stays within the cap. The
+    ///   guest bounds minted minus withdrawn, which is at most the escrow at
+    ///   the time of the deposit (minted <= deposited, withdrawn on L2 >=
+    ///   claimed on L1), so a deposit admitted here is always mintable. On an
+    ///   L1 that conserves its supply the escrow cannot pass the cap, so
+    ///   this never closes deposits; it only keeps an L1 accounting fault
+    ///   from becoming an unmintable inbox record.
+    pub fn deposit_within_supply_cap(&self, sats: u64, cap_sat: u128) -> bool {
+        match self.supply_cap() {
+            SupplyCap::GrossMinted => self.deposit_within_mint_cap(sats, cap_sat),
+            SupplyCap::Outstanding => {
+                self.escrow_sat.checked_add(u128::from(sats)).is_some_and(|escrow| escrow <= cap_sat)
+            }
+        }
     }
     /// The bridge conservation invariant: escrow equals deposits minus claims.
     pub fn escrow_conserved(&self) -> bool {

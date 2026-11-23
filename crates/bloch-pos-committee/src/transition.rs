@@ -6334,6 +6334,18 @@ impl CommittedState {
                 }
             }
         }
+        // Audit L2N-01, the proper fix (gated): an installed L2 whose policy
+        // names the program a pinned switch replaces names its successor
+        // from this boundary on. The boundary block's own transactions are
+        // already judged under the new program; there is no overlap. Inert
+        // while `L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH` is the
+        // sentinel. After the installation above, so an L2 installed behind
+        // both gates switches at the same boundary.
+        if crate::params::l2_settlement_program_switch_active(next_epoch) {
+            if let Some(l2) = st.l2_settlement.as_mut() {
+                l2.switch_program();
+            }
+        }
         // Claim finality on this chain (HF1_CLAIM_FINALITY_EPOCH):
         // record this chain's checkpoint of the epoch being opened. `head` is
         // still the parent here — the last block strictly before the new

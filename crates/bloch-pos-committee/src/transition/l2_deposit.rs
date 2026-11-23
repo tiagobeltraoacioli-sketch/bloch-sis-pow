@@ -210,14 +210,17 @@ impl CommittedState {
         {
             return Err(R::Inbox);
         }
-        // L1X-03 (gated): the L2 can never mint a record past its
-        // cumulative mint cap, and every settlement must consume the next
-        // record, so such a deposit would stop the L2 for good.
+        // L1X-03 (gated): the L2 can never mint a record past its supply
+        // cap, and every settlement must consume the next record, so such a
+        // deposit would stop the L2 for good. Which cap that is belongs to
+        // the settlement program in force (lifetime mint under the deployed
+        // program, outstanding supply after the L2N-01 program switch): the
+        // rule follows the program, whichever of the two gates came first.
         if crate::params::l2_cumulative_deposit_cap_active(self.epoch)
             && !self
                 .l2_settlement
                 .as_ref()
-                .is_some_and(|l2| l2.deposit_within_mint_cap(tx.amount_sat, u128::from(MAX_L2_DEPOSIT_SAT)))
+                .is_some_and(|l2| l2.deposit_within_supply_cap(tx.amount_sat, u128::from(MAX_L2_DEPOSIT_SAT)))
         {
             return Err(R::Inbox);
         }
