@@ -1922,3 +1922,6 @@ fn a_position_still_queued_under_the_cap_can_always_be_withdrawn() {
         .collect();
     assert_eq!(paid, vec![amount - charge.base_fee_sat], "the whole principal, less the fee");
 }
+
+// AUDIT-L1L2-20261123 L1S-01: regression tests of the gated rule.
+include!("audit_20261123_l1s01_tests.rs");

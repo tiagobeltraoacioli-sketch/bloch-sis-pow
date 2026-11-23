@@ -2893,6 +2893,53 @@ pub(crate) mod commission_update_limit_rehearsal {
     }
 }
 
+/// AUDIT-L1L2-20261123 L1S-01: delegated stake that is past its nominal
+/// cool-down but still draining stays slashable. `u64::MAX` means INERT.
+///
+/// A deactivated funded position releases its activated stake at the
+/// network churn rate. `Registry::state_of` calls it `Inactive` as soon as
+/// `COOLDOWN_EPOCHS` (32) have passed, whatever is still activated, and the
+/// slashing exposure view masked every `Inactive` position as ineligible.
+/// When more than 32 epochs of churn budget are queued, the position still
+/// adds its activated amount to the validator's weight and still earns
+/// issuance and fees, yet loses nothing when the validator is slashed.
+///
+/// Once armed the mask is dropped: the penalty is priced on the activated
+/// amount (R1 M6), which is zero for a position that has drained or was
+/// withdrawn, so those stay unaffected. No state is added.
+///
+/// It changes the outcome of a slashing transaction, so arming needs a
+/// historical replay, mixed-fleet qualification and a coordinated epoch. It
+/// cannot precede funded delegation.
+/// `l1s01_fix_draining_stake_stays_slashable_until_it_has_drained` pins the
+/// inert value.
+pub const SLASH_DRAINING_STAKE_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    SLASH_DRAINING_STAKE_ACTIVATION_EPOCH,
+    FUNDED_DELEGATION_ACTIVATION_EPOCH
+));
+
+pub(crate) fn slash_draining_stake_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if slash_draining_stake_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, SLASH_DRAINING_STAKE_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod slash_draining_stake_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// Security review round 2, EXE-4: the L2 release window's over-cap
 /// exemption no longer depends on being the window's first claim.
 /// `u64::MAX` means INERT.

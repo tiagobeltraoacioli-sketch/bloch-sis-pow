@@ -5224,7 +5224,14 @@ impl CommittedState {
         let mut exposure: Vec<Delegation> = Vec::with_capacity(self.delegations.len());
         for d in &self.delegations {
             let mut view = *d;
-            if registry.state_of(d) == delegation::StakeState::Inactive {
+            // L1S-01 (gated): past the nominal cool-down a position may still
+            // be draining behind the churn budget. It then still carries
+            // weight and earns, so it stays exposed; the activated amount
+            // below is zero once it has drained, which is all the mask was
+            // for.
+            if !crate::params::slash_draining_stake_active(self.epoch)
+                && registry.state_of(d) == delegation::StakeState::Inactive
+            {
                 view.eligible = false;
             }
             // R1 M6: price the penalty on ACTIVATED stake, never the nominal
