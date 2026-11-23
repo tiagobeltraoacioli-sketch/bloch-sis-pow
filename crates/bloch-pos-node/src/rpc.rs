@@ -3668,6 +3668,38 @@ fn l2_program_json(l2: &bloch_pos_committee::l2_settlement::State) -> Json {
     Json::obj(out)
 }
 
+/// `getl2settlement.settler`: the settler set registered on this L2 (audit
+/// L2N-01, the L1 stop-gap). `registered` false = no set is installed and
+/// settlement is permissionless, which is the state of every L2 until the
+/// first epoch boundary behind L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH on
+/// a build that pins a set; `set_hash` is then null and `keys` empty.
+/// With a set: `set_hash` is `l2_settlement::settler::set_hash` (the value
+/// `bloch-pos l2-settler` prints and a rotation signs), and `keys` lists the
+/// set in order, `index` being the `signer` an authorization names. A
+/// settlement that rotates the set shows here from the block that accepts
+/// it, so a settler can compare its own set file with the chain instead of
+/// learning of a rotation from a refused settlement. Report only: nothing
+/// here feeds a rule.
+fn l2_settler_json(settlers: &[Vec<u8>]) -> Json {
+    use bloch_pos_committee::l2_settlement::settler;
+    use bloch_pos_committee::params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH as GATE;
+    use sha3::{Digest, Sha3_256};
+    let registered = !settlers.is_empty();
+    Json::obj(vec![
+        // null = the gate is inert in this build.
+        ("activation_epoch", if GATE == u64::MAX { Json::Null } else { Json::u(GATE) }),
+        ("registered", Json::Bool(registered)),
+        ("set_hash", if registered { Json::hex(&settler::set_hash(settlers)) } else { Json::Null }),
+        ("max_keys", Json::u(settler::MAX_KEYS as u64)),
+        ("keys", Json::Arr(settlers.iter().enumerate().map(|(index, key)| Json::obj(vec![
+            ("index", Json::u(index as u64)),
+            // The identifier `bloch-pos l2-settler` prints for a key.
+            ("sha3", Json::hex(&Sha3_256::digest(key).into())),
+            ("key", Json::s(crate::codec::hex(key))),
+        ])).collect())),
+    ])
+}
+
 pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedState) -> Json {
     let Some(l2) = state.l2_settlement() else { return Json::Null; };
     let policy = l2.policy();
@@ -3701,6 +3733,9 @@ pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedStat
         // block on. "supply_cap" is the deposit cap that program enforces,
         // which the L1 deposit rule follows (audits L1X-03, L2N-02).
         ("program", l2_program_json(l2)),
+        // The registered settler set (audit L2N-01 stop-gap): absent until
+        // the settler-authorization gate installs one.
+        ("settler", l2_settler_json(l2.settlers())),
         // What this L2 admits, fixed at installation: a development genesis
         // follows the node's devnet features; the running-network flag day
         // ("activated") admits everything on every build.

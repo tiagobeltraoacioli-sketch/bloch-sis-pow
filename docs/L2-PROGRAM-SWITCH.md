@@ -110,6 +110,12 @@ in force, `proof_policy`, `supply_cap` (`gross-minted` / `outstanding`), and
 `switch` (the pinned successor, `activation_epoch` or null while inert,
 `taken`, `final`).
 
+`getl2settlement.settler` (the stop-gap's side): `registered`, `set_hash`
+(null without a set), `keys` in signer order (`index`, `sha3`, `key`),
+`max_keys`, and `activation_epoch` (null while the settler-authorization gate
+is inert). A settler compares its set file with this report; a rotation shows
+from the block that accepts it. Report only.
+
 ## What the tests cover
 
 Consensus crate, `transition/audit_20261123_l2n01_switch_tests.rs`, with the

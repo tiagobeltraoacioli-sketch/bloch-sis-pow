@@ -2687,3 +2687,52 @@ fn getl2settlement_reports_the_program_set_in_force() {
     assert_eq!(text(to, "configuration"), Some(crate::codec::hex32(&pinned.to[0])));
     assert_eq!(text(to, "supply_cap").as_deref(), Some("outstanding"));
 }
+
+/// Audit L2N-01 (stop-gap): `getl2settlement.settler` reports the settler
+/// set registered on the L2. On the mainnet L2 as installed today no set is
+/// registered and the gate is inert; with a set, the report carries the hash
+/// a rotation signs and the keys in signer order, and it follows the state
+/// it is given (a rotated set reports the new hash).
+#[test]
+fn getl2settlement_reports_the_registered_settler_set() {
+    use bloch_pos_committee::l2_settlement::{mainnet, settler, State};
+    use bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES;
+    use sha3::{Digest, Sha3_256};
+
+    // Mainnet as installed: no set, inert gate, and the field is present in
+    // the full report.
+    let l2 = State::activated(mainnet::activation().expect("the mainnet activation is pinned")).unwrap();
+    assert!(l2.settlers().is_empty(), "no settler set is installed by this build");
+    let none = l2_settler_json(l2.settlers());
+    assert_eq!(none.get("activation_epoch"), Some(&Json::Null), "the gate is inert");
+    assert_eq!(none.get("registered"), Some(&Json::Bool(false)));
+    assert_eq!(none.get("set_hash"), Some(&Json::Null));
+    assert_eq!(none.get("max_keys").and_then(Json::as_u64), Some(settler::MAX_KEYS as u64));
+    assert!(matches!(none.get("keys"), Some(Json::Arr(keys)) if keys.is_empty()));
+
+    // A registered set of two keys, in signer order.
+    let key = |tag: u8| vec![tag; ADMISSION_PQ_KEY_BYTES];
+    let set = vec![key(7), key(9)];
+    assert!(settler::valid_set(&set));
+    let json = l2_settler_json(&set);
+    let text = |json: &Json, key: &str| json.get(key).and_then(Json::as_str).map(str::to_owned);
+    assert_eq!(json.get("registered"), Some(&Json::Bool(true)));
+    assert_eq!(text(&json, "set_hash"), Some(crate::codec::hex32(&settler::set_hash(&set))));
+    let Some(Json::Arr(keys)) = json.get("keys") else { panic!("keys is an array") };
+    assert_eq!(keys.len(), 2);
+    for (i, entry) in keys.iter().enumerate() {
+        assert_eq!(entry.get("index").and_then(Json::as_u64), Some(i as u64));
+        assert_eq!(text(entry, "key"), Some(crate::codec::hex(&set[i])));
+        assert_eq!(text(entry, "sha3"), Some(crate::codec::hex32(&Sha3_256::digest(&set[i]).into())));
+    }
+    // What the report prints is a set file `bloch-pos l2-settler` accepts:
+    // the keys, one per line, parse back to the same set and the same hash.
+    let file: String = keys.iter().map(|entry| text(entry, "key").unwrap() + "\n").collect();
+    assert_eq!(mainnet::settler_keys(&file), Some(set.clone()));
+
+    // Order is part of the set, and a rotation is a different report.
+    let rotated = vec![key(9), key(7)];
+    let after = l2_settler_json(&rotated);
+    assert_ne!(text(&after, "set_hash"), text(&json, "set_hash"));
+    assert_eq!(text(&after, "set_hash"), Some(crate::codec::hex32(&settler::set_hash(&rotated))));
+}
