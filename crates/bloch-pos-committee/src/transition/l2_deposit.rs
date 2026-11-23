@@ -201,6 +201,15 @@ impl CommittedState {
         if self.admission_network_domain != Some(tx.network_domain) {
             return Err(R::Network);
         }
+        // L1X-02 (gated): no deposit joins a full backlog. `self.epoch` is
+        // the committed epoch rolled to the judged block; in the node-local
+        // preflight it is the head's, which can only be more lenient at the
+        // flag-day boundary.
+        if crate::params::l2_deposit_inflow_bound_active(self.epoch)
+            && self.l2_settlement.as_ref().is_some_and(|l2| l2.deposit_backlog_full())
+        {
+            return Err(R::Inbox);
+        }
         if tx.tip_millisat_per_gas > fee_market::MAX_TIP_MILLISAT_PER_GAS {
             return Err(R::TipAboveCeiling);
         }

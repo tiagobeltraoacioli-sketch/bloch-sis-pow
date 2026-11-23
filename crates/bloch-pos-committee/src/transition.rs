@@ -6938,6 +6938,14 @@ impl<V: SignatureVerifier> Transition<V> {
         {
             return Err(TransitionError::BlockGasLimitExceeded);
         }
+        // L1X-02 (gated): deposits per block are capped like DA batches, so
+        // the inbox cannot grow faster than settlements consume it.
+        if crate::params::l2_deposit_inflow_bound_active(block_epoch)
+            && transactions.iter().filter(|tx| matches!(tx, PosTransaction::L2Deposit(_))).count()
+                > crate::l2_settlement::MAX_DEPOSITS_PER_BLOCK
+        {
+            return Err(TransitionError::BlockGasLimitExceeded);
+        }
         // F-9: free rescue commitments may take at most a quarter of the
         // block (params::RESCUE_COMMITS_MAX_PER_BLOCK). Only once the
         // emergency gate binds: below it each one is refused on its own.

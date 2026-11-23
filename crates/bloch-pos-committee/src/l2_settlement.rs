@@ -737,6 +737,22 @@ pub mod withdrawal {
 
 /// Records one settlement must consume, when pending: min(pending, this).
 pub const MAX_INBOX_PER_SETTLEMENT: u64 = 64;
+/// L2 deposits per native block once
+/// `params::L2_DEPOSIT_INFLOW_BOUND_ACTIVATION_EPOCH` binds (L1X-02). With one
+/// settlement per [`DEPOSIT_DRAIN_BLOCKS`] native blocks the inflow then
+/// does not exceed what a settlement consumes. Raise it together with
+/// [`MAX_INBOX_PER_SETTLEMENT`], never alone.
+pub const MAX_DEPOSITS_PER_BLOCK: usize = 2;
+/// Native blocks one settlement is assumed to take (one Groth16 proof on the
+/// mainnet prover: about 15 minutes of 30 s slots).
+pub const DEPOSIT_DRAIN_BLOCKS: u64 = 30;
+const _: () = assert!(MAX_DEPOSITS_PER_BLOCK as u64 * DEPOSIT_DRAIN_BLOCKS <= MAX_INBOX_PER_SETTLEMENT);
+/// Inbox records that may wait for a settlement once the same gate binds: a
+/// deposit is refused while this many are pending. The per-block cap assumes
+/// a prover speed; this bound does not. It also bounds what a stopped
+/// settler leaves in escrow, and the wait of an escrowed deposit to this
+/// many records, i.e. four settlements.
+pub const MAX_PENDING_DEPOSITS: u64 = 4 * MAX_INBOX_PER_SETTLEMENT;
 /// Exact L2 body framing tag (`bloch_l2_evm::node_primitives::NodeBodyV2`).
 const L2_BODY_TAG: &[u8] = b"BLOCH:EVM:BODY:2";
 
@@ -1487,6 +1503,16 @@ impl State {
     pub fn consumed(&self) -> u64 {
         self.consumed
     }
+    /// Inbox records no settlement has consumed yet.
+    pub fn pending_deposits(&self) -> u64 {
+        (self.inbox.len() as u64).saturating_sub(self.consumed)
+    }
+    /// Whether [`MAX_PENDING_DEPOSITS`] records are already waiting (L1X-02;
+    /// binds only behind `params::L2_DEPOSIT_INFLOW_BOUND_ACTIVATION_EPOCH`,
+    /// which the caller judges: this state does not know the epoch).
+    pub fn deposit_backlog_full(&self) -> bool {
+        self.pending_deposits() >= MAX_PENDING_DEPOSITS
+    }
     pub fn escrow_sat(&self) -> u128 {
         self.escrow_sat
     }
@@ -1683,6 +1709,11 @@ impl State {
             return Err(R::Full);
         }
         self.native_height.checked_add(1).ok_or(R::Full)
+    }
+    /// Test hook: move the inbox cursor without a settlement.
+    #[cfg(test)]
+    pub(crate) fn mark_consumed_for_test(&mut self, records: u64) {
+        self.consumed = (self.consumed + records).min(self.inbox.len() as u64);
     }
     /// Test hook: configure the attestor set after genesis.
     #[cfg(test)]

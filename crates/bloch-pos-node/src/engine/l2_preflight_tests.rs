@@ -412,6 +412,32 @@ mod funded_l2_transactions {
         assert_eq!(node.select_transactions(0), vec![honest]);
     }
 
+    /// AUDIT-L1L2-20261123 L1X-02: once consensus bounds the deposit inflow
+    /// the proposer packs at most MAX_DEPOSITS_PER_BLOCK deposits, highest
+    /// tips first, and none beyond the room left in the backlog; other
+    /// transactions are not counted. Unbounded while the gate is inert.
+    #[test]
+    fn deposits_are_packed_within_the_consensus_inflow_bound() {
+        use bloch_pos_committee::l2_settlement::MAX_DEPOSITS_PER_BLOCK;
+        let _clock = validator_lifecycle::clock_at(3);
+        let funds = funds_of(4);
+        let (node, _dir) = engine(&funds);
+        let l2 = node.state.l2_settlement().unwrap();
+        let entry = |i: usize, tip: u128| {
+            let mut tx = deposit(&node, OWNER, (funds[i].txid, funds[i].vout), Some(funds[i].value), 0x42);
+            tx.tip_millisat_per_gas = tip;
+            let tx = PosTransaction::L2Deposit(tx);
+            (tx.canonical_bytes(), tx)
+        };
+        let all: Vec<(Vec<u8>, PosTransaction)> = (0..4).map(|i| entry(i, 10 - i as u128)).collect();
+        let pack = || Engine::pack_transactions_on(0, [0; 32], all.iter().map(|(k, tx)| (k, tx)).collect(), Some(l2));
+        assert_eq!(pack().len(), 4, "inert: every deposit that fits");
+        L2_DEPOSIT_INFLOW_FORCED.with(|c| c.set(true));
+        let bounded = pack();
+        L2_DEPOSIT_INFLOW_FORCED.with(|c| c.set(false));
+        assert_eq!(bounded, all[..MAX_DEPOSITS_PER_BLOCK].iter().map(|(_, tx)| tx.clone()).collect::<Vec<_>>());
+    }
+
     /// W1-1: claims are packed once per leaf and within the escrow, as the
     /// transition will judge them one after another. (Packing does not judge
     /// the proofs; the preflight did.)

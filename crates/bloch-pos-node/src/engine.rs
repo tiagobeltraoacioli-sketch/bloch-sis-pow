@@ -1722,6 +1722,23 @@ fn body_transactions(env: &BlockEnvelope) -> Result<Vec<PosTransaction>, String>
 /// "staking txs pay zero gas", so treating them as lowest-priority here is
 /// consistent with the chain's own current pricing, not a new judgement this
 /// fix invents.
+#[cfg(test)]
+thread_local! {
+    /// Test switch: pack as if `L2_DEPOSIT_INFLOW_BOUND_ACTIVATION_EPOCH`
+    /// were armed (the committee's own rehearsal switch is private to it).
+    static L2_DEPOSIT_INFLOW_FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether consensus bounds the L2 deposit inflow in `epoch` (L1X-02): the
+/// proposer then packs within the same bounds.
+fn l2_deposit_inflow_bounded(epoch: u64) -> bool {
+    #[cfg(test)]
+    if L2_DEPOSIT_INFLOW_FORCED.with(|c| c.get()) {
+        return true;
+    }
+    bloch_pos_committee::params::l2_deposit_inflow_bound_active(epoch)
+}
+
 fn tx_tip_rate(tx: &PosTransaction) -> u128 {
     match tx {
         PosTransaction::Transfer { tip_millisat_per_gas, .. }
@@ -6883,6 +6900,15 @@ impl Engine {
         let mut reserved = BTreeSet::new();
         // Consensus caps DA batches per block; the highest tips win the slots.
         let mut da_batches = 0usize;
+        // L1X-02: once the gate binds, consensus caps L2 deposits per block
+        // the same way (the highest tips win the slots) and refuses a
+        // deposit while the backlog is full. A settlement takes its whole
+        // block, so the backlog only grows inside a block with deposits.
+        let deposits_bounded = l2_deposit_inflow_bounded(epoch);
+        let mut l2_deposits = 0usize;
+        let deposit_room = l2.map_or(u64::MAX, |l2| {
+            bloch_pos_committee::l2_settlement::MAX_PENDING_DEPOSITS.saturating_sub(l2.pending_deposits())
+        });
         // W1-1: what L2 transactions exclude each other on inside one block,
         // reserved the way outpoints are. The preflight judges each entry
         // alone against the head, so two that each pass it could be selected
@@ -6949,6 +6975,14 @@ impl Engine {
             let points = Self::spent_outpoints(tx).unwrap_or_default();
             if points.iter().any(|point| reserved.contains(point)) {
                 continue;
+            }
+            if deposits_bounded && matches!(tx, PosTransaction::L2Deposit(_)) {
+                if l2_deposits >= bloch_pos_committee::l2_settlement::MAX_DEPOSITS_PER_BLOCK
+                    || l2_deposits as u64 >= deposit_room
+                {
+                    continue;
+                }
+                l2_deposits += 1;
             }
             if let PosTransaction::L2DataAvailability(batch) = tx {
                 if da_batches >= bloch_pos_committee::l2_settlement::da::MAX_PER_BLOCK {

@@ -2981,6 +2981,57 @@ pub(crate) mod l2_fault_isolation_rehearsal {
     }
 }
 
+/// AUDIT-L1L2-20261123 L1X-02: the L2 deposit inflow is bounded by what
+/// settlements drain. `u64::MAX` means INERT.
+///
+/// One settlement consumes at most `l2_settlement::MAX_INBOX_PER_SETTLEMENT`
+/// (64) inbox records, in strict order, and needs one proof (about 30 native
+/// blocks on the mainnet prover), while a native block fits 61 minimum
+/// deposits. A cheap flood of minimum deposits therefore delays every honest
+/// deposit behind it by days, with its coins already escrowed. Once armed:
+///
+/// * a block carrying more than `l2_settlement::MAX_DEPOSITS_PER_BLOCK` L2
+///   deposits is invalid, like a block with more than `da::MAX_PER_BLOCK` DA
+///   batches;
+/// * a deposit is refused while `l2_settlement::MAX_PENDING_DEPOSITS` records
+///   are already waiting for a settlement, whatever the prover's speed.
+///
+/// A deposit that does not fit is not escrowed: it stays in the sender's
+/// hands and competes by tip. The worst wait of an escrowed deposit is then
+/// `MAX_PENDING_DEPOSITS / MAX_INBOX_PER_SETTLEMENT` settlements, and a
+/// stopped settler holds at most `MAX_PENDING_DEPOSITS` records in escrow.
+///
+/// It changes which blocks are valid, so arming needs a historical replay,
+/// mixed-fleet qualification and a coordinated epoch; there is no runtime
+/// override. It cannot precede the L2 settlement itself.
+/// `l1x02_the_deposit_inflow_gate_is_inert` pins the inert value.
+pub const L2_DEPOSIT_INFLOW_BOUND_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    L2_DEPOSIT_INFLOW_BOUND_ACTIVATION_EPOCH,
+    L2_SETTLEMENT_ACTIVATION_EPOCH
+));
+
+pub fn l2_deposit_inflow_bound_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_deposit_inflow_bound_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_DEPOSIT_INFLOW_BOUND_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_deposit_inflow_bound_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// Flag day for the native L2 settlement on a network that is already running
 /// (M8 part 2), activated on mainnet at the epoch recorded below.
 ///

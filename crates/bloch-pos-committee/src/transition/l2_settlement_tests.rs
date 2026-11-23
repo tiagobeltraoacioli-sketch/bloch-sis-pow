@@ -4164,4 +4164,11 @@ mod l2_tests {
         use super::*;
         include!("l2_isolation_fuzz_tests.rs");
     }
+    /// AUDIT-L1L2-20261123: regression tests of the audit fixes, one file
+    /// per finding, over shared fixtures.
+    mod audit_20261123 {
+        use super::*;
+        include!("audit_20261123_fixtures.rs");
+        include!("audit_20261123_l1x02_tests.rs");
+    }
 }
