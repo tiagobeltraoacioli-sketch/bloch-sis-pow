@@ -48,6 +48,7 @@ mod codec;
 mod connection_limit;
 mod devnet_tools;
 mod l2_da_cli;
+mod l2_settler_cli;
 mod l2_claim_cli;
 mod l2_deposit_cli;
 mod engine;
@@ -376,6 +377,12 @@ fn main() {
         Some("l2-da") => {
             if let Err(error) = l2_da_cli::run(&args[1..]) {
                 eprintln!("l2-da: {error}");
+                exit(2);
+            }
+        }
+        Some("l2-settler") => {
+            if let Err(error) = l2_settler_cli::run(&args[1..]) {
+                eprintln!("l2-settler: {error}");
                 exit(2);
             }
         }
