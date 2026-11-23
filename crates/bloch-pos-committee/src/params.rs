@@ -3304,6 +3304,36 @@ pub(crate) fn l2_settler_authorization_active(epoch: u64) -> bool {
     epoch_gate_active(epoch, L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH)
 }
 
+/// Whether the consensus settlement decoder parses the settler
+/// authorization trailer (audit L2N-01; review item C1). A property of the
+/// BUILD, not of an epoch: false while the gate is inert, so the decoder of
+/// an inert build is the decoder of the releases before the trailer existed.
+/// The decoder has no epoch to read; in a build that arms the gate the
+/// trailer decodes at every epoch and the transition refuses it until the
+/// set is installed, which is the verdict an older node reaches at its
+/// decoder.
+pub(crate) fn l2_settler_trailer_decodable() -> bool {
+    #[cfg(test)]
+    if l2_settler_authorization_rehearsal::enabled() || l2_settler_trailer_rehearsal::enabled() {
+        return true;
+    }
+    L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH != u64::MAX
+}
+
+/// Test-only: the decoder of a build that arms the settler gate, without
+/// opening the gate itself (no set is installed by it).
+#[cfg(test)]
+pub(crate) mod l2_settler_trailer_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod l2_settler_authorization_rehearsal {
     use std::cell::Cell;

@@ -91,7 +91,7 @@ fn describe_set(label: &str, keys: &[Vec<u8>]) {
 /// An asynchronous V3 settlement from its hex file.
 fn read_settlement(path: &str) -> Result<Transaction, String> {
     let bytes = codec::unhex(read_text(path)?.trim())?;
-    let tx = Transaction::decode_async(&bytes).ok_or("not an asynchronous L2 settlement (wire 0x13)")?;
+    let tx = Transaction::decode_async_with_authorization(&bytes).ok_or("not an asynchronous L2 settlement (wire 0x13)")?;
     if tx.statement.len() != bloch_pos_committee::l2_settlement::STATEMENT_V3_BYTES {
         return Err("only a V3 settlement carries a settler authorization".into());
     }
@@ -154,7 +154,7 @@ pub(crate) fn check_authorization(
     // One encoding, within the wire bounds: what the network will decode.
     let mut signed = tx.clone();
     signed.authorization = Some(authorization.clone());
-    if Transaction::decode_async(&signed.encode_async()).as_ref() != Some(&signed) {
+    if Transaction::decode_async_with_authorization(&signed.encode_async()).as_ref() != Some(&signed) {
         return Err("the authorized settlement does not decode (signature or set out of bounds)".into());
     }
     Ok(())
@@ -342,7 +342,7 @@ mod tests {
         statement[..22].copy_from_slice(b"BLOCH:EVM:SETTLEMENT:3");
         statement[STATEMENT_CHAIN_ID..STATEMENT_CHAIN_ID + 8].copy_from_slice(&chain_id.to_be_bytes());
         let tx = Transaction { proof_policy: [0x15; 32], statement, proof: [fill ^ 0x5a; PROOF_BYTES], authorization: None };
-        assert_eq!(Transaction::decode_async(&tx.encode_async()), Some(tx.clone()));
+        assert_eq!(Transaction::decode_async_with_authorization(&tx.encode_async()), Some(tx.clone()));
         tx
     }
 
@@ -375,7 +375,7 @@ mod tests {
         let wire = signed.encode_async();
         // The unsigned bytes are a prefix: the form deployed today plus the trailer.
         assert_eq!(&wire[..TRANSACTION_V3_BYTES], tx.encode_async().as_slice());
-        assert_eq!(Transaction::decode_async(&wire), Some(signed.clone()));
+        assert_eq!(Transaction::decode_async_with_authorization(&wire), Some(signed.clone()));
         assert_eq!(signed.commitment(), tx.commitment(), "the head commitment does not cover the trailer");
         // Exactly the three steps of State::check_authorization.
         let digest = settler::digest(&domain, chain, &tx.commitment(), None);
@@ -440,11 +440,11 @@ mod tests {
         let set = mainnet::settler_keys(&field(VECTOR, "set").replace(',', "\n")).expect("set");
         assert_eq!(codec::hex32(&settler::set_hash(&set)), field(VECTOR, "set_hash"));
         for case in ["plain", "rotation"] {
-            let unsigned = Transaction::decode_async(&bytes(VECTOR, "unsigned_tx")).expect("unsigned settlement");
+            let unsigned = Transaction::decode_async_with_authorization(&bytes(VECTOR, "unsigned_tx")).expect("unsigned settlement");
             assert!(unsigned.authorization.is_none());
             assert_eq!(codec::hex32(&unsigned.commitment()), field(VECTOR, "commitment"));
             let wire = bytes(VECTOR, &format!("{case}_authorized_tx"));
-            let signed = Transaction::decode_async(&wire).expect("authorized settlement");
+            let signed = Transaction::decode_async_with_authorization(&wire).expect("authorized settlement");
             assert_eq!(signed.encode_async(), wire, "one encoding");
             assert_eq!(&wire[..TRANSACTION_V3_BYTES], unsigned.encode_async().as_slice());
             let authorization = signed.authorization.clone().expect("trailer");

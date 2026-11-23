@@ -98,6 +98,69 @@ fn l2n01_inert_settlement_stays_permissionless_and_refuses_a_trailer() {
     assert_eq!(l2.validate_async(&signed, &ProofDouble), Err(Reject::Settler));
     assert_eq!(l2.pending_async_refusal(&signed, *pre.head.as_bytes(), pre.slot), Some(Reject::Settler));
     assert!(judged(&pre, &block, &signed).is_err());
+    // Review item C1: with the gate inert the DECODER is the base decoder.
+    // A settlement followed by a trailer is not a transaction for the block
+    // door, the mempool or the RPC, under either wire tag, and every length
+    // other than the two exact settlement lengths is refused as before.
+    assert!(!crate::params::l2_settler_trailer_decodable());
+    let plain = next_settlement(&pre, 0);
+    let bytes = signed.encode_async();
+    assert_eq!(Transaction::decode_async(&bytes), None);
+    assert_eq!(PosTransaction::from_canonical_bytes(&bytes), Err(TxDecodeError::Truncated));
+    let mut sync = bytes.clone();
+    sync[0] = crate::l2_settlement::WIRE_TAG;
+    assert_eq!(Transaction::decode(&sync), None);
+    assert_eq!(PosTransaction::from_canonical_bytes(&sync), Err(TxDecodeError::Truncated));
+    let exact = plain.encode_async();
+    assert_eq!(exact.len(), crate::l2_settlement::TRANSACTION_V3_BYTES);
+    assert_eq!(Transaction::decode_async(&exact), Some(plain.clone()));
+    for extra in [1usize, 2, 5, 100, settler::MAX_AUTHORIZATION_BYTES, settler::MAX_AUTHORIZATION_BYTES + 1] {
+        let mut longer = exact.clone();
+        longer.resize(exact.len() + extra, 0);
+        assert_eq!(Transaction::decode_async(&longer), None, "{extra} bytes after the proof");
+    }
+    // The same bytes decode only for a build that arms the gate, and are
+    // then refused by the transition on an L2 without a set (the test above).
+    let _decoder = crate::params::l2_settler_trailer_rehearsal::open();
+    assert_eq!(Transaction::decode_async(&bytes), Some(signed.clone()));
+    assert_eq!(PosTransaction::from_canonical_bytes(&bytes), Ok(wire(&signed)));
+}
+
+/// Review item I7: the bytes a settlement is charged are a consensus value
+/// (they are the block's `block_tx_bytes`, committed in the fee leaf of the
+/// state root and read by the next block's base fee). Nothing pinned them:
+/// an off-by-one in the charge passed every suite. As shipped, a V3
+/// settlement block commits exactly the encoded length every release has
+/// charged, 1 + 32 + statement + proof, and the full block gas; the value is
+/// written out here, not taken from `wire_len`.
+#[test]
+fn l2n01_a_settlement_block_commits_its_exact_byte_charge_in_the_fee_leaf() {
+    let (pre, mut chains) = settler_fixture(None);
+    let block = template(&pre, &mut chains);
+    let tx = next_settlement(&pre, 0);
+    let charged = (1 + 32 + crate::l2_settlement::STATEMENT_V3_BYTES + crate::l2_settlement::PROOF_BYTES) as u64;
+    assert_eq!(charged, 1_155, "tag, proof policy, 766-byte V3 statement, 356-byte proof");
+    assert_eq!(tx.encode_async().len() as u64, charged);
+    let post = judged(&pre, &block, &tx).expect("the settlement block");
+    assert_eq!(post.block_tx_bytes, charged);
+    assert_eq!(post.block_gas_used, fee_market::BLOCK_GAS_LIMIT);
+    // The same block without the settlement commits no bytes and no gas.
+    let empty = body_verdict(&pre, &block, &[]).expect("the empty block");
+    assert_eq!((empty.block_tx_bytes, empty.block_gas_used), (0, 0));
+    // The leaf is part of the state root: one byte more is another root.
+    let mut off_by_one = post.clone();
+    off_by_one.block_tx_bytes += 1;
+    assert_ne!(off_by_one.compute_root(), post.compute_root());
+    // Behind the gate an authorized settlement is charged its encoded
+    // length too, trailer included (never reachable while the gate is inert:
+    // the decoder knows no trailer and `apply` refuses one).
+    let keys = vec![settler_key(1)];
+    let (armed, mut armed_chains) = settler_fixture(Some(keys));
+    let armed_block = template(&armed, &mut armed_chains);
+    let signed = authorize(&armed, next_settlement(&armed, 0), &settler_key(1), 0, None);
+    let settled = judged(&armed, &armed_block, &signed).expect("the settler's settlement");
+    assert_eq!(settled.block_tx_bytes, signed.encode_async().len() as u64);
+    assert!(settled.block_tx_bytes > charged);
 }
 
 /// Armed: the set is installed at the boundary and committed; the finding's
@@ -154,7 +217,12 @@ fn l2n01_only_a_registered_settler_settles_behind_the_gate() {
     assert_eq!(l2.pending_async_refusal(&honest, *pre.head.as_bytes(), pre.slot), None);
     let encoded = wire(&honest).canonical_bytes();
     assert_eq!(encoded.len(), honest.wire_len());
-    assert_eq!(PosTransaction::from_canonical_bytes(&encoded), Ok(wire(&honest)));
+    // The trailer is wire format only for a build that arms the gate.
+    assert_eq!(PosTransaction::from_canonical_bytes(&encoded), Err(TxDecodeError::Truncated));
+    {
+        let _decoder = crate::params::l2_settler_trailer_rehearsal::open();
+        assert_eq!(PosTransaction::from_canonical_bytes(&encoded), Ok(wire(&honest)));
+    }
     let post = judged(&pre, &block, &honest).expect("the settler's settlement");
     let settled = post.l2_settlement().unwrap();
     assert_eq!(settled.settled_number(), 1);
@@ -179,7 +247,10 @@ fn l2n01_a_registered_key_rotates_the_set_with_a_settlement() {
     grafted.authorization.as_mut().unwrap().next_set = Some(next.clone());
     assert_eq!(pre.l2_settlement().unwrap().validate_async(&grafted, &ProofDouble), Err(Reject::Settler));
     let rotating = authorize(&pre, next_settlement(&pre, 0), &settler_key(2), 1, Some(next.clone()));
-    assert_eq!(PosTransaction::from_canonical_bytes(&wire(&rotating).canonical_bytes()), Ok(wire(&rotating)));
+    {
+        let _decoder = crate::params::l2_settler_trailer_rehearsal::open();
+        assert_eq!(PosTransaction::from_canonical_bytes(&wire(&rotating).canonical_bytes()), Ok(wire(&rotating)));
+    }
     let post = judged(&pre, &block, &rotating).expect("rotation");
     assert_eq!(post.l2_settlement().unwrap().settlers(), next.as_slice());
 
@@ -211,6 +282,11 @@ fn l2n01_the_authorization_trailer_is_canonical() {
     let (pre, _) = settler_fixture(None);
     let signed = authorize(&pre, next_settlement(&pre, 0), &settler_key(1), 0, Some(vec![settler_key(3), settler_key(4)]));
     let bytes = signed.encode_async();
+    // Inert build: the consensus decoder knows no trailer; only the tooling
+    // decoder reads one.
+    assert_eq!(Transaction::decode_async(&bytes), None);
+    assert_eq!(Transaction::decode_async_with_authorization(&bytes), Some(signed.clone()));
+    let _decoder = crate::params::l2_settler_trailer_rehearsal::open();
     assert_eq!(Transaction::decode_async(&bytes), Some(signed.clone()));
     // Trailing or missing bytes, an empty signature, too many or repeated keys.
     let mut long = bytes.clone();

@@ -1062,26 +1062,47 @@ pub struct Transaction {
     pub proof: [u8; PROOF_BYTES],
     /// Settler authorization (audit L2N-01), a trailer after the proof of a
     /// V3 settlement. `None` is the wire form every settlement has had so
-    /// far. Consensus accepts `Some` only on an L2 with a settler set
-    /// installed, i.e. behind
-    /// `params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH`; before that a
-    /// transaction with a trailer is refused like one an older node cannot
-    /// decode.
+    /// far. The consensus decoder yields `Some` only in a build that arms
+    /// `params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH` (see
+    /// [`decode_async`](Self::decode_async)), and consensus accepts it only
+    /// on an L2 with a settler set installed behind that gate.
     pub authorization: Option<settler::Authorization>,
 }
 impl Transaction {
+    /// The consensus decoder of a synchronous settlement (block bodies,
+    /// mempool, RPC). See [`decode_async`](Self::decode_async) for the
+    /// trailer rule.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        Self::decode_tag(bytes, WIRE_TAG)
+        Self::decode_tag(bytes, WIRE_TAG, crate::params::l2_settler_trailer_decodable())
     }
+    /// The consensus decoder of an asynchronous settlement (block bodies,
+    /// mempool, RPC). The authorization trailer is part of the wire format
+    /// only in a build that arms
+    /// `params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH`: while that gate
+    /// is inert these bytes decode exactly as they did before the trailer
+    /// existed (the two exact settlement lengths and nothing else), so a
+    /// settlement with a trailer is not a transaction at all. In an armed
+    /// build the trailer decodes at every epoch and
+    /// `State::check_authorization` refuses it on an L2 without a settler
+    /// set; that refusal stays in an inert build too, as defence in depth
+    /// for a `Transaction` value built in memory.
     pub fn decode_async(bytes: &[u8]) -> Option<Self> {
-        Self::decode_tag(bytes, ASYNC_WIRE_TAG)
+        Self::decode_tag(bytes, ASYNC_WIRE_TAG, crate::params::l2_settler_trailer_decodable())
     }
-    fn decode_tag(bytes: &[u8], tag: u8) -> Option<Self> {
+    /// TOOLING ONLY (`bloch-pos l2-settler`, test vectors, readers that
+    /// inspect an authorized settlement before the gate is armed): decodes an
+    /// asynchronous settlement with or without the authorization trailer,
+    /// whatever the gate. Never used to judge a block or a mempool
+    /// transaction.
+    pub fn decode_async_with_authorization(bytes: &[u8]) -> Option<Self> {
+        Self::decode_tag(bytes, ASYNC_WIRE_TAG, true)
+    }
+    fn decode_tag(bytes: &[u8], tag: u8, trailer_decodable: bool) -> Option<Self> {
         let (statement_bytes, trailer) = match bytes.len() {
             TRANSACTION_BYTES => (STATEMENT_BYTES, None),
             TRANSACTION_V3_BYTES => (STATEMENT_V3_BYTES, None),
             // A V3 settlement followed by a settler authorization.
-            n if n > TRANSACTION_V3_BYTES && n <= TRANSACTION_V3_BYTES + settler::MAX_AUTHORIZATION_BYTES => {
+            n if trailer_decodable && n > TRANSACTION_V3_BYTES && n <= TRANSACTION_V3_BYTES + settler::MAX_AUTHORIZATION_BYTES => {
                 (STATEMENT_V3_BYTES, Some(&bytes[TRANSACTION_V3_BYTES..]))
             }
             _ => return None,
