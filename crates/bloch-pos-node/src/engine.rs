@@ -2518,6 +2518,7 @@ pub(crate) use reject_roots::{parse_reject_block_root, ENV_REJECT_BLOCK_ROOTS};
 mod side_branch_tests;
 #[cfg(test)]
 mod orphaned_head_tests;
+mod kes_local_check;
 mod verification;
 mod finality_cert;
 #[cfg(test)]
@@ -9662,7 +9663,7 @@ impl Engine {
             // Identity of the binary, not of the chain: no state read, no
             // lock taken, constant cost at any height.
             RpcRequest::L2Settlement => Ok(rpc::l2_settlement_json(&self.state)),
-            RpcRequest::Kes => Ok(rpc::kes_json(&self.state)),
+            RpcRequest::Kes => Ok(self.kes_rpc_json()),
             RpcRequest::BlockRaw(id) => {
                 let env = self.envelope_by_id(&id).ok_or_else(|| RpcError::new(rpc::BLOCK_NOT_FOUND, "unknown block"))?;
                 Ok(rpc::Json::s(crate::codec::hex(&crate::codec::encode_envelope(&env))))
@@ -10791,6 +10792,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
     let mut duty_sync_gate = DutySyncGate::default();
     let mut orphaned_head_hold = OrphanedHeadHold::default();
     let mut orphaned_head_reported: Option<u64> = None;
+    // Audit L1C-61: the wall epoch the registered KES tree was last compared
+    // with this node's key file. `None` makes the first turn the boot check.
+    let mut kes_local_checked_epoch: Option<u64> = None;
     // GATE-06: boot grace runs from here, the end of replay and of the boot
     // checks, not from engine construction.
     engine.booted_ms = now_ms();
@@ -10859,6 +10863,13 @@ pub fn run(cfg: Config) -> io::Result<()> {
             (slot, genesis_ms + slot * slot_ms)
         };
         let wall_epoch = epoch_of(slot);
+        // Audit L1C-61: at boot and once per epoch, say so loudly when the
+        // KES tree registered for this validator is not the one this node
+        // holds. Before the bind nothing else notices.
+        if kes_local_checked_epoch != Some(wall_epoch) {
+            engine.warn_kes_local_mismatch(kes_local_checked_epoch.is_none());
+            kes_local_checked_epoch = Some(wall_epoch);
+        }
         if slot != engine.wall_slot {
             engine.wall_slot = slot;
             // Drop everything the acceptance window has moved past. The pool

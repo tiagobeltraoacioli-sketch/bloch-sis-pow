@@ -178,6 +178,15 @@ enum RpcErr {
 /// envelope. An endpoint cannot make the watcher buffer past this.
 const MAX_RPC_RESPONSE_BYTES: usize = 2 * crate::p2p::MAX_GOSSIP_BYTES + 64 * 1024;
 
+/// One parameterless JSON-RPC query for other offline tools of this binary
+/// (`kes register --rpc`), with the same bounded reader; errors as text.
+pub(crate) fn rpc_query(addr: &str, method: &str) -> Result<Json, String> {
+    rpc_call(addr, method, Vec::new()).map_err(|e| match e {
+        RpcErr::Node(code, message) => format!("{addr}: {method}: node error {code}: {message}"),
+        RpcErr::Transport(message) => message,
+    })
+}
+
 fn rpc_call(addr: &str, method: &str, params: Vec<Json>) -> Result<Json, RpcErr> {
     let request = Json::obj(vec![
         ("jsonrpc", Json::s("2.0")),

@@ -4099,6 +4099,95 @@ pub(crate) mod kes_register_binding_rehearsal {
     }
 }
 
+/// AUDIT-L1L2-20261123 L1C-61: one static-key CORRECTION of a registered KES
+/// tree while KES is not bound. `u64::MAX` means INERT.
+///
+/// Registration (wire 0x17) is once-only. A validator whose registered tree
+/// is not the one its node holds (a `validator.kes` restored from an older
+/// backup, a data directory copied from another unit, an abandoned
+/// registration that somebody else broadcast later) signs with its static
+/// key until the bind and cannot sign at all from it on; the static key may
+/// replace the tree only after it EXPIRES (the rescue rule), which for the
+/// default depth is about eleven years. The only way out is exit and
+/// re-join. That stake is nevertheless part of the 90 % that fires the bind.
+///
+/// Once armed, a `KesRegister` for a validator that already has a tree is
+/// admitted as a correction when ALL of these hold:
+///
+/// * KES is not bound and the bind is not yet decided
+///   (`kes_enforced_from` is unset): no KES leaf has been required of anyone,
+///   so the replaced tree has never signed anything consensus accepts;
+/// * the registered tree is the validator's first and uncorrected one
+///   (start period 0, no successor, no history) and the chain is at global
+///   period [`KES_CORRECTED_START_PERIOD`] or later. The corrected tree
+///   starts at [`KES_CORRECTED_START_PERIOD`], which is also what marks it:
+///   a tree with that start is never corrected again, so the correction is
+///   ONCE per validator without a new state field (the transaction is free,
+///   so an unbounded rule would be free block space);
+/// * the new tree differs from the registered one and covers the current
+///   period;
+/// * the static key signed `kes::correct_signing_root`: its own domain tag,
+///   the inclusion epoch (valid in that epoch only, like `ExitV2`) and the
+///   tree being replaced, so a correction can be neither replayed later nor
+///   taken for a first registration, and an old first registration can never
+///   be replayed as a correction.
+///
+/// The corrected entry holds the new tree alone; the wire encoding does not
+/// change. After the bind decision nothing changes: once-only, rescue after
+/// expiry, renewal by `KesRotate`.
+///
+/// What it costs: before the bind a static key was already the whole
+/// identity, so a stolen static key gains only this: it can spend the one
+/// correction, after which the owner is where a wrong registration leaves
+/// them today (exit and re-join). Alternatives the owner can choose instead
+/// are listed in the audit finding (keep once-only and rely on the node's
+/// mismatch warnings; allow corrections without a count; a post-bind rescue
+/// for a tree that never signed).
+///
+/// A hard fork (it changes which 0x17 transactions are valid): arming needs
+/// a historical replay, mixed-fleet qualification and a coordinated FUTURE
+/// epoch; arm it before the registrations that would fire the bind, or it
+/// protects nobody. `hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY` carries
+/// the guard; `the_kes_prebind_correction_gate_is_inert` pins the value.
+pub const KES_PREBIND_CORRECTION_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    KES_PREBIND_CORRECTION_ACTIVATION_EPOCH,
+    KES_REGISTRATION_EPOCH
+));
+
+/// Start period of a corrected KES tree
+/// ([`KES_PREBIND_CORRECTION_ACTIVATION_EPOCH`]). A first registration before
+/// the bind starts at period 0, so this value also records that the one
+/// correction has been used.
+pub const KES_CORRECTED_START_PERIOD: u64 = 1;
+
+/// Is the pre-bind KES correction rule in force at `epoch`
+/// ([`KES_PREBIND_CORRECTION_ACTIVATION_EPOCH`])? A pure function of the
+/// epoch and the build.
+pub fn kes_prebind_correction_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if kes_prebind_correction_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, KES_PREBIND_CORRECTION_ACTIVATION_EPOCH)
+}
+
+/// Thread-local rehearsal switch for
+/// [`KES_PREBIND_CORRECTION_ACTIVATION_EPOCH`]. `cfg(test)` only.
+#[cfg(test)]
+pub(crate) mod kes_prebind_correction_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    /// Open the rule on this thread until the guard drops (also on unwind).
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// Test-only, thread-local KES schedule override. `cfg(test)`: it cannot
 /// exist in a shipped binary.
 #[cfg(test)]
