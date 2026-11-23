@@ -11,8 +11,13 @@ pub(super) struct Mempool {
     entries: BTreeMap<Vec<u8>, PosTransaction>,
     identities: BTreeMap<[u8; 32], usize>,
     sources: BTreeMap<[u8; 32], usize>,
-    /// Outpoints named by pending entries, with how many entries name each.
-    spends: BTreeMap<([u8; 32], u32), usize>,
+    /// Outpoints named by pending entries, each with the mempool keys of the
+    /// entries that name it (audit L1N-02). It used to be a count only, so
+    /// finding the entry that holds an input meant walking the pool, which
+    /// is why that test had to wait until the newcomer was authenticated.
+    /// One shared copy of the key per entry, however many inputs it names;
+    /// an entry naming an outpoint twice is listed twice and removed twice.
+    spenders: BTreeMap<([u8; 32], u32), Vec<Arc<[u8]>>>,
     /// Keys inserted by [`Self::insert`], i.e. not through admission.
     unverified: BTreeSet<Vec<u8>>,
     bytes: usize,
@@ -63,7 +68,28 @@ impl Mempool {
     }
     /// Whether any pending entry names `point` as an input.
     pub(super) fn spends_outpoint(&self, point: &([u8; 32], u32)) -> bool {
-        self.spends.contains_key(point)
+        self.spenders.contains_key(point)
+    }
+    /// The mempool keys of the pending entries that name `point` as an
+    /// input: one index lookup, no pool walk (audit L1N-02).
+    pub(super) fn spenders_of(&self, point: &([u8; 32], u32)) -> &[Arc<[u8]>] {
+        self.spenders.get(point).map_or(&[], Vec::as_slice)
+    }
+    /// The distinct pending entries naming any of `points`, in mempool key
+    /// order (the order a pool walk visits them).
+    pub(super) fn entries_spending<'a>(
+        &'a self,
+        points: &[([u8; 32], u32)],
+    ) -> BTreeMap<&'a [u8], &'a PosTransaction> {
+        let mut found = BTreeMap::new();
+        for point in points {
+            for key in self.spenders_of(point) {
+                if let Some((key, tx)) = self.entries.get_key_value(&key[..]) {
+                    found.insert(key.as_slice(), tx);
+                }
+            }
+        }
+        found
     }
     /// Whether the entry under `key` was inserted by the admission path,
     /// which authenticates a transaction before it inserts it.
@@ -146,9 +172,12 @@ impl Mempool {
             let count = self.sources.entry(source).or_default();
             *count = count.saturating_add(1);
         }
-        for point in Engine::spent_outpoints(&tx).unwrap_or_default() {
-            let count = self.spends.entry(point).or_default();
-            *count = count.saturating_add(1);
+        let points = Engine::spent_outpoints(&tx).unwrap_or_default();
+        if !points.is_empty() {
+            let shared: Arc<[u8]> = Arc::from(key.as_slice());
+            for point in points {
+                self.spenders.entry(point).or_default().push(Arc::clone(&shared));
+            }
         }
         self.entries.insert(key, tx);
         old
@@ -161,7 +190,14 @@ impl Mempool {
             decrement(&mut self.sources, source);
         }
         for point in Engine::spent_outpoints(&tx).unwrap_or_default() {
-            decrement(&mut self.spends, point);
+            if let Some(keys) = self.spenders.get_mut(&point) {
+                if let Some(at) = keys.iter().position(|held| held[..] == key[..]) {
+                    keys.swap_remove(at);
+                }
+                if keys.is_empty() {
+                    self.spenders.remove(&point);
+                }
+            }
         }
         self.unverified.remove(key);
         Some(tx)
@@ -562,6 +598,27 @@ fn check_l2_funded(
     }
 }
 
+/// The refusal text of a newcomer whose input a pending, still-backed entry
+/// holds. One text for the lookup before verification and the plan after it.
+pub(super) const INPUT_ALREADY_PENDING: &str =
+    "transaction spends an input that a pending transaction already spends";
+
+/// The refusal text of a funded pair that conflicts with a pending input or
+/// validator key, and of a spend whose input a pending funded pair holds.
+pub(super) const FUNDED_INPUT_CONFLICT: &str =
+    "funded deposit conflicts with a pending input or validator key";
+
+/// Pending holders of the newcomer's inputs visited before its signatures are
+/// verified (audit L1N-02). Each costs at most one proof-free state preflight.
+pub(super) const MAX_PENDING_HOLDERS_EXAMINED_BEFORE_VERIFICATION: usize = 8;
+
+/// Funded pairs are outside the input reservation of
+/// [`Engine::plan_input_conflicts`]: `funded_mempool_conflict` judges them
+/// and also reserves the validator key.
+fn input_reservation_exempt(tx: &PosTransaction) -> bool {
+    matches!(tx, PosTransaction::FundedDeposit(_) | PosTransaction::FundedDelegate(_))
+}
+
 /// Transactional capacity plan; callers build it and commit it only after
 /// authenticating the incoming transaction. Stale entries are not placed in a
 /// rejection cache.
@@ -582,24 +639,75 @@ impl Engine {
     /// `funded_mempool_conflict`, which also reserves the validator key.
     fn plan_input_conflicts(&self, incoming: &PosTransaction, epoch: u64,
         funded_context: &mut Option<(Arc<CommittedState>, u128)>) -> Result<BTreeSet<Vec<u8>>, Refusal> {
-        let funded = |tx: &PosTransaction| matches!(tx, PosTransaction::FundedDeposit(_) | PosTransaction::FundedDelegate(_));
         let mut stale = BTreeSet::new();
         let points = Self::spent_outpoints(incoming).unwrap_or_default();
         // The common case costs one index lookup per input and no pool walk.
-        if funded(incoming) || !points.iter().any(|point| self.mempool.spends_outpoint(point)) {
+        if input_reservation_exempt(incoming) || !points.iter().any(|point| self.mempool.spends_outpoint(point)) {
             return Ok(stale);
         }
-        for (key, other) in &self.mempool {
-            if funded(other) { continue; }
-            let shares_input = Self::spent_outpoints(other)
-                .is_some_and(|theirs| theirs.iter().any(|point| points.contains(point)));
-            if !shares_input { continue; }
+        // Audit L1N-02: the entries sharing an input come from the outpoint
+        // index, in the order the pool walk used to meet them.
+        for (key, other) in self.mempool.entries_spending(&points) {
+            if input_reservation_exempt(other) { continue; }
             if self.candidate_is_backed(other, key, epoch, funded_context) {
-                return Err(Refusal::StateDependent("transaction spends an input that a pending transaction already spends"));
+                return Err(Refusal::StateDependent(INPUT_ALREADY_PENDING));
             }
-            stale.insert(key.clone());
+            stale.insert(key.to_vec());
         }
         Ok(stale)
+    }
+
+    /// The lookup half of [`Self::plan_input_conflicts`], safe to run BEFORE
+    /// the newcomer's signatures are verified (audit L1N-02).
+    ///
+    /// A transfer whose signature is valid and whose input a pending
+    /// transaction already holds used to be verified first and refused
+    /// afterwards, free of charge: variants of one funded transfer drained
+    /// the verification allowance every source shares. The refusal is now
+    /// answered from the outpoint index, at the cost of one lookup per input
+    /// and one state preflight of the holder, with no cryptography.
+    ///
+    /// Nothing is planned out or evicted here: an unauthenticated newcomer
+    /// changes no pool state. Only a holder that admission itself
+    /// authenticated and that the current state still backs refuses it. A
+    /// holder that is no longer backed (its fee fell behind, its input was
+    /// spent) refuses nothing, so the newcomer goes on to verification and
+    /// the plan replaces the dead entry: an owner is still never locked out
+    /// of an input by their own dead transaction. A holder placed without
+    /// admission is left to the plan as well, because judging it needs its
+    /// witnesses checked, which is work only an authenticated newcomer buys;
+    /// so is a funded pair, whose backing needs a projected state. For every
+    /// holder judged here, "backed" is the signature-free state preflight alone.
+    pub(super) fn pending_input_refusal(&self, incoming: &PosTransaction, epoch: u64) -> Option<Refusal> {
+        if input_reservation_exempt(incoming) { return None; }
+        let points = Self::spent_outpoints(incoming)?;
+        let mut examined = 0usize;
+        let mut funded_context = None;
+        for point in &points {
+            for key in self.mempool.spenders_of(point) {
+                // At most one admitted, backed entry holds an outpoint, and a
+                // dead one is replaced by the next admitted spender, so this
+                // loop is short. The ceiling makes that a guarantee and not
+                // an argument: past it the newcomer is simply verified and
+                // judged by the plan, as before.
+                if examined >= MAX_PENDING_HOLDERS_EXAMINED_BEFORE_VERIFICATION { return None; }
+                examined += 1;
+                if !self.mempool.admission_verified(key) { continue; }
+                let Some(other) = self.mempool.get(&key[..]) else { continue };
+                // A funded pair is not judged here: whether it is still
+                // backed takes a projected state and a lifecycle validation,
+                // which an unauthenticated newcomer must not buy. It is left
+                // to `funded_mempool_conflict` after verification, where a
+                // refusal is charged to the sender.
+                if input_reservation_exempt(other) { continue; }
+                // A backed entry is never planned out, so this is the answer
+                // the plan would give the newcomer after verification.
+                if self.candidate_is_backed(other, key, epoch, &mut funded_context) {
+                    return Some(Refusal::StateDependent(INPUT_ALREADY_PENDING));
+                }
+            }
+        }
+        None
     }
 
     /// Callers authenticate `incoming` first: this walks pending entries.

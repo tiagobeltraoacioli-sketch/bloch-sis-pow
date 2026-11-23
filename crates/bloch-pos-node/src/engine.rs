@@ -903,17 +903,32 @@ const LIFECYCLE_VERIFICATIONS_TOTAL_PER_SLOT: usize = 256;
 /// submissions are exempt.
 const LIFECYCLE_VERIFICATIONS_PER_DELIVERER_PER_SLOT: usize = 16;
 
-/// New hybrid verifications allowed across attestation, transaction and
-/// evidence network admission in one wall slot. Blocks draw on their own
-/// allowances below, so this traffic can never spend the units a block
-/// needs. Consensus execution and this node's own
+/// New hybrid verifications allowed across transaction and evidence network
+/// admission in one wall slot. Blocks and (audit L1N-02) attestations draw on
+/// their own allowances below, so this traffic can never spend the units a
+/// block or a vote needs. Consensus execution and this node's own
 /// proposal are deliberately outside this node-local relay budget. At the
 /// 30-second cadence, 1,024 leaves large honest burst headroom while making
 /// unique-signature CPU finite even as the bounded transport queue drains.
 ///
-/// With the two block allowances the worst case is 1,024 + 256 + 512 = 1,792
-/// units per wall slot (before the separate lifecycle allowance).
+/// With the vote allowance and the two block allowances the worst case is
+/// 1,024 + 1,024 + 256 + 512 = 2,816 units per wall slot (before the separate
+/// lifecycle allowance and the node's own headroom below).
 const GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT: usize = 1_024;
+
+/// New hybrid verifications allowed for attestation network admission in one
+/// wall slot, and one source's share of them (audit L1N-02). The figures the
+/// shared allowance gave votes before they were separated from transactions:
+/// transactions, which anyone can have verified, used to spend them.
+const VOTE_VERIFICATIONS_TOTAL_PER_SLOT: usize = 1_024;
+const VOTE_VERIFICATIONS_PER_SOURCE_PER_SLOT: usize = 128;
+
+/// Verification units this node's own submissions (the engine's internal
+/// path, e.g. the automatic KES rotation) may still spend in one wall slot
+/// after remote traffic has spent [`GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT`]
+/// (audit L1N-02). No frame and no RPC call draws on it, whatever its
+/// address: a loopback client can be a reverse proxy for anyone.
+const OWN_SUBMISSION_VERIFICATIONS_PER_SLOT: usize = 32;
 
 /// Proposer-signature verifications allowed for gossiped blocks in one wall
 /// slot, and one source's share of them. Live gossip carries about one new
@@ -935,8 +950,11 @@ const DIRECTED_BLOCK_VERIFICATIONS_PER_SOURCE_PER_SLOT: usize = crate::p2p::MAX_
 /// never relays an invalid signature.
 const BLOCK_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT: usize = 8;
 
-/// The same rule for attestations, transactions and evidence, counted apart
-/// from blocks so invalid votes never close a source's block door. Wider
+/// The same rule for attestations and, counted apart from them since audit
+/// L1N-02, for transactions and evidence; both apart from blocks, so invalid
+/// votes never close a source's block door and refused transactions never
+/// close its vote door. For transactions it also counts a verification that
+/// held but admitted nothing (`note_refused_after_verification`). Wider
 /// than the block allowance because a peer on a branch with a different
 /// registry can relay votes this node's keys do not verify; a quarter of one
 /// source's share still leaves 32 sources, not 8, needed to spend the total.
@@ -2397,6 +2415,8 @@ mod hf_replay_guard;
 
 #[cfg(test)]
 mod proposal_revalidation_tests;
+#[cfg(test)]
+mod relay_allowance_tests;
 #[cfg(test)]
 mod vote_selection_tests;
 #[cfg(test)]
@@ -6532,7 +6552,11 @@ impl Engine {
     /// peer is not waiting on a verdict, and a duplicate arriving twice over a
     /// full mesh is the normal case rather than a fault.
     fn on_transaction(&mut self, tx: PosTransaction) -> Result<Admitted, Refusal> {
-        self.on_transaction_from(tx, None)
+        // This node's own submission: no network input reaches this call, so
+        // it alone carries the private verification headroom (audit L1N-02).
+        let key = tx.canonical_bytes();
+        self.admit_transaction(tx, key, None, OWN_SUBMISSION_VERIFICATIONS_PER_SLOT, |_, _| ())
+            .map(|(outcome, ())| outcome)
     }
 
     fn on_transaction_from(
@@ -6553,6 +6577,21 @@ impl Engine {
         tx: PosTransaction,
         key: Vec<u8>,
         verification_source: Option<[u8; 32]>,
+        prepare_result: impl FnOnce(&PosTransaction, &[u8]) -> R,
+    ) -> Result<(Admitted, R), Refusal> {
+        // A frame or RPC call, attributed or not, never draws on the node's
+        // own verification headroom (audit L1N-02).
+        self.admit_transaction(tx, key, verification_source, 0, prepare_result)
+    }
+
+    /// The one admission path. `own_headroom` is the private verification
+    /// share of [`Self::on_transaction`]; every other caller passes zero.
+    fn admit_transaction<R>(
+        &mut self,
+        tx: PosTransaction,
+        key: Vec<u8>,
+        verification_source: Option<[u8; 32]>,
+        own_headroom: usize,
         prepare_result: impl FnOnce(&PosTransaction, &[u8]) -> R,
     ) -> Result<(Admitted, R), Refusal> {
         // Identity is witness-free but not free: transfers fold every input
@@ -6621,6 +6660,16 @@ impl Engine {
         if let Some(why) = l2_admission_refusal(&tx, self.state.l2_settlement()) {
             return Err(Refusal::Invalid(why));
         }
+        // Audit L1N-02: an input that a pending, admission-verified and
+        // still-backed transaction holds is refused HERE, before any
+        // signature of the newcomer is verified, as a lookup in the outpoint
+        // index. It used to be refused only after verification, which made
+        // every conflicting variant of one funded transfer a free unit of the
+        // allowance all sources share.
+        if let Some(refusal) = self.pending_input_refusal(&tx, epoch_of(self.wall_slot())) {
+            return Err(refusal);
+        }
+        let verified_units;
         if let PosTransaction::L2SettlementAsync(settlement) = &tx {
             let state = self.state.l2_settlement().ok_or(Refusal::Invalid("L2 settlement is not configured"))?;
             if self.mempool.values().any(|pending| matches!(pending, PosTransaction::L2SettlementAsync(_))) {
@@ -6635,9 +6684,11 @@ impl Engine {
                 GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
                 verification_source,
                 GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
-            ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
+            ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT)
+                .with_own_headroom(own_headroom);
             let admission = state.validate_async(settlement, &verifier);
             let limited = verifier.limited();
+            verified_units = verifier.reserved_units();
             drop(verifier);
             if limited {
                 return Err(Refusal::GossipVerificationLimited {
@@ -6660,7 +6711,8 @@ impl Engine {
                 GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
                 verification_source,
                 GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
-            ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
+            ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT)
+                .with_own_headroom(own_headroom);
             let admission = admissible_with_network_verifier(
                 &tx,
                 epoch_of(self.wall_slot()),
@@ -6668,6 +6720,7 @@ impl Engine {
                 &verifier,
             );
             let limited = verifier.limited();
+            verified_units = verifier.reserved_units();
             drop(verifier);
             if limited {
                 return Err(Refusal::GossipVerificationLimited {
@@ -6676,26 +6729,22 @@ impl Engine {
             }
             admission.map_err(Refusal::Invalid)?;
         }
-        if let PosTransaction::SlashingEvidence(evidence) = &tx {
-            if validator_lifecycle::native_slashing_admission_active(epoch_of(self.wall_slot())) {
-                self.precheck_slashing_evidence(evidence, verification_source)?;
+        // Audit L1N-02: everything above verified the newcomer's signatures
+        // and they held. A refusal from here on is one only this node's state
+        // decides, and it used to cost its sender nothing. The units that
+        // verification spent are charged to the source like a failure.
+        let capacity = match self.plan_authenticated_admission(&tx, key.len(), verification_source) {
+            Ok(capacity) => capacity,
+            Err(refusal) => {
+                self.gossip_verifier.note_refused_after_verification(
+                    self.wall_slot(),
+                    verification::VerificationLane::Relay,
+                    verification_source,
+                    verified_units,
+                );
+                return Err(refusal);
             }
-        }
-        self.validate_lifecycle_admission(&tx, verification_source)?;
-        // Plan capacity cleanup without mutating the pool. A forged incoming
-        // signature must never evict either stale or currently paying entries.
-        //
-        // Only now, after every budgeted authentication of the incoming
-        // transaction above: planning walks this source's pending entries (or
-        // the whole pool under global pressure), and it used to run first, so
-        // a transaction nobody had authenticated yet bought pool-proportional
-        // work and was answered `TooManyFromSource` before its own signature
-        // was ever looked at. The plan also reserves pending inputs: see
-        // `plan_mempool_capacity`.
-        let capacity = self.plan_mempool_capacity(&tx, key.len(), epoch_of(self.wall_slot()))?;
-        if self.funded_mempool_conflict(&tx, &capacity.stale) {
-            return Err(Refusal::Invalid("funded deposit conflicts with a pending input or validator key"));
-        }
+        };
         // Commit only after every incoming admission check succeeds. Removing
         // state-dependent failures under pressure is retention, never a bar.
         for stale in &capacity.stale {
@@ -6723,6 +6772,38 @@ impl Engine {
         self.mempool.insert_with_txid(key, tx, txid);
         self.net.broadcast_transaction(broadcast);
         Ok((Admitted::New, prepared))
+    }
+
+    /// The state-dependent checks of an incoming transaction whose signatures
+    /// admission has already verified, ending in the capacity plan. Nothing
+    /// in the pool is changed here; the caller commits the plan.
+    fn plan_authenticated_admission(
+        &mut self,
+        tx: &PosTransaction,
+        encoded: usize,
+        verification_source: Option<[u8; 32]>,
+    ) -> Result<admission::CapacityPlan, Refusal> {
+        if let PosTransaction::SlashingEvidence(evidence) = tx {
+            if validator_lifecycle::native_slashing_admission_active(epoch_of(self.wall_slot())) {
+                self.precheck_slashing_evidence(evidence, verification_source)?;
+            }
+        }
+        self.validate_lifecycle_admission(tx, verification_source)?;
+        // Plan capacity cleanup without mutating the pool. A forged incoming
+        // signature must never evict either stale or currently paying entries.
+        //
+        // Only now, after every budgeted authentication of the incoming
+        // transaction above: planning walks this source's pending entries (or
+        // the whole pool under global pressure), and it used to run first, so
+        // a transaction nobody had authenticated yet bought pool-proportional
+        // work and was answered `TooManyFromSource` before its own signature
+        // was ever looked at. The plan also reserves pending inputs: see
+        // `plan_mempool_capacity`.
+        let capacity = self.plan_mempool_capacity(tx, encoded, epoch_of(self.wall_slot()))?;
+        if self.funded_mempool_conflict(tx, &capacity.stale) {
+            return Err(Refusal::Invalid(admission::FUNDED_INPUT_CONFLICT));
+        }
+        Ok(capacity)
     }
 
     /// Transactions for the block this node is about to propose.
@@ -8883,11 +8964,16 @@ impl Engine {
         // therefore `committees_at`. Membership and key must come from one
         // snapshot; the old code took membership from here and the key from a
         // boot-time genesis table, which is the inconsistency being removed.
-        let verifier = self.gossip_verifier.budgeted_for_source(
+        //
+        // Audit L1N-02: votes draw on their own lane. They used to share the
+        // relay lane with transactions, which eight source addresses could
+        // spend in full every slot with valid signatures that cost nothing.
+        let verifier = self.gossip_verifier.budgeted_lane_for_source(
             self.wall_slot(),
-            GOSSIP_VERIFICATIONS_TOTAL_PER_SLOT,
+            verification::VerificationLane::Vote,
+            VOTE_VERIFICATIONS_TOTAL_PER_SLOT,
             admission.verification_source(),
-            GOSSIP_VERIFICATIONS_PER_SOURCE_PER_SLOT,
+            VOTE_VERIFICATIONS_PER_SOURCE_PER_SLOT,
         ).with_failure_allowance(GOSSIP_VERIFICATION_FAILURES_PER_SOURCE_PER_SLOT);
         let decision = match admission {
             AttestationAdmission::Fresh { att, verification_source } => pool.process_from_source(
