@@ -1908,6 +1908,13 @@ pub struct CommittedState {
     /// and at the start of every epoch. An empty map adds no state-root
     /// leaf and no local-cache section.
     commission_update_epochs: BTreeMap<u32, u64>,
+    /// Validator → the epoch of its `WithdrawalCredentialRotation` in the
+    /// current epoch (audit L1S-02). Written only behind
+    /// `params::CREDENTIAL_ROTATION_LIMIT_ACTIVATION_EPOCH` and emptied at
+    /// every epoch boundary, exactly like `commission_update_epochs`: empty
+    /// on every state below the gate, no state-root leaf and no local-cache
+    /// section while empty.
+    credential_rotation_epochs: BTreeMap<u32, u64>,
     /// Forward-secure validator keys (`crate::kes`): registered once by wire
     /// 0x17, replaced only by a leaf-signed `KesRotate`. Each entry is the key
     /// in force and at most one successor (`crate::kes::KesEntry`). Committed
@@ -2531,6 +2538,7 @@ impl CommittedState {
             l2_settlement: None,
             pq_rescue_commits: BTreeMap::new(),
             commission_update_epochs: BTreeMap::new(),
+            credential_rotation_epochs: BTreeMap::new(),
             kes: BTreeMap::new(),
             kes_enforced_from: None,
             issued_sat: tokenomics_v4::GENESIS_ISSUED_SAT,
@@ -3309,6 +3317,7 @@ impl CommittedState {
         }
         crate::state_root::insert_pq_rescue_commits(&mut tree, &self.pq_rescue_commits);
         crate::state_root::insert_commission_update_epochs(&mut tree, &self.commission_update_epochs);
+        crate::state_root::insert_credential_rotation_epochs(&mut tree, &self.credential_rotation_epochs);
         tree
     }
 
@@ -3722,6 +3731,30 @@ impl CommittedState {
                 epoch,
                 crate::params::STAKING_TX_METERING_ACTIVATION_EPOCH,
             )
+    }
+
+    /// Node-local packing aid (audit L1S-02): the block capacity a ZERO-FEE
+    /// message takes in `epoch`, or `None` for a class that pays a base fee
+    /// and for L2 settlements (which are proposed alone). An upper bound for
+    /// every class but the credential rotation, which is exact: the
+    /// proposer budgets free messages with it. Not used by the transition.
+    pub fn zero_fee_capacity(epoch: u64, tx: &PosTransaction) -> Option<fee_market::TxCharge> {
+        match tx {
+            PosTransaction::Transfer { .. }
+            | PosTransaction::TransferV2 { .. }
+            | PosTransaction::FundedDeposit(_)
+            | PosTransaction::FundedDelegate(_)
+            | PosTransaction::FundedDelegationWithdraw(_)
+            | PosTransaction::L2Deposit(_)
+            | PosTransaction::L2DataAvailability(_)
+            | PosTransaction::L2WithdrawClaim(_)
+            | PosTransaction::RescueReveal(_)
+            | PosTransaction::L2Settlement(_)
+            | PosTransaction::L2SettlementAsync(_) => None,
+            PosTransaction::WithdrawalCredentialRotation(rotation) => Some(Self::rotation_charge(epoch, rotation)),
+            // No lifecycle message verifies more than two hybrid signatures.
+            _ => Some(Self::staking_tx_charge(epoch, 2, tx.canonical_bytes().len())),
+        }
     }
 
     /// R7 M1: the charge a staking-class transaction owes for its own bytes
@@ -6206,6 +6239,8 @@ impl CommittedState {
         // DET-3: the one-update-per-epoch record only speaks about the epoch
         // that just closed (no-op on the empty pre-gate map).
         st.commission_update_epochs.clear();
+        // L1S-02: the same for the one-rotation-per-epoch record.
+        st.credential_rotation_epochs.clear();
         // HF3 KES: enforcement is decided at the first boundary past the
         // compiled gate where registered keys cover the stake threshold
         // (review F-2), and takes effect `KES_BIND_DELAY_EPOCHS` later, so a
@@ -6920,6 +6955,9 @@ impl<V: SignatureVerifier> Transition<V> {
         let mut priority_fees: u128 = 0;
         let mut block_gas: u64 = 0;
         let mut block_bytes: u64 = 0;
+        // L1S-02 (gated): the part of the usage that paid a fee.
+        let mut paid_gas: u64 = 0;
+        let mut paid_bytes: u64 = 0;
         // Satoshis this block bonds without spending an output. See the
         // conservation check at step 11b.
         // The parent is already committed. Pin it before transactions, and keep
@@ -7052,6 +7090,10 @@ impl<V: SignatureVerifier> Transition<V> {
                     priority_fees += charge.priority_fee_sat;
                     block_gas = block_gas.saturating_add(charge.gas);
                     block_bytes = block_bytes.saturating_add(charge.tx_bytes);
+                    if charge.base_fee_sat != 0 || charge.priority_fee_sat != 0 {
+                        paid_gas = paid_gas.saturating_add(charge.gas);
+                        paid_bytes = paid_bytes.saturating_add(charge.tx_bytes);
+                    }
                     // Bonding that funds itself from nothing, measured where
                     // it happens. `Deposit` and `Delegate` name an
                     // `amount_sat` and spend no output, so an admitted one
@@ -7132,8 +7174,25 @@ impl<V: SignatureVerifier> Transition<V> {
         // The fee-market leaf this block commits: the price it charged and the
         // usage the next block's controller reads.
         st.base_fee_millisat_per_gas = base_fee;
-        st.block_gas_used = block_gas;
-        st.block_tx_bytes = block_bytes;
+        if crate::params::fee_controller_paid_usage_active(block_epoch) {
+            // L1S-02: only usage that paid moves the next base fee. A
+            // settlement block is neutral (exactly at target): the
+            // settlement is free and displaced everything else, so it says
+            // nothing about demand in either direction.
+            let settles = transactions.iter().any(|tx| {
+                matches!(tx, PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_))
+            });
+            if settles {
+                st.block_gas_used = fee_market::BLOCK_GAS_TARGET;
+                st.block_tx_bytes = 0;
+            } else {
+                st.block_gas_used = paid_gas;
+                st.block_tx_bytes = paid_bytes;
+            }
+        } else {
+            st.block_gas_used = block_gas;
+            st.block_tx_bytes = block_bytes;
+        }
 
         // 11b. SUPPLY CONSERVATION — the invariant that says nothing minted
         //      from nothing (2026-09-03). The hard cap at step 3c watches the

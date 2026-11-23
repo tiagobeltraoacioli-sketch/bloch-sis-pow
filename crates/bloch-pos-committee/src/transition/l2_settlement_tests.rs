@@ -4170,5 +4170,6 @@ mod l2_tests {
         use super::*;
         include!("audit_20261123_fixtures.rs");
         include!("audit_20261123_l1x02_tests.rs");
+        include!("audit_20261123_l1s02_tests.rs");
     }
 }

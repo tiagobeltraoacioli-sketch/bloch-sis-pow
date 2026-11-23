@@ -2062,10 +2062,16 @@ pub const FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS: u64 = SLOTS_PER_EPOCH;
 ///   `canonical_bytes().len()` plus one `HYBRID_VERIFY_GAS` term per hybrid
 ///   signature the arm actually verifies (reusing `TxClass::Eutxo{ inputs }`
 ///   for the shape, since `fee_market` has no dedicated staking class and
-///   the cost SHAPE — flat + bytes + N verifications — is identical) — at
-///   the block's base fee like a transfer's gas component (no priority
-///   fee: nothing here names a tip, and none of these messages spend an
-///   eUTXO input to draw one from). Both existing per-block caps
+///   the cost SHAPE — flat + bytes + N verifications — is identical). The
+///   charge is CAPACITY ONLY: gas and bytes against the block limits, no
+///   base fee and no priority fee in money, on every path
+///   (`CommittedState::staking_tx_charge` returns `base_fee_sat: 0`;
+///   none of these messages names a tip or spends an eUTXO input to draw a
+///   fee from). An earlier version of this text said "at the block's base
+///   fee"; the code never charged it (audit L1S-02). The same capacity
+///   metering is already in force from `WITHDRAWAL_ACTIVATION_EPOCH`, so
+///   arming this gate adds only the transaction-count bound below; it does
+///   not make any staking message pay. Both existing per-block caps
 ///   (`BlockGasLimitExceeded`, `BlockByteLimitExceeded`) already sum every
 ///   transaction's charge (step 10b), so making this charge non-zero is
 ///   what makes them bind on a staking-only body; no new cap is needed for
@@ -3698,6 +3704,96 @@ pub(crate) mod pq_migration_rehearsal {
     /// Arm the SLH suite gate AND the lattice emergency.
     pub fn open_emergency() -> impl Drop {
         Restore(SLH.with(|v| v.replace(true)), EMERGENCY.with(|v| v.replace(true)))
+    }
+}
+
+/// AUDIT-L1L2-20261123 L1S-02: only usage that paid a fee moves the base
+/// fee. `u64::MAX` means INERT.
+///
+/// Before this gate the gas and bytes of zero-fee protocol transactions
+/// (lifecycle messages, credential rotation, L2 settlement) are committed as
+/// the block's usage and feed `fee_market::next_base_fee`, so whoever can
+/// place free transactions can raise the price everyone else pays. Once
+/// armed, the committed usage (`BaseFeeRecord`) counts only transactions
+/// that were charged a base or priority fee; the per-block gas and byte
+/// LIMITS still count every transaction.
+///
+/// L2 settlement blocks are NEUTRAL under the gate. A settlement pays no fee
+/// and takes its whole block, so before the gate it reads as a full block
+/// (+12.5%, review EXE-5) and counted as plain free usage it would read as an
+/// empty one (-12.5%), which would let whoever settles push the price down.
+/// The block commits exactly the gas target and no bytes instead: the next
+/// base fee equals the settlement block's own.
+///
+/// It changes a committed leaf and the next block's base fee, so arming needs
+/// a historical replay, mixed-fleet qualification and a coordinated epoch.
+/// `l1s02_fee_gates_are_inert` pins the inert value.
+pub const FEE_CONTROLLER_PAID_USAGE_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn fee_controller_paid_usage_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if fee_controller_paid_usage_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, FEE_CONTROLLER_PAID_USAGE_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod fee_controller_paid_usage_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
+/// AUDIT-L1L2-20261123 L1S-02: at most one `WithdrawalCredentialRotation`
+/// per validator per epoch. `u64::MAX` means INERT.
+///
+/// The rotation pays no fee and its only replay protection is "the new
+/// credential differs from the current one" inside the signed epoch, so a
+/// holder of two keys can rotate A -> B -> A without limit: an unlimited
+/// supply of valid zero-fee transactions of 2.5M gas each. Once armed, an
+/// accepted rotation records its epoch for the validator
+/// (`CommittedState::credential_rotation_epochs`) and a further rotation of
+/// the same validator in the same epoch is refused
+/// (`PqMigrationReject::AlreadyRotated`). The record is committed state
+/// exactly like the commission-update record (DET-3): one leaf per validator
+/// under the validator component with a key no validator index can produce,
+/// emptied at every epoch boundary, and one optional local-cache section.
+/// Below the gate nothing is recorded, so every state root and every cache
+/// keeps its bytes.
+///
+/// It changes which transactions are valid and it changes committed state,
+/// so arming needs a historical replay, mixed-fleet qualification and a
+/// coordinated epoch. It cannot precede the rotation itself.
+pub const CREDENTIAL_ROTATION_LIMIT_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    CREDENTIAL_ROTATION_LIMIT_ACTIVATION_EPOCH,
+    HF3_PQ_MIGRATION_EPOCH
+));
+
+pub(crate) fn credential_rotation_limit_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if credential_rotation_limit_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, CREDENTIAL_ROTATION_LIMIT_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod credential_rotation_limit_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
     }
 }
 

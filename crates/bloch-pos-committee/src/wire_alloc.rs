@@ -119,9 +119,12 @@ pub mod local_cache {
     /// Commission-update epochs of the current epoch (security review round
     /// 2 DET-3, `COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH`).
     pub const COMMISSION_UPDATES: &[u8; 16] = b"BPOSST01:COMU:v1";
+    /// Credential-rotation epochs of the current epoch (audit L1S-02,
+    /// `CREDENTIAL_ROTATION_LIMIT_ACTIVATION_EPOCH`).
+    pub const CREDENTIAL_ROTATIONS: &[u8; 16] = b"BPOSST01:CROT:v1";
     /// Fixed merge/parse order.
-    pub const ORDER: [&[u8; 16]; 7] =
-        [L2, L2_CHECKPOINTS, KES, PQ, FINALITY_SET, OWN_CHECKPOINTS, COMMISSION_UPDATES];
+    pub const ORDER: [&[u8; 16]; 8] =
+        [L2, L2_CHECKPOINTS, KES, PQ, FINALITY_SET, OWN_CHECKPOINTS, COMMISSION_UPDATES, CREDENTIAL_ROTATIONS];
 }
 
 /// Trailing extensions of the finality leaf (state tag `0x09`). Absent while

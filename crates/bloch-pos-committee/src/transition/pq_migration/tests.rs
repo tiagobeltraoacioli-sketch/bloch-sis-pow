@@ -638,3 +638,6 @@ fn rotation_accepts_a_maximum_length_slh_signature() {
     let over = PosTransaction::WithdrawalCredentialRotation(tx);
     assert!(PosTransaction::from_canonical_bytes(&over.canonical_bytes()).is_err());
 }
+
+// AUDIT-L1L2-20261123 L1S-02: regression tests of the two gated rules.
+include!("audit_20261123_l1s02_tests.rs");

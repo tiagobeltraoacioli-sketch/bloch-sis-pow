@@ -348,6 +348,21 @@ pub(crate) fn insert_commission_update_epochs(tree: &mut Smt, epochs: &BTreeMap<
     }
 }
 
+/// `WithdrawalCredentialRotation` epochs of the current epoch
+/// (`CommittedState::credential_rotation_epochs`, audit L1S-02): the same
+/// shape as the commission-update leaves above, under its own key prefix.
+/// Empty below `CREDENTIAL_ROTATION_LIMIT_ACTIVATION_EPOCH` and at the start
+/// of every epoch, so every historical root is unchanged.
+const CREDENTIAL_ROTATION_KEY_PREFIX: &[u8] = b"credential-rotation-epoch:";
+
+pub(crate) fn insert_credential_rotation_epochs(tree: &mut Smt, epochs: &BTreeMap<u32, u64>) {
+    for (validator, epoch) in epochs {
+        let mut key = CREDENTIAL_ROTATION_KEY_PREFIX.to_vec();
+        key.extend_from_slice(&validator.to_le_bytes());
+        tree.insert(derive_key(TAG_VALIDATOR, &key), hash_value(&epoch.to_le_bytes()));
+    }
+}
+
 pub(crate) fn insert_pq_rescue_commits(
     tree: &mut Smt,
     commits: &std::collections::BTreeMap<[u8; 32], u64>,

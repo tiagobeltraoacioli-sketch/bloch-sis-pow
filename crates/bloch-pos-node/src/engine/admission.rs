@@ -20,6 +20,11 @@ pub(super) struct Mempool {
     lifecycle_verifications_total: usize,
     lifecycle_verifications: BTreeMap<[u8; 32], usize>,
     lifecycle_verifications_by_deliverer: BTreeMap<[u8; 32], usize>,
+    /// Audit L1S-02: `(kind, validator)` -> the signed epoch of the last
+    /// credential rotation / commission update admitted or seen in a
+    /// canonical block. One entry per validator and kind, overwritten by a
+    /// newer epoch, so it never grows past twice the registry.
+    once_per_epoch: BTreeMap<(u8, u32), u64>,
 }
 
 /// The allowance key of one (deliverer, identity) pair (audit L1-02). This
@@ -115,6 +120,15 @@ impl Mempool {
         let used = self.lifecycle_verifications.entry(pair).or_default();
         *used = used.saturating_add(1);
         true
+    }
+    /// Whether a message of this `(kind, validator)` signed for `epoch` was
+    /// already admitted or included (audit L1S-02).
+    pub(super) fn once_per_epoch_seen(&self, key: (u8, u32), epoch: u64) -> bool {
+        self.once_per_epoch.get(&key) == Some(&epoch)
+    }
+    pub(super) fn note_once_per_epoch(&mut self, key: (u8, u32), epoch: u64) {
+        let seen = self.once_per_epoch.entry(key).or_insert(epoch);
+        *seen = (*seen).max(epoch);
     }
     pub(super) fn insert(&mut self, key: Vec<u8>, tx: PosTransaction) -> Option<PosTransaction> {
         let txid = tx.txid();

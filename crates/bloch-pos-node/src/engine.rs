@@ -1722,6 +1722,28 @@ fn body_transactions(env: &BlockEnvelope) -> Result<Vec<PosTransaction>, String>
 /// "staking txs pay zero gas", so treating them as lowest-priority here is
 /// consistent with the chain's own current pricing, not a new judgement this
 /// fix invents.
+/// Audit L1S-02: the share of a proposed block's gas target and byte target
+/// that zero-fee messages may take together (node-local packing policy).
+/// One suite-0x0003 credential rotation (2.5M gas, 22 kB) fits; a block of
+/// free messages alone therefore sits far below target and lowers the price.
+const ZERO_FEE_BLOCK_SHARE_PERCENT: u64 = 10;
+
+/// The zero-fee messages one signer can produce again and again (audit
+/// L1S-02): every other zero-fee message is one-shot per validator.
+fn zero_fee_repeatable(tx: &PosTransaction) -> bool {
+    matches!(tx, PosTransaction::WithdrawalCredentialRotation(_) | PosTransaction::ValidatorCommissionUpdate(_))
+}
+
+/// `(kind, validator, signed epoch)` of a message the mempool admits once
+/// per validator per epoch (audit L1S-02).
+fn once_per_epoch_key(tx: &PosTransaction) -> Option<((u8, u32), u64)> {
+    match tx {
+        PosTransaction::WithdrawalCredentialRotation(tx) => Some(((0, tx.validator), tx.epoch)),
+        PosTransaction::ValidatorCommissionUpdate(tx) => Some(((1, tx.validator), tx.epoch)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test switch: pack as if `L2_DEPOSIT_INFLOW_BOUND_ACTIVATION_EPOCH`
@@ -5907,6 +5929,10 @@ impl Engine {
     /// branch is exactly the case where the newer slot is the true answer.
     fn note_tx_slots(&mut self, slot: u64, txs: &[PosTransaction]) {
         for tx in txs {
+            // Audit L1S-02: one included by another proposer counts too.
+            if let Some((once, epoch)) = once_per_epoch_key(tx) {
+                self.mempool.note_once_per_epoch(once, epoch);
+            }
             let id = tx.txid();
             if self.tx_slot_index.insert(id, slot).is_none() {
                 self.tx_slot_index_order.push_back(id);
@@ -6681,6 +6707,19 @@ impl Engine {
                 self.precheck_slashing_evidence(evidence, verification_source)?;
             }
         }
+        // Audit L1S-02: a credential rotation and a commission update pay no
+        // fee and can be signed again and again; the pool takes one per
+        // validator per epoch (admitted here or seen in a canonical block).
+        // Before the signatures: the record is written only for a message
+        // that passed them, so nobody can set it for a validator it does not
+        // control, and a repeat costs no verification.
+        if let Some((key, epoch)) = once_per_epoch_key(&tx) {
+            if self.mempool.once_per_epoch_seen(key, epoch) {
+                return Err(Refusal::StateDependent(
+                    "one credential rotation and one commission update per validator per epoch",
+                ));
+            }
+        }
         self.validate_lifecycle_admission(&tx, verification_source)?;
         // Plan capacity cleanup without mutating the pool. A forged incoming
         // signature must never evict either stale or currently paying entries.
@@ -6720,6 +6759,9 @@ impl Engine {
         // expire transactions it never had a chance to include.
         self.mempool_admitted_at
             .insert(key.clone(), self.head_slot_now());
+        if let Some((once, epoch)) = once_per_epoch_key(&tx) {
+            self.mempool.note_once_per_epoch(once, epoch);
+        }
         self.mempool.insert_with_txid(key, tx, txid);
         self.net.broadcast_transaction(broadcast);
         Ok((Admitted::New, prepared))
@@ -6905,6 +6947,19 @@ impl Engine {
         // deposit while the backlog is full. A settlement takes its whole
         // block, so the backlog only grows inside a block with deposits.
         let deposits_bounded = l2_deposit_inflow_bounded(epoch);
+        // Audit L1S-02: what zero-fee messages may take of this block. They
+        // pay nothing, yet their gas and bytes feed the base-fee controller,
+        // so an unlimited supply of them (credential rotations, commission
+        // updates) could hold every block above target and ratchet the price
+        // for everyone else. Free messages together get
+        // `ZERO_FEE_BLOCK_SHARE_PERCENT` of the gas and byte targets (the
+        // first one always fits, so none is unpackable), and the repeatable
+        // ones are never what takes a block above its byte target, the axis
+        // paying transactions are densest on.
+        let byte_target = bloch_pos_committee::fee_market::block_tx_bytes_target(epoch);
+        let free_gas_budget = bloch_pos_committee::fee_market::BLOCK_GAS_TARGET / 100 * ZERO_FEE_BLOCK_SHARE_PERCENT;
+        let free_byte_budget = byte_target / 100 * ZERO_FEE_BLOCK_SHARE_PERCENT;
+        let (mut free_gas, mut free_bytes) = (0u64, 0u64);
         let mut l2_deposits = 0usize;
         let deposit_room = l2.map_or(u64::MAX, |l2| {
             bloch_pos_committee::l2_settlement::MAX_PENDING_DEPOSITS.saturating_sub(l2.pending_deposits())
@@ -6972,6 +7027,22 @@ impl Engine {
             if bytes.saturating_add(n) > cap {
                 continue;
             }
+            // Unmetered eras (below `WITHDRAWAL_ACTIVATION_EPOCH`) charge a
+            // free message no capacity at all: it does not reach the
+            // controller, so there is nothing to budget.
+            let free = bloch_pos_committee::CommittedState::zero_fee_capacity(epoch, tx)
+                .filter(|charge| charge.gas != 0 || charge.tx_bytes != 0);
+            if let Some(charge) = &free {
+                let first = free_gas == 0 && free_bytes == 0;
+                let within = free_gas.saturating_add(charge.gas) <= free_gas_budget
+                    && free_bytes.saturating_add(n) <= free_byte_budget;
+                if !(first || within) {
+                    continue;
+                }
+                if zero_fee_repeatable(tx) && bytes.saturating_add(n) > byte_target {
+                    continue;
+                }
+            }
             let points = Self::spent_outpoints(tx).unwrap_or_default();
             if points.iter().any(|point| reserved.contains(point)) {
                 continue;
@@ -7017,6 +7088,10 @@ impl Engine {
             }
             reserved.extend(points);
             bytes = bytes.saturating_add(n); // checked against `cap` just above
+            if let Some(charge) = free {
+                free_gas = free_gas.saturating_add(charge.gas);
+                free_bytes = free_bytes.saturating_add(n);
+            }
             out.push(tx.clone());
         }
         out
@@ -22367,6 +22442,9 @@ mod validator_admission_tests;
 #[cfg(test)]
 #[path = "engine/funded_delegation_tests.rs"]
 mod funded_delegation_tests;
+#[cfg(test)]
+#[path = "engine/audit_20261123_l1s02_tests.rs"]
+mod audit_20261123_l1s02_tests;
 
 #[cfg(test)]
 mod branch_gap_repair_tests {
