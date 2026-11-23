@@ -576,11 +576,16 @@ pub mod withdrawal {
         /// sees, given the current escrow: rolled to a fresh window when the
         /// stored one is older.
         pub fn at(self, limits: &Limits, at_height: u64, escrow_sat: u128) -> Self {
+            self.at_bps(limits, at_height, escrow_sat, limits.release_window_bps)
+        }
+        /// [`Self::at`] with the escrow share given explicitly (the attested
+        /// lane, [`ATTESTED_RELEASE_WINDOW_BPS`]).
+        pub fn at_bps(self, limits: &Limits, at_height: u64, escrow_sat: u128, bps: u64) -> Self {
             let window = at_height / limits.release_window_blocks;
             if window == self.window && self.released != 0 {
                 return self;
             }
-            let share = escrow_sat.saturating_mul(u128::from(limits.release_window_bps)) / 10_000;
+            let share = escrow_sat.saturating_mul(u128::from(bps)) / 10_000;
             Self { window, released: 0, cap: share.max(u128::from(limits.release_floor_sat)) }
         }
         /// Whether `sats` more fits. An `exempt` claim (see
@@ -602,6 +607,68 @@ pub mod withdrawal {
         /// Room left in the window (an exempt first claim may exceed it).
         pub fn remaining(&self) -> u128 {
             self.cap.saturating_sub(self.released)
+        }
+    }
+
+    /// Escrow share (basis points) the attested lane may release per window
+    /// once `params::L2_ATTESTED_RELEASE_LANE_ACTIVATION_EPOCH` binds (audit
+    /// L1X-01): half of the escrow at the lane's first claim of the window.
+    pub const ATTESTED_RELEASE_WINDOW_BPS: u64 = 5_000;
+
+    /// Which gated release rules are in force for a claim (the caller knows
+    /// the epoch, the L2 state does not).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct ReleaseRules {
+        /// `params::L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH` (EXE-4).
+        pub exempt_after_earlier_claims: bool,
+        /// `params::L2_ATTESTED_RELEASE_LANE_ACTIVATION_EPOCH` (L1X-01).
+        pub attested_lane: bool,
+    }
+    impl ReleaseRules {
+        pub fn at(epoch: u64) -> Self {
+            Self {
+                exempt_after_earlier_claims: crate::params::l2_release_exemption_active(epoch),
+                attested_lane: crate::params::l2_attested_release_lane_active(epoch),
+            }
+        }
+    }
+
+    /// What the release window still admits for the next native block, as
+    /// claims are taken from it one after another: the single place that
+    /// decides `RateLimited` (the claim check, the release, and the
+    /// proposer's packing all use it).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ReleaseBudget {
+        /// The ordinary window.
+        pub open: ReleaseWindow,
+        /// The attested lane (used only behind its gate).
+        pub attested: ReleaseWindow,
+        /// The policy has an attestor set.
+        pub attestors: bool,
+        pub rules: ReleaseRules,
+    }
+    impl ReleaseBudget {
+        /// Whether a claim that carries an attestation is judged in the lane.
+        fn in_lane(&self, attested: bool) -> bool {
+            self.rules.attested_lane && attested && self.attestors
+        }
+        pub fn admits(&self, sats: u64, attested: bool) -> bool {
+            if self.in_lane(attested) {
+                // Open while it has released no more than its budget; the
+                // claim that crosses the budget is paid in full.
+                self.attested.released <= self.attested.cap
+            } else {
+                self.open.admits(sats, attested || !self.attestors, self.rules.exempt_after_earlier_claims)
+            }
+        }
+        /// Take `sats` if admitted; false (and nothing moved) otherwise.
+        pub fn take(&mut self, sats: u64, attested: bool) -> bool {
+            if !self.admits(sats, attested) {
+                return false;
+            }
+            let window = if self.in_lane(attested) { &mut self.attested } else { &mut self.open };
+            window.released = window.released.saturating_add(u128::from(sats));
+            true
         }
     }
 
@@ -1586,6 +1653,12 @@ pub struct State {
     /// while empty); the local cache carries it in its own trailing section.
     #[cfg_attr(feature = "local-state-cache", serde(skip))]
     settlers: Vec<Vec<u8>>,
+    /// Release accounting of the attested lane (audit L1X-01), written only
+    /// behind `params::L2_ATTESTED_RELEASE_LANE_ACTIVATION_EPOCH`. Committed
+    /// (last, absent until the lane's first claim); the local cache carries
+    /// it in its own trailing section.
+    #[cfg_attr(feature = "local-state-cache", serde(skip))]
+    attested_release: withdrawal::ReleaseWindow,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
@@ -1646,6 +1719,7 @@ impl State {
             profile: Profile::development(),
             checkpoint_roots: std::collections::BTreeMap::new(),
             settlers: Vec::new(),
+            attested_release: withdrawal::ReleaseWindow::default(),
         })
     }
     pub(crate) fn genesis_async(policy: Policy) -> Result<Self, Reject> {
@@ -1776,6 +1850,35 @@ impl State {
     pub fn release_window(&self) -> withdrawal::ReleaseWindow {
         self.release_window.at(&self.profile.limits, self.native_height.saturating_add(1), self.escrow_sat)
     }
+    /// The attested lane a claim in the next native block sees (audit
+    /// L1X-01; meaningful only behind its gate).
+    pub fn attested_release_window(&self) -> withdrawal::ReleaseWindow {
+        self.attested_release.at_bps(
+            &self.profile.limits,
+            self.native_height.saturating_add(1),
+            self.escrow_sat,
+            withdrawal::ATTESTED_RELEASE_WINDOW_BPS,
+        )
+    }
+    /// What the release window admits in the next native block under `rules`.
+    pub fn release_budget(&self, rules: withdrawal::ReleaseRules) -> withdrawal::ReleaseBudget {
+        withdrawal::ReleaseBudget {
+            open: self.release_window(),
+            attested: self.attested_release_window(),
+            attestors: self.policy.attestor_set != [0; 32],
+            rules,
+        }
+    }
+    /// Local-cache restore only; the state root check that follows the
+    /// restore authenticates what is put back.
+    #[cfg(feature = "local-state-cache")]
+    pub(crate) fn restore_attested_release(&mut self, window: withdrawal::ReleaseWindow) {
+        self.attested_release = window;
+    }
+    /// The stored attested-lane accounting (default until its first claim).
+    pub fn attested_release(&self) -> &withdrawal::ReleaseWindow {
+        &self.attested_release
+    }
     /// Record `root` as this chain's checkpoint of `epoch` (the epoch the
     /// boundary opens), with `finalized_epoch` the finalized checkpoint after
     /// the boundary's tally. FFG finalizes only the epoch before the one it
@@ -1843,6 +1946,21 @@ impl State {
         attested: bool,
         exempt_after_earlier_claims: bool,
     ) -> Result<withdrawal::Record, withdrawal::ClaimRefusal> {
+        let rules = withdrawal::ReleaseRules { exempt_after_earlier_claims, attested_lane: false };
+        self.check_claim_under(chain_id, index, l1_recipient, sats, siblings, attested, rules)
+    }
+    /// [`Self::check_claim`] under every gated release rule (`rules` is
+    /// [`withdrawal::ReleaseRules::at`] the claim's epoch).
+    pub fn check_claim_under(
+        &self,
+        chain_id: u64,
+        index: u64,
+        l1_recipient: &[u8; 32],
+        sats: u64,
+        siblings: &[[u8; 32]; withdrawal::TREE_DEPTH],
+        attested: bool,
+        rules: withdrawal::ReleaseRules,
+    ) -> Result<withdrawal::Record, withdrawal::ClaimRefusal> {
         use withdrawal::ClaimRefusal as R;
         if !self.profile.user_transactions || !self.asynchronous {
             return Err(R::NotActive);
@@ -1858,7 +1976,7 @@ impl State {
         if self.escrow_sat < u128::from(sats) {
             return Err(R::Escrow);
         }
-        if !self.release_window().admits(sats, self.window_exempt(attested), exempt_after_earlier_claims) {
+        if !self.release_budget(rules).admits(sats, attested) {
             return Err(R::RateLimited);
         }
         Ok(record)
@@ -1876,16 +1994,38 @@ impl State {
         attested: bool,
         exempt_after_earlier_claims: bool,
     ) -> Result<(), withdrawal::ClaimRefusal> {
-        self.check_claim(chain_id, index, l1_recipient, sats, siblings, attested, exempt_after_earlier_claims)?;
+        let rules = withdrawal::ReleaseRules { exempt_after_earlier_claims, attested_lane: false };
+        self.release_withdrawal_under(chain_id, index, l1_recipient, sats, siblings, attested, rules)
+    }
+    /// [`Self::release_withdrawal`] under every gated release rule.
+    pub(crate) fn release_withdrawal_under(
+        &mut self,
+        chain_id: u64,
+        index: u64,
+        l1_recipient: &[u8; 32],
+        sats: u64,
+        siblings: &[[u8; 32]; withdrawal::TREE_DEPTH],
+        attested: bool,
+        rules: withdrawal::ReleaseRules,
+    ) -> Result<(), withdrawal::ClaimRefusal> {
+        self.check_claim_under(chain_id, index, l1_recipient, sats, siblings, attested, rules)?;
         let released = self.released_sat.checked_add(u128::from(sats)).ok_or(withdrawal::ClaimRefusal::Escrow)?;
-        let mut window = self.release_window();
-        window.released = window.released.saturating_add(u128::from(sats));
+        let before = self.release_budget(rules);
+        let mut budget = before;
+        let taken = budget.take(sats, attested);
+        debug_assert!(taken, "checked just above");
         // No fallible step below: nullifier, escrow, total and window move together.
         let fresh = self.claimed.insert(index);
         debug_assert!(fresh);
         self.escrow_sat -= u128::from(sats);
         self.released_sat = released;
-        self.release_window = window;
+        // Exactly one of the two accountings moved; only that one is stored,
+        // so the ordinary window's committed bytes are what they always were.
+        if budget.attested != before.attested {
+            self.attested_release = budget.attested;
+        } else {
+            self.release_window = budget.open;
+        }
         Ok(())
     }
     /// `(root, count)` of the withdrawal tree after the accepted head: the
@@ -2100,6 +2240,15 @@ impl State {
             for key in &self.settlers {
                 out.extend_from_slice(key);
             }
+        }
+        // Absent until the first attested claim behind
+        // L2_ATTESTED_RELEASE_LANE_ACTIVATION_EPOCH, so earlier states keep
+        // their bytes.
+        if self.attested_release != withdrawal::ReleaseWindow::default() {
+            out.extend_from_slice(b"BLOCH:NATIVE:L2:ATTESTED-RELEASE:1");
+            out.extend_from_slice(&self.attested_release.window.to_le_bytes());
+            out.extend_from_slice(&self.attested_release.released.to_le_bytes());
+            out.extend_from_slice(&self.attested_release.cap.to_le_bytes());
         }
         out
     }

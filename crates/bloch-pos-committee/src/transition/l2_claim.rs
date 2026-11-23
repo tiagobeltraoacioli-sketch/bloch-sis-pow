@@ -491,7 +491,7 @@ impl CommittedState {
             }
             _ => {}
         }
-        let record = l2.check_claim(tx.l2_chain_id, tx.index, &tx.l1_recipient, tx.sats, &tx.siblings, tx.attestation.is_some(), crate::params::l2_release_exemption_active(self.epoch))?;
+        let record = l2.check_claim_under(tx.l2_chain_id, tx.index, &tx.l1_recipient, tx.sats, &tx.siblings, tx.attestation.is_some(), withdrawal::ReleaseRules::at(self.epoch))?;
         // During a block's transactions `self` still has the parent's slot
         // and the L2 state the parent's native height; the claim's block is
         // the next one.
@@ -542,11 +542,11 @@ impl CommittedState {
         if !tx.verify_attestation(verifier) {
             return Err(R::Attestation);
         }
-        let exempt_after_earlier_claims = crate::params::l2_release_exemption_active(self.epoch);
+        let rules = withdrawal::ReleaseRules::at(self.epoch);
         let l2 = self.l2_settlement.as_mut().ok_or(R::NotActive)?;
         // The release is the last fallible step; spendable-set edits follow it.
         // An attestation reaching here names the policy's set and verified.
-        l2.release_withdrawal(tx.l2_chain_id, tx.index, &tx.l1_recipient, tx.sats, &tx.siblings, tx.attestation.is_some(), exempt_after_earlier_claims)?;
+        l2.release_withdrawal_under(tx.l2_chain_id, tx.index, &tx.l1_recipient, tx.sats, &tx.siblings, tx.attestation.is_some(), rules)?;
         for input in &tx.inputs {
             self.eutxos.remove(&(input.txid, input.vout));
         }

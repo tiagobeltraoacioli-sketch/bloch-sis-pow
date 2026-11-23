@@ -108,6 +108,9 @@ pub mod local_cache {
     /// L2 settler set (audit L2N-01,
     /// `L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH`), after the L2 sections.
     pub const L2_SETTLERS: &[u8; 16] = b"BPOSST01:L2ST:v1";
+    /// L2 attested release lane (audit L1X-01,
+    /// `L2_ATTESTED_RELEASE_LANE_ACTIVATION_EPOCH`), last of the L2 sections.
+    pub const L2_ATTESTED_RELEASE: &[u8; 16] = b"BPOSST01:L2AR:v1";
     /// HF3 KES (`v2`: entries with start periods and the enforcement bind
     /// epoch; the devnet lineage's `v1` section is not accepted).
     /// `v3` adds the retired-key history (review R-1); `v1`/`v2` sections
@@ -126,8 +129,8 @@ pub mod local_cache {
     /// `CREDENTIAL_ROTATION_LIMIT_ACTIVATION_EPOCH`).
     pub const CREDENTIAL_ROTATIONS: &[u8; 16] = b"BPOSST01:CROT:v1";
     /// Fixed merge/parse order.
-    pub const ORDER: [&[u8; 16]; 9] =
-        [L2, L2_CHECKPOINTS, L2_SETTLERS, KES, PQ, FINALITY_SET, OWN_CHECKPOINTS, COMMISSION_UPDATES, CREDENTIAL_ROTATIONS];
+    pub const ORDER: [&[u8; 16]; 10] =
+        [L2, L2_CHECKPOINTS, L2_SETTLERS, L2_ATTESTED_RELEASE, KES, PQ, FINALITY_SET, OWN_CHECKPOINTS, COMMISSION_UPDATES, CREDENTIAL_ROTATIONS];
 }
 
 /// Trailing extensions of the finality leaf (state tag `0x09`). Absent while

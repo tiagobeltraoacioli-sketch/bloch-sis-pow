@@ -6988,8 +6988,12 @@ impl Engine {
         // selects together what the transition refuses.
         let mut da_keys = BTreeSet::new();
         let mut claimed = BTreeSet::new();
-        let mut release = l2.map(|l2| (l2, l2.release_window(), l2.escrow_sat()));
-        let exempt_after_earlier_claims = bloch_pos_committee::params::l2_release_exemption_active(epoch);
+        // The budget follows both gated release rules (EXE-4 and the
+        // attested lane of audit L1X-01) through the one type the claim
+        // check itself uses.
+        let mut release = l2.map(|l2| {
+            (l2.release_budget(bloch_pos_committee::l2_settlement::withdrawal::ReleaseRules::at(epoch)), l2.escrow_sat())
+        });
         // F-9: consensus admits at most RESCUE_COMMITS_MAX_PER_BLOCK
         // commitments; they rank after every tipped transaction and among
         // themselves by `rescue_commit_rank`.
@@ -7088,14 +7092,11 @@ impl Engine {
                 if claimed.contains(&claim.index) {
                     continue;
                 }
-                if let Some((l2, window, escrow)) = release.as_mut() {
+                if let Some((budget, escrow)) = release.as_mut() {
                     let sats = u128::from(claim.sats);
-                    if *escrow < sats
-                        || !window.admits(claim.sats, l2.window_exempt(claim.attestation.is_some()), exempt_after_earlier_claims)
-                    {
+                    if *escrow < sats || !budget.take(claim.sats, claim.attestation.is_some()) {
                         continue;
                     }
-                    window.released = window.released.saturating_add(sats);
                     *escrow -= sats; // checked just above
                 }
                 claimed.insert(claim.index);

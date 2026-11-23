@@ -17,6 +17,10 @@ const L2_CHECKPOINT_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::L2_CHEC
 /// (`params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH`). Written only when
 /// a set is installed, so every earlier cache keeps its bytes.
 const L2_SETTLER_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::L2_SETTLERS;
+/// Marks the optional section after it holding the attested release lane's
+/// accounting (`params::L2_ATTESTED_RELEASE_LANE_ACTIVATION_EPOCH`). Written
+/// only once the lane has been used.
+const L2_ATTESTED_RELEASE_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::L2_ATTESTED_RELEASE;
 /// Marks the optional trailing post-quantum rescue-commitment section. Written
 /// only when the map is non-empty (never before the emergency gate).
 const PQ_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::PQ;
@@ -247,6 +251,14 @@ impl CommittedState {
                     return Err(error.to_string());
                 }
             }
+            if *l2.attested_release() != crate::l2_settlement::withdrawal::ReleaseWindow::default() {
+                bytes.extend_from_slice(L2_ATTESTED_RELEASE_SECTION);
+                if let Err(error) = bincode::DefaultOptions::new().with_limit(LIMIT)
+                    .serialize_into(&mut *bytes, l2.attested_release()) {
+                    bytes.truncate(original_len);
+                    return Err(error.to_string());
+                }
+            }
             if bytes.len() - original_len > LIMIT as usize {
                 bytes.truncate(original_len);
                 return Err("local cache payload exceeds its limit".into());
@@ -420,6 +432,15 @@ impl CommittedState {
                 }
                 l2.restore_settlers(keys);
                 section = settler_section;
+            }
+            if let Some(mut lane_section) = section.strip_prefix(L2_ATTESTED_RELEASE_SECTION.as_slice()) {
+                let window: crate::l2_settlement::withdrawal::ReleaseWindow = bincode::DefaultOptions::new().with_limit(LIMIT)
+                    .deserialize_from(&mut lane_section).map_err(|e| e.to_string())?;
+                if window == crate::l2_settlement::withdrawal::ReleaseWindow::default() {
+                    return Err("empty cached L2 attested-release section".into());
+                }
+                l2.restore_attested_release(window);
+                section = lane_section;
             }
             l2_settlement = Some(l2.from_local_cache()?);
             rest = section;

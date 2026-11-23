@@ -2942,6 +2942,67 @@ pub(crate) mod l2_release_exemption_rehearsal {
     }
 }
 
+/// AUDIT-L1L2-20261123 L1X-01: attested claims are released from their own
+/// lane of the release window. `u64::MAX` means INERT.
+///
+/// One window serves every claim, first come first served. A dust claim
+/// (today), a claim just under the attestation threshold, or one attested
+/// claim just over the cap (once `L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH` is
+/// armed) therefore closes it for every other withdrawal, window after
+/// window. The window exists to slow a forged proof, which cannot produce
+/// the attestors' signatures.
+///
+/// Once armed, on a policy with an attestor set, a claim that carries the
+/// attestation is neither counted against nor limited by the ordinary
+/// window. It draws on a second accounting of the same window length whose
+/// budget is `l2_settlement::withdrawal::ATTESTED_RELEASE_WINDOW_BPS` (50%)
+/// of the escrow at the lane's first claim (same floor): attested claims are
+/// admitted while the lane has released no more than its budget, and the
+/// claim that crosses it is paid in full and closes the lane until the next
+/// window. Unattested claims keep the ordinary cap, alone. Per window the
+/// escrow then releases at most `cap` to unattested claims (a forged proof
+/// without attestor keys is bounded exactly as before) plus the lane budget
+/// and one attested claim.
+///
+/// This is the middle ground between today's rule (attested claims compete
+/// for the one window) and taking attested claims out of the window
+/// altogether (no per-window bound if the proof system and three attestor
+/// keys fail together). It adds committed state (the lane's accounting,
+/// absent until the first attested claim under the gate) and one optional
+/// local-cache section. It is independent of
+/// `L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH`, which keeps governing policies
+/// without attestors.
+///
+/// It changes which claims are valid, so arming needs a historical replay,
+/// mixed-fleet qualification and a coordinated epoch. It cannot precede the
+/// L2 itself. `l1x01_the_attested_lane_gate_is_inert` pins the inert value.
+pub const L2_ATTESTED_RELEASE_LANE_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    L2_ATTESTED_RELEASE_LANE_ACTIVATION_EPOCH,
+    L2_SETTLEMENT_ACTIVATION_EPOCH
+));
+
+pub fn l2_attested_release_lane_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_attested_release_lane_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_ATTESTED_RELEASE_LANE_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_attested_release_lane_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// Fault isolation of the L2 / bridge / settlement handlers inside the block
 /// transition ([`crate::isolation`]). `u64::MAX` means INERT.
 ///
