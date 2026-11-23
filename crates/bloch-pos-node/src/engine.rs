@@ -2519,6 +2519,8 @@ mod side_branch_tests;
 #[cfg(test)]
 mod orphaned_head_tests;
 mod kes_local_check;
+#[cfg(test)]
+mod own_body_vote_tests;
 mod verification;
 mod finality_cert;
 #[cfg(test)]
@@ -3934,6 +3936,49 @@ impl Engine {
              bypass with --no-doppelganger-check or BLOCH_NO_DOPPELGANGER=1 (NOT recommended).",
             self.wall_slot,
         );
+    }
+
+    /// Votes of THIS key carried in the body of a block that just became
+    /// canonical (audit L1C-31).
+    ///
+    /// The gossip door and the block door's proposer check were the only
+    /// feeds of [`Self::note_own_signature`], so a vote of this key that
+    /// reached the node only inside a block (while it was catching up, when
+    /// the gossip copy was dropped or never routed here, or signed before
+    /// this node subscribed) was ignored even after the transition had
+    /// verified its signature: a second instance went unnoticed, and the
+    /// record still admitted a second vote for a target already signed.
+    ///
+    /// Called only after the transition accepted the whole block, so every
+    /// body vote is authentic: a forged vote makes the block invalid and
+    /// never reaches this. A vote the record covers is this node's own work
+    /// and does nothing. An uncovered one raises the record; when the node
+    /// is live it also stops duties (during boot replay it only raises the
+    /// record, which is what `SlashingProtection::settle_missing_history`
+    /// already documented).
+    ///
+    /// Deliberately NOT fed to [`Self::note_possible_doppelganger`]: that
+    /// check halts on any duty of this index dated inside the observation
+    /// window, covered or not. Gossip never hands a node its own vote back,
+    /// but a block does: a node restarted within the slot it voted in would
+    /// read its own vote in the next block and halt. An uncovered vote halts
+    /// through the record check above, inside the window and after it.
+    fn note_own_body_votes(&mut self, env: &BlockEnvelope) {
+        if self.keys.is_none() || env.body.attestations.is_empty() {
+            return;
+        }
+        let Some(my_index) = self.duty_index(&self.state) else { return };
+        let live = self.live;
+        let mine: Vec<crate::slashprot::Published> = env
+            .body
+            .attestations
+            .iter()
+            .filter(|att| att.validator == my_index)
+            .map(published_attestation)
+            .collect();
+        for seen in mine {
+            self.note_own_signature(my_index, seen, live);
+        }
     }
 
     /// Rollback guard, runtime half (node-local). An authenticated signature
@@ -7226,6 +7271,10 @@ impl Engine {
                 // finality ratchet, which may release bodies. A no-op on the
                 // replay path, where the block is stored after this returns.
                 self.blocks.mark_validated(id.as_bytes());
+                // Audit L1C-31: the transition just verified every body
+                // vote; one of this key that the record does not cover is
+                // the evidence a gossip sighting is.
+                self.note_own_body_votes(env);
                 // RPC-only: retain the registry proof of a checkpoint block
                 // when this block opened a new epoch (once per epoch).
                 self.note_checkpoint_registry();
@@ -7975,6 +8024,12 @@ impl Engine {
             self.chain.push((env.header.slot, id));
         }
         self.canonical = canonical;
+        // Audit L1C-31: every block of the adopted branch passed the
+        // transition above, body votes included. Same hook as the
+        // pure-extension path (`apply_canonical`).
+        for env in &branch {
+            self.note_own_body_votes(env);
+        }
         // RPC-only: the reorg ring holds the new head and its parent, so
         // the head's boundary (if it opened an epoch) can be retained.
         self.note_checkpoint_registry();
