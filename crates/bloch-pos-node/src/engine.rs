@@ -1892,6 +1892,10 @@ fn zero_fee_repeatable(tx: &PosTransaction) -> bool {
     matches!(tx, PosTransaction::WithdrawalCredentialRotation(_) | PosTransaction::ValidatorCommissionUpdate(_))
 }
 
+/// The refusal of a second credential rotation or commission update of one
+/// validator in one signed epoch (audit L1S-02). Retryable, never a bar.
+const ONCE_PER_EPOCH_REFUSAL: &str = "one credential rotation and one commission update per validator per epoch";
+
 /// `(kind, validator, signed epoch)` of a message the mempool admits once
 /// per validator per epoch (audit L1S-02).
 fn once_per_epoch_key(tx: &PosTransaction) -> Option<((u8, u32), u64)> {
@@ -6331,6 +6335,24 @@ impl Engine {
         }
     }
 
+    /// A block carrying `txs` just left canonical history (review of
+    /// b8f1b91d). A credential rotation or commission update it included
+    /// marked its validator's epoch as used (`note_tx_slots`); with the block
+    /// gone the message is in no block, and unless this pool still holds one
+    /// for the same validator and epoch the mark would refuse the signer's
+    /// resubmission until the next epoch. Release it. Node-local: the mark is
+    /// mempool policy only. A mark of a NEWER epoch is left alone, and so is
+    /// one a pending message of this pool accounts for.
+    fn release_once_per_epoch_marks(&mut self, txs: &[PosTransaction]) {
+        for tx in txs {
+            let Some(once) = once_per_epoch_key(tx) else { continue };
+            if self.mempool.values().any(|pending| once_per_epoch_key(pending) == Some(once)) {
+                continue;
+            }
+            self.mempool.release_once_per_epoch(once.0, once.1);
+        }
+    }
+
     /// `pending | included | justified | finalized | unknown` for `txid`
     /// (R4 F-11). Cheapest check first: the bounded index (`O(log n)`
     /// lookup) before the cached mempool identity index (`O(log n)`).
@@ -7045,6 +7067,22 @@ impl Engine {
         if let Some(refusal) = self.pending_input_refusal(&tx, epoch_of(self.wall_slot())) {
             return Err(refusal);
         }
+        // Audit L1S-02: a credential rotation and a commission update pay no
+        // fee and can be signed again and again; the pool takes one per
+        // validator per epoch (admitted here or seen in a canonical block).
+        // HERE, before any signature of the newcomer is verified (review of
+        // b8f1b91d: after the merge with L1N-02 the rule sat behind the
+        // verification and its refusal was charged to the delivering source,
+        // while the comment said otherwise). The record is written only for
+        // a message that passed its signatures, so nobody can set it for a
+        // validator it does not control; a repeat is answered by a lookup,
+        // costs no verification, and costs the peer that relayed it nothing:
+        // the refusal depends on this node's pool, which a relay cannot see.
+        if let Some((once, epoch)) = once_per_epoch_key(&tx) {
+            if self.mempool.once_per_epoch_seen(once, epoch) {
+                return Err(Refusal::StateDependent(ONCE_PER_EPOCH_REFUSAL));
+            }
+        }
         let verified_units;
         if let PosTransaction::L2SettlementAsync(settlement) = &tx {
             let state = self.state.l2_settlement().ok_or(Refusal::Invalid("L2 settlement is not configured"))?;
@@ -7167,19 +7205,10 @@ impl Engine {
                 self.precheck_slashing_evidence(evidence, verification_source)?;
             }
         }
-        // Audit L1S-02: a credential rotation and a commission update pay no
-        // fee and can be signed again and again; the pool takes one per
-        // validator per epoch (admitted here or seen in a canonical block).
-        // Before the signatures: the record is written only for a message
-        // that passed them, so nobody can set it for a validator it does not
-        // control, and a repeat costs no verification.
-        if let Some((key, epoch)) = once_per_epoch_key(tx) {
-            if self.mempool.once_per_epoch_seen(key, epoch) {
-                return Err(Refusal::StateDependent(
-                    "one credential rotation and one commission update per validator per epoch",
-                ));
-            }
-        }
+        // The once-per-epoch rule of audit L1S-02 is not here: it is a
+        // lookup, answered in `admit_transaction` before any signature of
+        // the newcomer is verified, so that a repeat costs no verification
+        // and no failure charge to whoever relayed it.
         self.validate_lifecycle_admission(tx, verification_source)?;
         // Plan capacity cleanup without mutating the pool. A forged incoming
         // signature must never evict either stale or currently paying entries.
@@ -8302,6 +8331,9 @@ impl Engine {
             .collect();
         for (slot, txs) in stale {
             self.forget_tx_slots_if_stale(slot, &txs);
+            // Before the winning branch is noted below: a message it
+            // includes again is marked again there.
+            self.release_once_per_epoch_marks(&txs);
         }
         // Remove stale FIFO identities once for the whole losing tail. If an
         // adopted transaction is reinserted while its old queue ID remains,

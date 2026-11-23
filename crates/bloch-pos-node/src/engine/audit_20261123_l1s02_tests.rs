@@ -118,7 +118,7 @@ fn the_pool_takes_one_rotation_and_one_commission_update_per_validator_per_epoch
     let included = commission(&node, epoch, 500);
     let repeat = commission(&node, epoch, 700);
     let lane = node.gossip_verifier.lane_used_at(node.wall_slot(), verification::VerificationLane::Relay);
-    const ONCE: &str = "one credential rotation and one commission update per validator per epoch";
+    const ONCE: &str = ONCE_PER_EPOCH_REFUSAL;
     // Before anything is recorded the door gets past the rule (and refuses
     // this unsigned fixture message for another reason).
     assert!(!matches!(node.on_transaction(repeat.clone()), Err(Refusal::StateDependent(ONCE))));
@@ -132,4 +132,99 @@ fn the_pool_takes_one_rotation_and_one_commission_update_per_validator_per_epoch
     );
     // The same validator's update for the next epoch is not held by it.
     assert!(!matches!(node.on_transaction(commission(&node, epoch + 1, 700)), Err(Refusal::StateDependent(ONCE))));
+}
+
+/// Review of b8f1b91d, the order: the rule is a lookup answered before any
+/// signature of the newcomer is verified, for both kinds, and its refusal
+/// is not charged to the source that delivered the repeat (after the merge
+/// with L1N-02 it sat behind the verification and was charged like a
+/// failure).
+#[test]
+fn a_repeat_is_refused_before_any_signature_and_costs_its_relay_nothing() {
+    let (mut node, _dir) = perf_support::proposing_engine();
+    let _clock = validator_lifecycle::clock_at(EPOCH * SLOTS_PER_EPOCH + 1);
+    let source = [0x77u8; 32];
+    let relay = verification::VerificationLane::Relay;
+    let slot = node.wall_slot();
+    let used = |node: &Engine| (
+        node.gossip_verifier.lane_used_at(slot, relay),
+        node.gossip_verifier.source_failures_at(slot, relay, source),
+    );
+    for (kind, tx) in [(0u8, rotation(7, 0x31).1), (1u8, commission(&node, EPOCH, 700))] {
+        let (once, epoch) = once_per_epoch_key(&tx).unwrap();
+        assert_eq!((once.0, epoch), (kind, EPOCH));
+        // Not recorded: the door gets past the rule (these fixture messages
+        // are then refused for their signatures or their state).
+        assert!(!matches!(node.on_transaction_from(tx.clone(), Some(source)), Err(Refusal::StateDependent(ONCE_PER_EPOCH_REFUSAL))));
+        let spent = used(&node);
+        node.mempool.note_once_per_epoch(once, epoch);
+        assert!(matches!(node.on_transaction_from(tx, Some(source)), Err(Refusal::StateDependent(ONCE_PER_EPOCH_REFUSAL))));
+        assert_eq!(used(&node), spent, "kind {kind}: the repeat verified nothing and charged its relay nothing");
+        node.mempool.release_once_per_epoch(once, epoch);
+    }
+    assert!(node.mempool.is_empty());
+    // The rule sits in the door itself, ahead of the first verifier.
+    let source_text = include_str!("../engine.rs");
+    let door = source_text.find("    fn admit_transaction<R>(").expect("the admission door");
+    let rule = door + source_text[door..].find("return Err(Refusal::StateDependent(ONCE_PER_EPOCH_REFUSAL));").expect("the rule");
+    let first_verifier = door + source_text[door..].find("self.gossip_verifier.budgeted_for_source(").expect("the first verifier");
+    assert!(rule < first_verifier, "the once-per-epoch lookup must precede every signature verification");
+    assert_eq!(source_text.matches("Refusal::StateDependent(ONCE_PER_EPOCH_REFUSAL)").count(), 1, "one place decides it");
+}
+
+/// Review of b8f1b91d, the reorg: a rotation or commission update whose
+/// block leaves canonical history no longer holds its validator's epoch.
+/// The signer can submit it again in the same epoch; a pending message of
+/// this pool, a newer epoch's record and other validators are untouched.
+#[test]
+fn a_reorged_out_message_releases_its_once_per_epoch_mark() {
+    let (mut node, _dir) = perf_support::proposing_engine();
+    let epoch = 4_700u64;
+    let _clock = validator_lifecycle::clock_at(epoch * SLOTS_PER_EPOCH + 1);
+    let included = commission(&node, epoch, 500);
+    let (once, _) = once_per_epoch_key(&included).unwrap();
+    let refused = |node: &mut Engine, bps: u128| {
+        let tx = commission(node, epoch, bps);
+        matches!(node.on_transaction(tx), Err(Refusal::StateDependent(ONCE_PER_EPOCH_REFUSAL)))
+    };
+    // Included in a canonical block: the epoch is used.
+    node.note_tx_slots(40, std::slice::from_ref(&included));
+    assert!(refused(&mut node, 700));
+    // The block is reorganised out and the winning branch does not carry
+    // the message: the epoch is open again.
+    node.release_once_per_epoch_marks(std::slice::from_ref(&included));
+    assert!(!node.mempool.once_per_epoch_seen(once, epoch));
+    assert!(!refused(&mut node, 700));
+    // The winning branch carries it again: marked again (the reorg notes
+    // the adopted blocks after releasing the losing ones).
+    node.note_tx_slots(41, std::slice::from_ref(&included));
+    assert!(refused(&mut node, 700));
+    // A record of a newer epoch is not released by an older block leaving.
+    node.mempool.note_once_per_epoch(once, epoch + 1);
+    node.release_once_per_epoch_marks(std::slice::from_ref(&included));
+    assert!(node.mempool.once_per_epoch_seen(once, epoch + 1));
+    node.mempool.release_once_per_epoch(once, epoch + 1);
+    // A message of the same validator and epoch still pending in this pool
+    // keeps the mark: the pool already holds this epoch's one message.
+    node.mempool.note_once_per_epoch(once, epoch);
+    let pending = commission(&node, epoch, 900);
+    node.mempool.insert(pending.canonical_bytes(), pending);
+    node.release_once_per_epoch_marks(std::slice::from_ref(&included));
+    assert!(node.mempool.once_per_epoch_seen(once, epoch), "the pending message accounts for the mark");
+    // Another validator's message leaving does not touch this one.
+    let (other, other_tx) = (once_per_epoch_key(&rotation(7, 0x31).1).unwrap(), rotation(7, 0x31).1);
+    node.mempool.note_once_per_epoch(other.0, other.1);
+    node.release_once_per_epoch_marks(std::slice::from_ref(&other_tx));
+    assert!(!node.mempool.once_per_epoch_seen(other.0, other.1));
+    assert!(node.mempool.once_per_epoch_seen(once, epoch));
+
+    // As wired: `do_reorg` releases the losing tail's marks after dropping
+    // its index entries and before it notes the winning branch.
+    let source_text = include_str!("../engine.rs");
+    let reorg = source_text.find("    fn do_reorg(").expect("do_reorg");
+    let body = &source_text[reorg..];
+    let forget = body.find("self.forget_tx_slots_if_stale(slot, &txs);").expect("losing tail forgotten");
+    let release = body.find("self.release_once_per_epoch_marks(&txs);").expect("losing tail's marks released");
+    let adopt = body.find("for (slot, txs) in included_txs {").expect("winning branch noted");
+    assert!(forget < release && release < adopt, "release the losing marks before the winning branch is noted");
 }

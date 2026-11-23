@@ -156,6 +156,13 @@ impl Mempool {
         let seen = self.once_per_epoch.entry(key).or_insert(epoch);
         *seen = (*seen).max(epoch);
     }
+    /// Forget that `key` was used in `epoch`: the block that carried the
+    /// message left canonical history. A record of another epoch stays.
+    pub(super) fn release_once_per_epoch(&mut self, key: (u8, u32), epoch: u64) {
+        if self.once_per_epoch.get(&key) == Some(&epoch) {
+            self.once_per_epoch.remove(&key);
+        }
+    }
     pub(super) fn insert(&mut self, key: Vec<u8>, tx: PosTransaction) -> Option<PosTransaction> {
         let txid = tx.txid();
         let old = self.insert_with_txid(key.clone(), tx, txid);
