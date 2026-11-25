@@ -142,11 +142,7 @@ fn sign_fitting_falcon_overflow_rate() {
 fn wallet_keypair_sign_fitting_covers_enveloped_and_raw_secrets() {
     use bloch_crypto::wallet::{self, Keypair};
     let enveloped = wallet::generate_keypair(true);
-    let raw = Keypair {
-        private_key: enveloped.private_key[crypto::SUITE_HEADER_LEN..].to_vec(),
-        public_key: enveloped.public_key.clone(),
-        address: enveloped.address.clone(),
-    };
+    let raw = Keypair::from_parts(enveloped.expose_private_key()[crypto::SUITE_HEADER_LEN..].to_vec(), enveloped.public_key.clone(), enveloped.address.clone());
     for key in [&enveloped, &raw] {
         for i in 0u8..8 {
             let sig = key.sign_fitting(&[i; 32], ADMISSION_BUDGET).expect("fits");

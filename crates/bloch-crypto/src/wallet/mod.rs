@@ -781,9 +781,17 @@ fn refuse_seeded_signing() -> Result<(), String> {
 
 // ── Keypair ───────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Deserialize)]
+/// Legacy keypair: a secret key, its public key and its address.
+///
+/// Review F6: the secret is not a public field and the type is not `Clone`.
+/// Both made unwiped copies trivial to create by accident: `Drop` wipes only
+/// the instance being dropped, so every clone and every `kp.private_key`
+/// copied out of it lived on unwiped. Code outside this crate now reaches the
+/// secret through [`Keypair::expose_private_key`], which says what it does,
+/// and builds one with [`Keypair::from_parts`].
+#[derive(Deserialize)]
 pub struct Keypair {
-    pub private_key: Vec<u8>,
+    pub(crate) private_key: Vec<u8>,
     pub public_key:  Vec<u8>,
     pub address:     String,
 }
@@ -812,6 +820,17 @@ impl Drop for Keypair {
 }
 
 impl Keypair {
+    /// Build a keypair from its parts. The secret is moved in, not copied.
+    pub fn from_parts(private_key: Vec<u8>, public_key: Vec<u8>, address: String) -> Self {
+        Keypair { private_key, public_key, address }
+    }
+
+    /// The secret key bytes. Every copy made from this borrow is the
+    /// caller's to wipe; prefer [`Self::sign`], which needs no copy.
+    pub fn expose_private_key(&self) -> &[u8] {
+        &self.private_key
+    }
+
     pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, String> {
         let sig = self.with_enveloped_secret(|sk| crypto::sign(sk, msg))?;
         self.release_if_valid(msg, sig)

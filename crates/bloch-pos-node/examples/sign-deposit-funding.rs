@@ -239,11 +239,7 @@ mod tests {
     fn fixture() -> (FundedDeposit, FundedDeposit, Keypair) {
         let (pubkey, secret) = crypto::generate_keypair();
         let raw = pubkey[4..].to_vec();
-        let key = Keypair {
-            private_key: secret[4..].to_vec(),
-            public_key: raw.clone(),
-            address: crypto::address_from_pubkey(&raw, false),
-        };
+        let key = Keypair::from_parts(secret[4..].to_vec(), raw.clone(), crypto::address_from_pubkey(&raw, false));
         let (vpub, vsecret) = crypto::generate_keypair();
         let mut tx = FundedDeposit {
             network_domain: [1; 32],
