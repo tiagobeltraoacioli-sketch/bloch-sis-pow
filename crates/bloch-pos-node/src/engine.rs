@@ -3172,6 +3172,42 @@ impl Refusal {
 /// reduced list.
 const PROPOSAL_RESELECTIONS_MAX: usize = 4;
 
+/// Wall time `propose` may spend probing and re-probing one block (review
+/// B3). Every refused transaction costs a full probe transition on the
+/// consensus thread, and the count bounds above still allow a few hundred of
+/// them, which an adversarial mempool can turn into more than a slot. Past
+/// this budget the remaining transactions are left out of THIS block (they
+/// stay pending, none is barred for it) and the block is built with the votes
+/// alone. A third of the slot: enough for every honest case observed, and it
+/// leaves the block time to propagate and be attested.
+const PROPOSAL_BUILD_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(bloch_pos_committee::params::SLOT_DURATION_SECS / 3);
+
+/// Whether a build that began at `started` has used its budget by `now`.
+fn proposal_budget_spent(started: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(started) >= PROPOSAL_BUILD_BUDGET
+}
+
+#[cfg(test)]
+mod proposal_budget_tests {
+    use super::*;
+
+    /// The budget is a real fraction of the slot, is spent exactly at its
+    /// end, and a clock reading before the start never counts as spent.
+    #[test]
+    fn proposal_build_budget_is_bounded_by_the_slot() {
+        let slot = std::time::Duration::from_secs(bloch_pos_committee::params::SLOT_DURATION_SECS);
+        assert!(PROPOSAL_BUILD_BUDGET >= std::time::Duration::from_secs(5));
+        assert!(PROPOSAL_BUILD_BUDGET <= slot / 2);
+        let start = std::time::Instant::now();
+        assert!(!proposal_budget_spent(start, start));
+        assert!(!proposal_budget_spent(start, start + PROPOSAL_BUILD_BUDGET - std::time::Duration::from_millis(1)));
+        assert!(proposal_budget_spent(start, start + PROPOSAL_BUILD_BUDGET));
+        assert!(proposal_budget_spent(start, start + slot));
+        assert!(!proposal_budget_spent(start + slot, start));
+    }
+}
+
 fn culprit_index(err: &TransitionError, len: usize) -> Option<usize> {
     match err {
         TransitionError::Transfer(i, _) | TransitionError::Transaction(i) => {
@@ -4499,7 +4535,23 @@ impl Engine {
         }
         header.attestation_root = derive::attestation_root(&atts);
         let mut vote_retries = 0usize;
+        let build_started = std::time::Instant::now();
+        let mut budget_spent = false;
         let (post, tx_bytes) = loop {
+            // B3: the retries below are bounded by count, not by time. Once
+            // the budget is gone, stop paying one probe per refused
+            // transaction: leave the rest of the selection out of this block.
+            if !budget_spent && !txs.is_empty() && proposal_budget_spent(build_started, std::time::Instant::now()) {
+                budget_spent = true;
+                crate::metrics::NodeMetrics::inc(&crate::metrics::NODE.proposal_build_deadline_total);
+                eprintln!(
+                    "[slot {slot}] building this proposal has taken more than {}s; proposing \
+                     without its {} remaining transaction(s), which stay pending",
+                    PROPOSAL_BUILD_BUDGET.as_secs(),
+                    txs.len(),
+                );
+                txs.clear();
+            }
             let tx_bytes: Vec<Vec<u8>> = txs.iter().map(PosTransaction::canonical_bytes).collect();
             header.body_root = derive::body_root(&tx_bytes);
             let probe = ProposalEnvelope {
@@ -4550,7 +4602,7 @@ impl Engine {
                     // transactions still land instead of the shrunken list.
                     // They stay pending for the next proposer.
                     narrowed |= !indexed;
-                    if indexed && !narrowed && reselections <= PROPOSAL_RESELECTIONS_MAX {
+                    if indexed && !narrowed && !budget_spent && reselections <= PROPOSAL_RESELECTIONS_MAX {
                         reselections += 1;
                         let again = self.select_transactions_with(
                             bloch_pos_committee::epoch_of(slot),
@@ -4599,6 +4651,7 @@ impl Engine {
             // An empty signature means signing failed (review F-7 residual):
             // the watermark is spent, but no block is broadcast.
             Ok(sig) if sig.is_empty() => {
+                crate::metrics::NodeMetrics::inc(&crate::metrics::NODE.proposal_signature_failures_total);
                 eprintln!("[slot {slot}] not proposing: the proposer signature could not be produced");
                 return;
             }
@@ -4656,6 +4709,7 @@ impl Engine {
             if self.evict_vote_refused_in_own_block(&signed, &vote_keys, &txs, slot) {
                 return;
             }
+            crate::metrics::NodeMetrics::inc(&crate::metrics::NODE.own_blocks_refused_total);
             eprintln!(
                 "[slot {slot}] REFUSED OWN BLOCK {} — the transition did not adopt what this \
                  node just produced (h28080 class). Dropping its {} transaction(s) and \
@@ -10151,6 +10205,9 @@ fn start_devnet(
         for w in security.warnings() {
             eprintln!("mesh security: WARNING {w}");
         }
+        if let Some(w) = security.exposure_warning(&cfg.listen_addr) {
+            eprintln!("mesh security: WARNING {w}");
+        }
     };
     warn();
     let mesh = net::start(
@@ -10462,6 +10519,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
             k.signer_self_test()?;
             println!("signer self-test: ok (platform {}, Falcon-1024 KAT, pairwise); {hardening}",
                 bloch_crypto::crypto::hardening::target_arch());
+            println!("{}", crate::keys::signing_latency_floor_notice());
             Some(k)
         }
         None => {
@@ -11168,12 +11226,22 @@ pub fn run(cfg: Config) -> io::Result<()> {
                 if !addr.ip().is_loopback() {
                     // Not a log line among log lines: this port has no
                     // authentication and `sendrawtransaction` is a write.
+                    // What is stated is what is configured: an operator who
+                    // set an API key or a rate limit is not told there is none.
+                    let access = crate::rpc::Access::from_env().unwrap_or_default();
+                    let authentication = if access.is_authenticated() {
+                        "an API key (sent in clear: plain HTTP, no TLS)"
+                    } else {
+                        "NO authentication"
+                    };
+                    let rate = if access.is_rate_limited() { "a per-source rate limit" } else { "NO rate limiting" };
                     eprintln!(
                         "WARNING: the RPC is bound to {}, which is not loopback. It has \
-                         NO authentication, NO rate limiting and NO authorisation — \
-                         anything that can reach this port can read the node's full \
-                         state and submit transactions. Restrict it at the firewall to \
-                         the clients that are meant to reach it.",
+                         {authentication}, {rate} and NO per-method authorisation — \
+                         anything that can reach this port and pass those checks can read \
+                         the node's full state and submit transactions (unless \
+                         --rpc-read-only is set). Restrict it at the firewall to the \
+                         clients that are meant to reach it.",
                         addr.ip()
                     );
                 }

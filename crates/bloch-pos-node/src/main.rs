@@ -734,7 +734,10 @@ fn print_help() {
                manifest commits to none and the flag is then refused.\n\
                          [--rpc-bind <ip>] [--rpc-port <n>|off]\n\
                          [--rpc-trusted-proxy <ip[,ip...]>]\n\
+                         [--rpc-read-only] [--rpc-api-key-file <path>]\n\
+                         [--rpc-rate-limit <requests-per-second>]\n\
                          [--metrics-bind <ip>] [--metrics-port <n>] [--allow-public-metrics]\n\
+                         [--metrics-token-file <path>]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
                data persists in <dir>; a compatible local state cache skips its replay prefix.\n\
                \n\
@@ -752,6 +755,10 @@ fn print_help() {
                unauthenticated. A non-loopback bind is refused unless\n\
                --allow-public-metrics explicitly acknowledges the exposure;\n\
                that flag adds no authentication, so firewall it like RPC.\n\
+               --metrics-token-file <path> (24 to 256 printable characters\n\
+               in the file) makes both endpoints require\n\
+               `Authorization: Bearer <token>`, else 401; it is what a\n\
+               Prometheus bearer_token_file sends. Plain HTTP still.\n\
                Requests must carry a Host naming loopback, the bound\n\
                address (on 0.0.0.0/::, the IP the scraper connected to) or\n\
                a name in BLOCH_RPC_HOST_ALLOWLIST; others get 403.\n\
@@ -790,6 +797,17 @@ fn print_help() {
                entry that is not itself a listed proxy). Default: none, and\n\
                forwarded headers are ignored. List only addresses from\n\
                which nothing but your proxy can connect.\n\
+               \n\
+               Three opt-in restrictions, all off by default:\n\
+               --rpc-read-only refuses sendrawtransaction, so a node behind\n\
+               a public read gateway cannot be used to submit;\n\
+               --rpc-api-key-file <path> requires every request to carry\n\
+               the key in that file (24 to 256 printable characters) in an\n\
+               X-API-Key header, else 401; --rpc-rate-limit <n> allows n\n\
+               requests per second per source address (burst 2n), else\n\
+               429. None of them encrypts anything: the RPC is still plain\n\
+               HTTP, so send the key only over loopback or through a\n\
+               TLS-terminating proxy.\n\
                A node started with an EMPTY data dir syncs from genesis: it\n\
                downloads every block from peers and validates each one\n\
                itself. No datadir is ever donated. While the chain is\n\
@@ -1118,6 +1136,7 @@ const RUN_SWITCHES: &[&str] = &[
     "--acknowledge-missing-slashing-protection",
     "--replay-from-genesis",
     "--require-state-cache",
+    "--rpc-read-only",
     "--security-status",
     "--security-status-remote",
 ];
@@ -1784,15 +1803,14 @@ pub(crate) struct TransportPlan {
 /// nothing else — no clock, no filesystem, no environment, no `exit`, no
 /// print — so every posture and every refusal below is a unit test.
 ///
-/// # The default is Dual (flipped, deliberately)
+/// # The default is Devnet (and a flip to Dual was reverted)
 ///
-/// `None => Dual`. The earlier default was `Devnet`, kept there because a node
-/// that quietly came up on libp2p ALONE would find no peers and fork off. Dual
-/// removes that hazard while opening the network: it runs the devnet TCP mesh
-/// (so a node restarting with an unchanged unit file still finds the fleet) AND
-/// binds a libp2p swarm (so an unaffiliated third party can dial in). Explicit
-/// `--transport devnet` still selects devnet-only for anyone who wants it. This
-/// flip is a fleet-wide decision and was made deliberately, not as cleanup.
+/// `None => Devnet`: no `--transport` selects the devnet TCP mesh alone, the
+/// same as an explicit `--transport devnet`. A revision briefly mapped `None`
+/// to `Dual`; it was reverted (audit round 3, H-2; see the comment on the
+/// match arm below) because every rebuilt node then opened a libp2p listener
+/// nobody had asked for. Moving a node to `dual` or `libp2p` is an explicit
+/// flag in its unit file, never a compiled-in default.
 ///
 /// # What is new is that the decision is stated, and contradictions refuse
 ///
@@ -2124,6 +2142,34 @@ fn run_cmd(args: &[String]) {
         }
     }
 
+    // The opt-in RPC restrictions. Same sugar-over-env shape as the trusted
+    // proxies above, and validated now for the same reason: a restriction the
+    // operator asked for and mistyped must stop the boot, not be dropped.
+    if run_switch(args, "--rpc-read-only") {
+        unsafe { std::env::set_var(rpc::RPC_READ_ONLY_ENV, "1") };
+    }
+    if let Some(path) = arg_value(args, "--rpc-api-key-file") {
+        unsafe { std::env::set_var(rpc::RPC_API_KEY_FILE_ENV, path) };
+    }
+    if let Some(value) = arg_value(args, "--rpc-rate-limit") {
+        if let Err(why) = rpc::Access::parse_rate(&value) {
+            eprintln!("run: --rpc-rate-limit: {why}");
+            exit(2);
+        }
+        unsafe { std::env::set_var(rpc::RPC_RATE_LIMIT_ENV, value) };
+    }
+    match rpc::Access::from_env() {
+        Ok(access) => {
+            for line in access.summary() {
+                println!("{line}");
+            }
+        }
+        Err(why) => {
+            eprintln!("run: RPC access settings: {why}");
+            exit(2);
+        }
+    }
+
     // Metrics/health (audit C-R6-2). OPT-IN: no flag, no listener, so an
     // unflagged fleet binary behaves byte-for-byte as before. Same refusal
     // rule as --rpc-port: a malformed port stops the boot rather than
@@ -2144,6 +2190,21 @@ fn run_cmd(args: &[String]) {
         eprintln!("run: {error}");
         exit(2);
     });
+    // Optional bearer token for /health and /metrics; same sugar-over-env
+    // shape as the RPC options, validated before anything binds.
+    if let Some(path) = arg_value(args, "--metrics-token-file") {
+        unsafe { std::env::set_var(metrics::METRICS_TOKEN_FILE_ENV, path) };
+    }
+    match metrics::bearer_token_from_env() {
+        Ok(Some(_)) if metrics_port.is_some() => {
+            println!("metrics: /health and /metrics require an Authorization: Bearer token");
+        }
+        Ok(_) => {}
+        Err(why) => {
+            eprintln!("run: --metrics-token-file: {why}");
+            exit(2);
+        }
+    }
 
     // `--peers host:port=<identity>` pins the mesh identity expected at that
     // address; the dialer gets the bare address and the pin travels with the

@@ -2606,15 +2606,15 @@ fn a_status_request_through_any_proxy_is_refused() {
     let not_found = envelope(Json::Num("1".into()), Err(RpcError::method_not_found("getsecuritystatus")));
     let local = test_sentinel(Config { status: true, ..Default::default() });
     with_test_sentinel(local, || {
-        let direct = handle_body_from(body, &backend, Some((loopback, &|| false, false)));
+        let direct = handle_body_from(body, &backend, Some((loopback, &|| false, false)), false);
         assert!(direct.contains("\"result\""), "a direct loopback caller is answered: {direct}");
-        let relayed = handle_body_from(body, &backend, Some((loopback, &|| false, true)));
+        let relayed = handle_body_from(body, &backend, Some((loopback, &|| false, true)), false);
         assert_eq!(relayed, not_found, "a relayed loopback caller is not");
         assert_eq!(security_status_for_relayed(), Err(RpcError::method_not_found("getsecuritystatus")));
     });
     let remote = test_sentinel(Config { status: true, allow_remote_status: true, ..Default::default() });
     with_test_sentinel(remote, || {
-        let relayed = handle_body_from(body, &backend, Some((loopback, &|| false, true)));
+        let relayed = handle_body_from(body, &backend, Some((loopback, &|| false, true)), false);
         assert!(relayed.contains("\"result\""), "the operator opted in: {relayed}");
     });
     // Sentinel off: the same answer as a node that never had it.
@@ -2643,7 +2643,7 @@ fn the_request_head_reports_forwarding_headers() {
         let hosts = HostPolicy::with_extra("127.0.0.1", None);
         let mut seen = None;
         let deadline = Instant::now() + Duration::from_secs(5);
-        let out = read_request_attributed(&mut sock, &hosts, deadline, &mut |_, relayed| {
+        let out = read_request_attributed(&mut sock, &hosts, deadline, &mut |_, relayed, _| {
             seen = Some(relayed);
             Ok(())
         });
@@ -2735,4 +2735,154 @@ fn getl2settlement_reports_the_registered_settler_set() {
     let after = l2_settler_json(&rotated);
     assert_ne!(text(&after, "set_hash"), text(&json, "set_hash"));
     assert_eq!(text(&after, "set_hash"), Some(crate::codec::hex32(&settler::set_hash(&rotated))));
+}
+
+// ─── Access policy: read-only, API key, rate limit ─────────────────────────
+
+fn keyed_post(method: &str, key_lines: &[&str]) -> String {
+    let body = request(method, "[]");
+    let keys: String = key_lines.iter().map(|k| format!("X-API-Key: {k}\r\n")).collect();
+    format!(
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         {keys}Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+const TEST_API_KEY: &str = "0123456789abcdef0123456789abcdef";
+
+fn access_with(read_only: bool, key: Option<&str>, rate: Option<u32>) -> Access {
+    Access {
+        read_only,
+        api_key: key.map(Access::key_digest),
+        rate: rate.map(RateLimit::new),
+    }
+}
+
+/// The default policy is no policy: a request with no key, and one carrying a
+/// stray key, are both served, and a write is routed as before.
+#[test]
+fn access_default_changes_nothing() {
+    let spy = Spy::new();
+    let addr = serve_with("127.0.0.1", 0, spy.clone(), TrustedProxies::default(), Access::default()).unwrap();
+    assert!(http(addr, &keyed_post("getchaininfo", &[])).starts_with("HTTP/1.1 200 OK"));
+    assert!(http(addr, &keyed_post("getchaininfo", &["whatever"])).starts_with("HTTP/1.1 200 OK"));
+    assert!(Access::default().summary().is_empty());
+    let reply = post(addr, &request("sendrawtransaction", r#"["00"]"#));
+    assert!(!reply.contains(&WRITES_DISABLED.to_string()), "{reply}");
+}
+
+/// Read-only refuses the write by name, before decoding it, with its own
+/// code; reads are untouched and nothing reaches the backend for the write.
+#[test]
+fn access_read_only_refuses_sendrawtransaction_only() {
+    let spy = Spy::new();
+    let addr = serve_with(
+        "127.0.0.1", 0, spy.clone(), TrustedProxies::default(), access_with(true, None, None),
+    ).unwrap();
+    for params in [r#"["00"]"#, r#"["not hex at all"]"#, "[]"] {
+        let reply = post(addr, &request("sendrawtransaction", params));
+        assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+        let body = reply.split_once("\r\n\r\n").expect("a body").1;
+        assert_eq!(error_code(&parse_json(body).unwrap()), Some(WRITES_DISABLED), "{reply}");
+    }
+    let reply = post(addr, &request("getchaininfo", "[]"));
+    assert!(reply.starts_with("HTTP/1.1 200 OK") && !reply.contains("\"error\""), "{reply}");
+    // The in-process dispatcher has no listener policy and is unchanged.
+    let direct = call(spy.as_ref(), &request("sendrawtransaction", r#"["00"]"#));
+    assert_ne!(error_code(&direct), Some(WRITES_DISABLED));
+}
+
+/// With a key configured: absent, wrong, prefix, extended and duplicated keys
+/// are all 401/400 and never reach the backend; the exact key is served.
+#[test]
+fn access_api_key_is_required_and_exact() {
+    let gate = Gate::new();
+    gate.release();
+    let addr = serve_with(
+        "127.0.0.1", 0, gate.clone(), TrustedProxies::default(), access_with(false, Some(TEST_API_KEY), None),
+    ).unwrap();
+    let longer = format!("{TEST_API_KEY}0");
+    for wrong in [&[][..], &[""], &["wrong"], &[&TEST_API_KEY[..31]], &[longer.as_str()], &[&TEST_API_KEY.to_uppercase()]] {
+        let reply = http(addr, &keyed_post("getchaininfo", wrong));
+        assert!(reply.starts_with("HTTP/1.1 401 Unauthorized\r\n"), "{wrong:?}: {reply}");
+    }
+    let reply = http(addr, &keyed_post("getchaininfo", &[TEST_API_KEY, TEST_API_KEY]));
+    assert!(reply.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{reply}");
+    assert_eq!(gate.last_source(), None, "a refused request reached the backend");
+
+    let reply = http(addr, &keyed_post("getchaininfo", &[TEST_API_KEY]));
+    assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+    assert!(gate.last_source().is_some());
+}
+
+#[test]
+fn access_api_key_file_contents_are_bounded() {
+    assert_eq!(Access::parse_api_key(&format!("  {TEST_API_KEY}\n")), Ok(TEST_API_KEY));
+    assert!(Access::parse_api_key("").is_err());
+    assert!(Access::parse_api_key("short-key").is_err());
+    assert!(Access::parse_api_key(&"k".repeat(API_KEY_MAX_LEN + 1)).is_err());
+    assert!(Access::parse_api_key("0123456789abcdef 0123456789abcdef").is_err());
+    assert!(Access::parse_api_key("0123456789abcdef\u{e9}0123456789abcdef").is_err());
+    for bad in ["", "0", "-1", "1.5", "10001", "ten"] {
+        assert!(Access::parse_rate(bad).is_err(), "{bad}");
+    }
+    assert_eq!(Access::parse_rate("1"), Ok(1));
+    assert_eq!(Access::parse_rate("10000"), Ok(10_000));
+}
+
+/// The bucket: a burst of 2n, then n per second, per source; an IPv6 /64 is
+/// one source; a full table refuses a new source instead of waving it through.
+#[test]
+fn access_rate_limit_bucket_arithmetic() {
+    let limit = RateLimit::new(5);
+    let start = Instant::now();
+    let a: IpAddr = "192.0.2.1".parse().unwrap();
+    let b: IpAddr = "192.0.2.2".parse().unwrap();
+    for i in 0..10 {
+        assert!(limit.take(a, start), "burst request {i}");
+    }
+    assert!(!limit.take(a, start), "the 11th request in the same instant");
+    assert!(limit.take(b, start), "another source has its own bucket");
+    // 200 ms at 5/s is exactly one request.
+    let later = start + Duration::from_millis(200);
+    assert!(limit.take(a, later));
+    assert!(!limit.take(a, later));
+    // A long idle period refills to the burst and no further.
+    let much_later = start + Duration::from_secs(3_600);
+    for _ in 0..10 {
+        assert!(limit.take(a, much_later));
+    }
+    assert!(!limit.take(a, much_later));
+
+    let v6a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+    let v6b: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+    let one = RateLimit::new(1);
+    assert!(one.take(v6a, start) && one.take(v6b, start));
+    assert!(!one.take(v6a, start), "the same /64 shares one bucket");
+
+    let full = RateLimit::new(1);
+    for i in 0..RATE_TABLE_MAX {
+        let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000u32 + i as u32));
+        assert!(full.take(ip, start));
+    }
+    let newcomer: IpAddr = "198.51.100.77".parse().unwrap();
+    assert!(!full.take(newcomer, start), "a full table of active sources admits no new one");
+    assert!(full.take(newcomer, start + Duration::from_secs(10)), "refilled sources are forgotten");
+}
+
+/// End to end: past the burst the listener answers 429, and a wrong key is
+/// metered too (the rate is charged before the key is judged).
+#[test]
+fn access_rate_limit_answers_429() {
+    let spy = Spy::new();
+    let addr = serve_with(
+        "127.0.0.1", 0, spy.clone(), TrustedProxies::default(), access_with(false, Some(TEST_API_KEY), Some(1)),
+    ).unwrap();
+    let first = http(addr, &keyed_post("getchaininfo", &["wrong"]));
+    assert!(first.starts_with("HTTP/1.1 401 Unauthorized\r\n"), "{first}");
+    let second = http(addr, &keyed_post("getchaininfo", &[TEST_API_KEY]));
+    assert!(second.starts_with("HTTP/1.1 200 OK"), "{second}");
+    let third = http(addr, &keyed_post("getchaininfo", &[TEST_API_KEY]));
+    assert!(third.starts_with("HTTP/1.1 429 Too Many Requests\r\n"), "{third}");
 }

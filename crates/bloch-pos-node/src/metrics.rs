@@ -311,6 +311,20 @@ pub struct NodeMetrics {
     /// Connections a `require` node refused because the peer did not speak
     /// the handshake, in either direction.
     pub mesh_plain_refused_total: AtomicU64,
+    /// Signatures this node produced that failed verify-before-release and
+    /// were withheld (one per failed attempt). Any non-zero value is a
+    /// hardware fault or a mismatched keystore; three in a row abort the
+    /// process, which then shows as a restart.
+    pub signer_verify_failures_total: AtomicU64,
+    /// Proposal slots lost because the proposer signature could not be
+    /// produced after the slashing-protection watermark was spent.
+    pub proposal_signature_failures_total: AtomicU64,
+    /// Own blocks the real transition refused after they were built and
+    /// signed: the slot is lost, the block is never broadcast.
+    pub own_blocks_refused_total: AtomicU64,
+    /// Proposals whose build ran past its time budget and was cut short
+    /// (the block went out with what had been validated by then).
+    pub proposal_build_deadline_total: AtomicU64,
 }
 
 impl NodeMetrics {
@@ -364,6 +378,10 @@ impl NodeMetrics {
             mesh_plain_sessions_inbound: AtomicU64::new(0),
             mesh_plain_sessions_inbound_total: AtomicU64::new(0),
             mesh_plain_refused_total: AtomicU64::new(0),
+            signer_verify_failures_total: AtomicU64::new(0),
+            proposal_signature_failures_total: AtomicU64::new(0),
+            own_blocks_refused_total: AtomicU64::new(0),
+            proposal_build_deadline_total: AtomicU64::new(0),
         }
     }
 
@@ -677,6 +695,30 @@ impl NodeMetrics {
             "Connections refused under --mesh-security require because the peer did not speak the handshake",
             self.get(&self.mesh_plain_refused_total),
         );
+        series(
+            "bloch_pos_signer_verify_failures_total",
+            "counter",
+            "Signatures withheld because they failed verify-before-release; alert on any increase",
+            self.get(&self.signer_verify_failures_total),
+        );
+        series(
+            "bloch_pos_proposal_signature_failures_total",
+            "counter",
+            "Proposal slots lost because the proposer signature could not be produced",
+            self.get(&self.proposal_signature_failures_total),
+        );
+        series(
+            "bloch_pos_own_blocks_refused_total",
+            "counter",
+            "Own blocks refused by the real transition after signing (slot lost, never broadcast)",
+            self.get(&self.own_blocks_refused_total),
+        );
+        series(
+            "bloch_pos_proposal_build_deadline_total",
+            "counter",
+            "Proposals whose build exceeded its time budget and was cut short",
+            self.get(&self.proposal_build_deadline_total),
+        );
         out
     }
 
@@ -827,11 +869,61 @@ pub fn fs_free_bytes(path: &std::path::Path) -> u64 {
 /// page cannot use it: its `Host` is a name, not this machine's address. A
 /// scraper that addresses the node by DNS name must be put on the allowlist.
 pub fn serve(bind_addr: &str, port: u16, metrics: &'static NodeMetrics) -> std::io::Result<SocketAddr> {
+    let token = bearer_token_from_env()
+        .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why))?;
+    serve_with_token(bind_addr, port, metrics, token)
+}
+
+/// Path of a file holding the bearer token both endpoints then require
+/// (`--metrics-token-file`): `Authorization: Bearer <token>`, which is what a
+/// Prometheus `bearer_token_file` / `authorization.credentials_file` sends.
+/// Unset means no token, which is the default. Like the RPC API key this is
+/// authentication, not encryption: the listener is plain HTTP.
+pub(crate) const METRICS_TOKEN_FILE_ENV: &str = "BLOCH_METRICS_TOKEN_FILE";
+
+/// SHA3-256 of the configured token, if one is configured.
+pub(crate) fn bearer_token_from_env() -> Result<Option<[u8; 32]>, String> {
+    match std::env::var(METRICS_TOKEN_FILE_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{METRICS_TOKEN_FILE_ENV} is not valid UTF-8")),
+        Ok(path) => {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read the metrics token file `{path}`: {e}"))?;
+            let token = crate::rpc::Access::parse_api_key(&text)
+                .map_err(|why| why.replace("RPC API key", "metrics token"))?;
+            Ok(Some(crate::rpc::Access::key_digest(token)))
+        }
+    }
+}
+
+/// The request's bearer credential: exactly one `Authorization` field whose
+/// scheme is `Bearer`. Anything else (absent, repeated, another scheme) is
+/// no credential.
+fn bearer_credential(head: &str) -> Option<&str> {
+    let mut found = None;
+    for line in head.split("\r\n").skip(1) {
+        let Some((name, value)) = line.split_once(':') else { continue };
+        if name.eq_ignore_ascii_case("authorization") && found.replace(value.trim_matches([' ', '\t'])).is_some() {
+            return None;
+        }
+    }
+    let (scheme, credential) = found?.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then(|| credential.trim_matches(' '))
+}
+
+/// [`serve`] with the token given rather than read from the environment.
+fn serve_with_token(
+    bind_addr: &str,
+    port: u16,
+    metrics: &'static NodeMetrics,
+    token: Option<[u8; 32]>,
+) -> std::io::Result<SocketAddr> {
     let listener = TcpListener::bind((bind_addr, port))?;
     let local = listener.local_addr()?;
     let hosts = Arc::new(MetricsHosts {
         policy: crate::rpc::HostPolicy::new(bind_addr),
         wildcard_bind: bind_addr == "0.0.0.0" || bind_addr == "::",
+        token,
     });
     let live = Arc::new(AtomicUsize::new(0));
     let ip_limits = Arc::new(crate::connection_limit::Limits::default());
@@ -862,6 +954,8 @@ pub fn serve(bind_addr: &str, port: u16, metrics: &'static NodeMetrics) -> std::
 struct MetricsHosts {
     policy: crate::rpc::HostPolicy,
     wildcard_bind: bool,
+    /// SHA3-256 of the bearer token every request must carry, if configured.
+    token: Option<[u8; 32]>,
 }
 
 impl MetricsHosts {
@@ -944,6 +1038,13 @@ fn serve_connection(sock: &mut TcpStream, metrics: &NodeMetrics, hosts: &Metrics
         );
         return;
     }
+    if let Some(expected) = &hosts.token {
+        let presented = bearer_credential(&head);
+        if !presented.is_some_and(|credential| crate::rpc::Access::digest_matches(expected, credential)) {
+            let _ = respond(sock, 401, "text/plain", "a valid Authorization: Bearer token is required");
+            return;
+        }
+    }
     // Route on the path WITHOUT any query string.
     let path = path.split('?').next().unwrap_or("");
     match path {
@@ -968,6 +1069,7 @@ fn serve_connection(sock: &mut TcpStream, metrics: &NodeMetrics, hosts: &Metrics
 fn respond(sock: &mut TcpStream, status: u16, ctype: &str, body: &str) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -988,6 +1090,46 @@ fn respond(sock: &mut TcpStream, status: u16, ctype: &str, body: &str) -> std::i
 
 #[cfg(test)]
 mod tests {
+    /// P5: with a token configured, both endpoints answer 401 unless the
+    /// request carries exactly that bearer credential; without one, nothing
+    /// changes.
+    #[test]
+    fn bearer_token_guards_both_endpoints() {
+        use std::io::{Read as _, Write as _};
+        static TOKEN_TEST_METRICS: super::NodeMetrics = super::NodeMetrics::new();
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+        let digest = crate::rpc::Access::key_digest(TOKEN);
+        let guarded = super::serve_with_token("127.0.0.1", 0, &TOKEN_TEST_METRICS, Some(digest)).expect("bind");
+        let open = super::serve_with_token("127.0.0.1", 0, &TOKEN_TEST_METRICS, None).expect("bind");
+        let status = |addr: std::net::SocketAddr, path: &str, headers: &str| -> u16 {
+            let mut sock = std::net::TcpStream::connect(addr).expect("connect");
+            write!(sock, "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{headers}\r\n").unwrap();
+            let mut resp = String::new();
+            sock.read_to_string(&mut resp).expect("read");
+            resp.split(' ').nth(1).and_then(|s| s.parse().ok()).expect("status line")
+        };
+        let good = format!("Authorization: Bearer {TOKEN}\r\n");
+        for path in ["/metrics", "/health"] {
+            for bad in [
+                String::new(),
+                "Authorization: Bearer wrong\r\n".to_string(),
+                format!("Authorization: Bearer {}\r\n", &TOKEN[..31]),
+                format!("Authorization: Bearer {TOKEN}0\r\n"),
+                format!("Authorization: Basic {TOKEN}\r\n"),
+                format!("Authorization: {TOKEN}\r\n"),
+                format!("{good}{good}"),
+            ] {
+                assert_eq!(status(guarded, path, &bad), 401, "{path} with {bad:?}");
+            }
+            assert_ne!(status(guarded, path, &good), 401, "{path}");
+            assert_ne!(status(guarded, path, "authorization: bearer 0123456789abcdef0123456789abcdef\r\n"), 401);
+            assert_ne!(status(open, path, ""), 401, "{path} without a configured token");
+        }
+        assert_eq!(status(guarded, "/metrics", &good), 200);
+        assert_eq!(super::bearer_credential("GET / HTTP/1.1\r\nAuthorization: Bearer  abc \r\n"), Some("abc"));
+        assert_eq!(super::bearer_credential("GET / HTTP/1.1\r\nHost: x\r\n"), None);
+    }
+
     use super::*;
 
     #[test]
@@ -1084,6 +1226,10 @@ mod tests {
             "bloch_pos_mesh_plain_sessions_inbound",
             "bloch_pos_mesh_plain_sessions_inbound_total",
             "bloch_pos_mesh_plain_refused_total",
+            "bloch_pos_signer_verify_failures_total",
+            "bloch_pos_proposal_signature_failures_total",
+            "bloch_pos_own_blocks_refused_total",
+            "bloch_pos_proposal_build_deadline_total",
             "bloch_pos_rejection_logs_suppressed_total",
         ] {
             assert!(text.contains(name), "missing series {name}");
@@ -1354,6 +1500,7 @@ mod tests {
         let hosts = |bind: &str, extra: Option<&str>| MetricsHosts {
             policy: crate::rpc::HostPolicy::with_extra(bind, extra),
             wildcard_bind: bind == "0.0.0.0" || bind == "::",
+            token: None,
         };
         let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
 

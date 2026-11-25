@@ -354,6 +354,9 @@ pub const TX_REFUSED_RETRYABLE: i64 = -32009;
 /// leaves (included, expires, or is itself evicted), not on any fixed
 /// schedule this response could name.
 pub const TX_REFUSED_SOURCE_CAP: i64 = -32010;
+/// `sendrawtransaction` on a node started with `--rpc-read-only`: this
+/// listener serves reads only, and no retry will change that.
+pub const WRITES_DISABLED: i64 = -32011;
 
 /// A JSON-RPC error object: a code a client can branch on and a message a human
 /// can act on. Both halves are required — a bare code makes an operator read
@@ -1741,7 +1744,7 @@ fn envelope(id: Json, outcome: RpcResult) -> String {
 /// "malformed input crashes the node" and "anyone can stop the validator" are
 /// the same sentence.
 pub fn handle_body(body: &str, backend: &dyn RpcBackend) -> String {
-    handle_body_from(body, backend, None)
+    handle_body_from(body, backend, None, false)
 }
 
 /// [`handle_body`] for one HTTP connection: the address it is attributed
@@ -1750,6 +1753,7 @@ fn handle_body_from(
     body: &str,
     backend: &dyn RpcBackend,
     source: Option<(IpAddr, &dyn Fn() -> bool, bool)>,
+    read_only: bool,
 ) -> String {
     let request = match parse_json(body) {
         Ok(v) => v,
@@ -1789,6 +1793,18 @@ fn handle_body_from(
         return envelope(id, Err(RpcError::invalid_request("`method` must be a string")));
     };
 
+    // Refused by name, before the transaction is decoded: a read-only
+    // listener does no work for a write.
+    if read_only && method == "sendrawtransaction" {
+        return envelope(
+            id,
+            Err(RpcError::new(
+                WRITES_DISABLED,
+                "this RPC endpoint is read-only (--rpc-read-only); sendrawtransaction is refused",
+            )),
+        );
+    }
+
     let params = request.get("params").filter(|p| !matches!(p, Json::Null));
     let outcome = route(method, params).and_then(|req| match source {
         Some((_, _, true)) if matches!(req, RpcRequest::SecurityStatus) => security_status_for_relayed(),
@@ -1818,7 +1834,9 @@ pub fn serve(
     // (limits the operator believes are per-client would not be) or anybody.
     let proxies = TrustedProxies::from_env()
         .map_err(|why| io::Error::new(io::ErrorKind::InvalidInput, why))?;
-    serve_behind(bind_addr, port, backend, proxies)
+    let access = Access::from_env()
+        .map_err(|why| io::Error::new(io::ErrorKind::InvalidInput, why))?;
+    serve_with(bind_addr, port, backend, proxies, access)
 }
 
 /// [`serve`] with the trusted-proxy list given rather than read from the
@@ -1829,6 +1847,18 @@ fn serve_behind(
     backend: Arc<dyn RpcBackend>,
     proxies: TrustedProxies,
 ) -> io::Result<SocketAddr> {
+    serve_with(bind_addr, port, backend, proxies, Access::default())
+}
+
+/// [`serve_behind`] with the access policy given as well.
+fn serve_with(
+    bind_addr: &str,
+    port: u16,
+    backend: Arc<dyn RpcBackend>,
+    proxies: TrustedProxies,
+    access: Access,
+) -> io::Result<SocketAddr> {
+    let access = Arc::new(access);
     let listener = TcpListener::bind((bind_addr, port))?;
     let local = listener.local_addr()?;
     let live = Arc::new(AtomicUsize::new(0));
@@ -1867,6 +1897,7 @@ fn serve_behind(
             let hosts = hosts.clone();
             let proxies = proxies.clone();
             let ip_limits = ip_limits.clone();
+            let access = access.clone();
             thread::spawn(move || {
                 let mut permit = permit;
                 let mut sock = sock;
@@ -1874,6 +1905,7 @@ fn serve_behind(
                     &mut sock,
                     backend.as_ref(),
                     &hosts,
+                    &access,
                     peer,
                     peer_is_proxy,
                     &mut |forwarded: &[String]| {
@@ -1969,6 +2001,7 @@ fn serve_connection(
     sock: &mut TcpStream,
     backend: &dyn RpcBackend,
     hosts: &HostPolicy,
+    access: &Access,
     peer: IpAddr,
     peer_is_proxy: bool,
     attribute: &mut dyn FnMut(&[String]) -> Result<IpAddr, HttpError>,
@@ -1981,10 +2014,12 @@ fn serve_connection(
     // Through a proxy (review RC-05): a declared one, or any forwarding
     // header at all.
     let mut relayed = peer_is_proxy;
-    let request = read_request(sock, hosts, &mut |forwarded, relay_header| {
+    let request = read_request(sock, hosts, &mut |forwarded, relay_header, api_key| {
         relayed |= relay_header;
         source = attribute(forwarded)?;
-        Ok(())
+        // After attribution, so the rate is charged to the client a trusted
+        // proxy names and not to the proxy.
+        access.admit(source, api_key)
     });
     match request {
         Ok(body) => {
@@ -1994,7 +2029,7 @@ fn serve_connection(
                 Ok(text) => {
                     let probe: &TcpStream = sock;
                     let gone: &dyn Fn() -> bool = &|| client_gone(probe);
-                    handle_body_from(text, backend, Some((source, gone, relayed)))
+                    handle_body_from(text, backend, Some((source, gone, relayed)), access.read_only)
                 }
                 Err(_) => envelope(Json::Null, Err(RpcError::parse_error("body is not UTF-8"))),
             };
@@ -2157,6 +2192,229 @@ fn valid_host_port_suffix(suffix: &str) -> bool {
         && port.parse::<u16>().is_ok()
 }
 
+// ─── Access policy: read-only mode, API key, request rate ──────────────────
+//
+// All three are OPT-IN and off by default, so a node started with the flags
+// it had yesterday serves exactly what it served yesterday. None of them is
+// transport security: the listener is still plain HTTP, so an API key
+// crossing a network that is not loopback or an already-encrypted hop is
+// readable on the path. They exist so that a port which IS reachable by more
+// than its operator is not, by construction, an open write door.
+
+/// `1` makes this listener refuse `sendrawtransaction` (`--rpc-read-only`).
+pub(crate) const RPC_READ_ONLY_ENV: &str = "BLOCH_RPC_READ_ONLY";
+/// Path of a file holding the API key every request must present in
+/// `X-API-Key` (`--rpc-api-key-file`). A file, not the key itself, so the
+/// secret is never in argv or in the process environment.
+pub(crate) const RPC_API_KEY_FILE_ENV: &str = "BLOCH_RPC_API_KEY_FILE";
+/// Requests per second allowed per source address (`--rpc-rate-limit`).
+pub(crate) const RPC_RATE_LIMIT_ENV: &str = "BLOCH_RPC_RATE_LIMIT";
+
+const API_KEY_HEADER: &str = "x-api-key";
+/// Bounds on the configured key: long enough not to be guessable, short
+/// enough to fit a header line with room to spare.
+const API_KEY_MIN_LEN: usize = 24;
+const API_KEY_MAX_LEN: usize = 256;
+/// The highest per-source rate that can be configured.
+const RATE_LIMIT_MAX_PER_SECOND: u32 = 10_000;
+/// Sources tracked by the rate limiter at once. When the table is full of
+/// sources that are still inside their window, a NEW source is refused
+/// rather than admitted unmetered.
+const RATE_TABLE_MAX: usize = 4_096;
+
+/// What this listener demands of a request beyond being well-formed.
+#[derive(Default)]
+pub(crate) struct Access {
+    read_only: bool,
+    /// SHA3-256 of the configured key; the key itself is not retained.
+    api_key: Option<[u8; 32]>,
+    rate: Option<RateLimit>,
+}
+
+impl Access {
+    /// Read the three settings from the environment. Anything present but
+    /// malformed is an error: a node whose operator asked for a restriction
+    /// must not start without it.
+    pub(crate) fn from_env() -> Result<Self, String> {
+        let var = |name: &str| match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid UTF-8")),
+        };
+        let read_only = match var(RPC_READ_ONLY_ENV)?.as_deref() {
+            None | Some("") | Some("0") => false,
+            Some("1") => true,
+            Some(other) => return Err(format!("{RPC_READ_ONLY_ENV} must be `1` or `0`, not `{other}`")),
+        };
+        let api_key = match var(RPC_API_KEY_FILE_ENV)? {
+            None => None,
+            Some(path) => {
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("cannot read the RPC API key file `{path}`: {e}"))?;
+                Some(Self::key_digest(Self::parse_api_key(&text)?))
+            }
+        };
+        let rate = match var(RPC_RATE_LIMIT_ENV)? {
+            None => None,
+            Some(value) => Some(RateLimit::new(Self::parse_rate(&value)?)),
+        };
+        Ok(Access { read_only, api_key, rate })
+    }
+
+    /// The key as the file holds it: one token, surrounding whitespace (the
+    /// trailing newline an editor adds) removed.
+    pub(crate) fn parse_api_key(text: &str) -> Result<&str, String> {
+        let key = text.trim();
+        if key.len() < API_KEY_MIN_LEN || key.len() > API_KEY_MAX_LEN {
+            return Err(format!(
+                "the RPC API key must be {API_KEY_MIN_LEN} to {API_KEY_MAX_LEN} characters \
+                 (got {})",
+                key.len()
+            ));
+        }
+        if !key.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err("the RPC API key must be printable ASCII with no spaces".into());
+        }
+        Ok(key)
+    }
+
+    pub(crate) fn parse_rate(value: &str) -> Result<u32, String> {
+        match value.parse::<u32>() {
+            Ok(n) if (1..=RATE_LIMIT_MAX_PER_SECOND).contains(&n) => Ok(n),
+            _ => Err(format!(
+                "the RPC rate limit must be a whole number of requests per second, \
+                 1 to {RATE_LIMIT_MAX_PER_SECOND} (got `{value}`)"
+            )),
+        }
+    }
+
+    pub(crate) fn key_digest(key: &str) -> [u8; 32] {
+        use sha3::{Digest, Sha3_256};
+        Sha3_256::digest(key.as_bytes()).into()
+    }
+
+    /// Whether `presented` hashes to `expected`, compared without an early
+    /// exit. Shared with the metrics listener's bearer token.
+    pub(crate) fn digest_matches(expected: &[u8; 32], presented: &str) -> bool {
+        let got = Self::key_digest(presented);
+        let mut difference = 0u8;
+        for (a, b) in expected.iter().zip(got.iter()) {
+            difference |= a ^ b;
+        }
+        std::hint::black_box(difference) == 0
+    }
+
+    /// Whether `presented` is the configured key. Both sides are hashed and
+    /// the digests compared without an early exit, so neither the length nor
+    /// a matching prefix of the key shows in the time this takes.
+    fn key_matches(&self, presented: Option<&str>) -> bool {
+        let Some(expected) = &self.api_key else { return true };
+        let Some(presented) = presented else { return false };
+        Self::digest_matches(expected, presented)
+    }
+
+    /// Judge one request head from `source`. The rate is charged first, so
+    /// wrong-key attempts are metered like any other request.
+    fn admit(&self, source: IpAddr, presented_key: Option<&str>) -> Result<(), HttpError> {
+        if let Some(rate) = &self.rate {
+            if !rate.take(source, Instant::now()) {
+                return Err(http_err(429, "request rate limit exceeded for this source address"));
+            }
+        }
+        if !self.key_matches(presented_key) {
+            return Err(http_err(401, "a valid X-API-Key header is required"));
+        }
+        Ok(())
+    }
+
+    /// One line per active restriction, for the startup log.
+    pub(crate) fn summary(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.read_only {
+            lines.push("RPC is read-only: sendrawtransaction is refused".to_string());
+        }
+        if self.api_key.is_some() {
+            lines.push("RPC requires an X-API-Key header on every request".to_string());
+        }
+        if let Some(rate) = &self.rate {
+            lines.push(format!(
+                "RPC rate limit: {} requests/s per source address (burst {})",
+                rate.per_second,
+                rate.burst()
+            ));
+        }
+        lines
+    }
+
+    pub(crate) fn is_authenticated(&self) -> bool {
+        self.api_key.is_some()
+    }
+
+    pub(crate) fn is_rate_limited(&self) -> bool {
+        self.rate.is_some()
+    }
+}
+
+/// A token bucket per source address ([`crate::connection_limit::limit_key`]:
+/// an IPv4 address or an IPv6 /64). Counted in thousandths of a request so
+/// the refill needs no floating point.
+struct RateLimit {
+    per_second: u32,
+    table: Mutex<std::collections::HashMap<IpAddr, (u64, Instant)>>,
+}
+
+impl RateLimit {
+    fn new(per_second: u32) -> Self {
+        RateLimit { per_second, table: Mutex::new(std::collections::HashMap::new()) }
+    }
+
+    /// Two seconds' worth: a client may be briefly bursty, not sustainedly so.
+    fn burst(&self) -> u64 {
+        u64::from(self.per_second).saturating_mul(2)
+    }
+
+    fn capacity_milli(&self) -> u64 {
+        self.burst().saturating_mul(1_000)
+    }
+
+    fn refilled(&self, tokens: u64, since: Instant, now: Instant) -> u64 {
+        let elapsed_ms = u64::try_from(now.saturating_duration_since(since).as_millis()).unwrap_or(u64::MAX);
+        tokens
+            .saturating_add(elapsed_ms.saturating_mul(u64::from(self.per_second)))
+            .min(self.capacity_milli())
+    }
+
+    /// Spend one request from `source`'s bucket; `false` when it is empty.
+    fn take(&self, source: IpAddr, now: Instant) -> bool {
+        let key = crate::connection_limit::limit_key(source);
+        let mut table = match self.table.lock() {
+            Ok(table) => table,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !table.contains_key(&key) && table.len() >= RATE_TABLE_MAX {
+            // Forget every source whose bucket has refilled: it is
+            // indistinguishable from one never seen.
+            let capacity = self.capacity_milli();
+            table.retain(|_, (tokens, since)| self.refilled(*tokens, *since, now) < capacity);
+            if table.len() >= RATE_TABLE_MAX {
+                return false;
+            }
+        }
+        let (tokens, since) = table.get(&key).copied().unwrap_or((self.capacity_milli(), now));
+        let available = self.refilled(tokens, since, now);
+        match available.checked_sub(1_000) {
+            Some(left) => {
+                table.insert(key, (left, now));
+                true
+            }
+            None => {
+                table.insert(key, (available, now));
+                false
+            }
+        }
+    }
+}
+
 // ─── Trusted proxies: whose word is taken for the client address ───────────
 
 /// Addresses of reverse proxies whose `X-Forwarded-For` is believed —
@@ -2295,7 +2553,7 @@ fn content_type_allowed(ct: Option<&str>) -> bool {
 fn read_request(
     sock: &mut TcpStream,
     hosts: &HostPolicy,
-    on_head: &mut dyn FnMut(&[String], bool) -> Result<(), HttpError>,
+    on_head: &mut dyn FnMut(&[String], bool, Option<&str>) -> Result<(), HttpError>,
 ) -> Result<Vec<u8>, HttpError> {
     let deadline = Instant::now().checked_add(IO_TIMEOUT)
         .ok_or_else(|| http_err(408, "request deadline out of range"))?;
@@ -2310,14 +2568,14 @@ fn read_request_until(
     hosts: &HostPolicy,
     deadline: Instant,
 ) -> Result<Vec<u8>, HttpError> {
-    read_request_attributed(sock, hosts, deadline, &mut |_, _| Ok(()))
+    read_request_attributed(sock, hosts, deadline, &mut |_, _, _| Ok(()))
 }
 
 fn read_request_attributed(
     sock: &mut TcpStream,
     hosts: &HostPolicy,
     deadline: Instant,
-    on_head: &mut dyn FnMut(&[String], bool) -> Result<(), HttpError>,
+    on_head: &mut dyn FnMut(&[String], bool, Option<&str>) -> Result<(), HttpError>,
 ) -> Result<Vec<u8>, HttpError> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
@@ -2365,6 +2623,7 @@ fn read_request_attributed(
     let mut origin: Option<String> = None;
     let mut host: Option<String> = None;
     let mut forwarded: Vec<String> = Vec::new();
+    let mut api_key: Option<String> = None;
     let mut relay_header = false;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
@@ -2402,13 +2661,17 @@ fn read_request_attributed(
             if host.replace(value.to_string()).is_some() {
                 return Err(http_err(400, "duplicate Host"));
             }
+        } else if name.eq_ignore_ascii_case(API_KEY_HEADER) {
+            if api_key.replace(value.to_string()).is_some() {
+                return Err(http_err(400, "duplicate X-API-Key"));
+            }
         } else if name.eq_ignore_ascii_case(FORWARDED_HEADER) {
             // Collected, not believed: whether any of it counts is decided by
             // who the TCP peer is (see `TrustedProxies`).
             forwarded.push(value.to_string());
         }
     }
-    on_head(&forwarded, relay_header)?;
+    on_head(&forwarded, relay_header, api_key.as_deref())?;
 
     // R1 A3-M4: the browser-request gate, before Content-Length is even
     // consulted — three header comparisons are cheaper than anything past
@@ -2486,12 +2749,14 @@ fn respond(sock: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
         411 => "Length Required",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
+        429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         503 => "Service Unavailable",
         _ => "Error",

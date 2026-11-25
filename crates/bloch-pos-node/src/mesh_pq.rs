@@ -571,6 +571,38 @@ impl MeshSecurity {
         out
     }
 
+    /// What an operator must be told when the mesh listens on `listen_addr`
+    /// in a mode that does not authenticate (review B1/P2). `plain` and
+    /// `offer` are legitimate on loopback and during a migration; on a
+    /// routable bind they are an open door, and until now the node said
+    /// nothing about it. A warning, never a refusal: the fleet's unit files
+    /// were written against these defaults.
+    pub fn exposure_warning(&self, listen_addr: &str) -> Option<String> {
+        let loopback = listen_addr.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+        if loopback {
+            return None;
+        }
+        match (&self.identity, self.mode) {
+            (_, Mode::Require) => None,
+            (Some(_), Mode::Offer) => Some(format!(
+                "THE MESH ON {listen_addr} IS NOT LOOPBACK AND `--mesh-security offer` GUARANTEES \
+                 NOTHING AGAINST AN ACTIVE ATTACKER: a peer that does not offer the handshake is \
+                 served in plain, so anyone on the path can force plain and read or inject \
+                 frames. Blocks and votes stay signature-checked; delivery, privacy and peer \
+                 identity do not. Move to `--mesh-security require` with pinned peers or \
+                 --mesh-allow (docs/operations/MESH-SECURITY-REQUIRE-MIGRATION.md)."
+            )),
+            _ => Some(format!(
+                "THE MESH ON {listen_addr} IS NOT LOOPBACK AND IS PLAIN: no authentication and \
+                 no encryption. Anything that can reach the port is a peer: it can read every \
+                 block, vote and transaction, inject frames up to the per-source budgets, and \
+                 hold inbound slots. Firewall the port to the fleet, or move to \
+                 `--mesh-security offer` and then `require` \
+                 (docs/operations/MESH-SECURITY-REQUIRE-MIGRATION.md)."
+            )),
+        }
+    }
+
     pub fn mode(&self) -> Mode {
         self.mode
     }
@@ -1187,6 +1219,32 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::sync::Arc;
+
+    /// B1/P2: `plain` and `offer` on a routable bind are said out loud;
+    /// loopback and `require` are not, and `warnings()` is unchanged.
+    #[test]
+    fn exposure_warning_names_plain_and_offer_on_a_routable_bind() {
+        let plain = MeshSecurity::plain();
+        for loopback in ["127.0.0.1", "127.8.8.8", "::1"] {
+            assert_eq!(plain.exposure_warning(loopback), None, "{loopback}");
+        }
+        for routable in ["0.0.0.0", "::", "10.8.0.4", "203.0.113.7", "not-an-ip"] {
+            let warning = plain.exposure_warning(routable).expect(routable);
+            assert!(warning.contains("PLAIN") && warning.contains(routable), "{warning}");
+        }
+        assert!(plain.warnings().is_empty());
+
+        let dir = std::env::temp_dir().join(format!("mesh-exposure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let offer = MeshSecurity::load(Mode::Offer, [7u8; 32], &dir, None, &[], &[], false).unwrap();
+        assert_eq!(offer.exposure_warning("127.0.0.1"), None);
+        let warning = offer.exposure_warning("0.0.0.0").expect("offer on a routable bind");
+        assert!(warning.contains("offer") && warning.contains("force plain"), "{warning}");
+        let require = MeshSecurity::load(Mode::Require, [7u8; 32], &dir, None, &[], &[], false).unwrap();
+        assert_eq!(require.exposure_warning("0.0.0.0"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     const NET: [u8; 32] = [7; 32];
 

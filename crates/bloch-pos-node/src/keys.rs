@@ -1022,7 +1022,10 @@ pub(crate) fn sign_verified_released(
                 pad_signing_latency(started, signing_latency_floor());
                 return Ok(signature);
             }
-            Err(e) => eprintln!("SIGNER FAULT (validator {validator}): {e}"),
+            Err(e) => {
+                crate::metrics::NodeMetrics::inc(&crate::metrics::NODE.signer_verify_failures_total);
+                eprintln!("SIGNER FAULT (validator {validator}): {e}");
+            }
         }
     }
     Err(SignerFault)
@@ -1079,6 +1082,25 @@ fn parse_latency_floor(raw: Option<&str>) -> std::time::Duration {
 fn signing_latency_floor() -> std::time::Duration {
     static FLOOR: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *FLOOR.get_or_init(|| parse_latency_floor(std::env::var(SIGN_LATENCY_FLOOR_ENV).ok().as_deref()))
+}
+
+/// One boot line stating the signing latency floor in force (review B7). The
+/// floor stays opt-in, because in-process multi-validator harnesses would
+/// serialize the sleeps, but a validator running without it is told so once
+/// instead of having to know the variable exists.
+pub(crate) fn signing_latency_floor_notice() -> String {
+    latency_floor_notice(signing_latency_floor())
+}
+
+fn latency_floor_notice(floor: std::time::Duration) -> String {
+    if floor.is_zero() {
+        format!(
+            "signing latency floor: OFF. Signing time is observable on the network for \
+             publicly scheduled duties; set {SIGN_LATENCY_FLOOR_ENV}=100 on mainnet validators"
+        )
+    } else {
+        format!("signing latency floor: {} ms", floor.as_millis())
+    }
 }
 
 fn pad_signing_latency(started: std::time::Instant, floor: std::time::Duration) {
@@ -2715,6 +2737,9 @@ mod signer_hardening_tests {
     #[test]
     fn latency_floor_is_off_by_default_parsed_and_capped() {
         use std::time::Duration;
+        assert!(latency_floor_notice(Duration::ZERO).contains("OFF")
+            && latency_floor_notice(Duration::ZERO).contains(SIGN_LATENCY_FLOOR_ENV));
+        assert_eq!(latency_floor_notice(Duration::from_millis(100)), "signing latency floor: 100 ms");
         assert_eq!(parse_latency_floor(None), Duration::ZERO);
         assert_eq!(parse_latency_floor(Some("")), Duration::ZERO);
         assert_eq!(parse_latency_floor(Some("abc")), Duration::ZERO);
