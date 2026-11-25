@@ -3556,18 +3556,18 @@ impl Engine {
         // that disagrees with the consensus authority is the defect the
         // anchor was introduced to remove, one boundary along.
         //
-        // # The third definition, which this does NOT fix
+        // # The third definition is gone
         //
-        // `derive::sortition_seed` — the producer's inclusion filter and
-        // proposer draw — reads `epoch − 1` unconditionally, with no gate.
-        // Below the flag day that is the same boundary all three now use, so
-        // the fleet is consistent today. **The moment
-        // `ANCESTRY_SEED_ACTIVATION_EPOCH` is armed, `sortition_seed` becomes
-        // the odd one out** and the producer will filter against a committee
-        // the transition does not recognise. It is not gated here because its
-        // history lives in `ParentState::chain.randao_mixes`, whose retention
-        // is a separate question from `boundary_mixes`'. Arming this flag day
-        // is not safe until that is closed.
+        // There used to be a third seed, `derive::sortition_seed` (the old
+        // producer's inclusion filter and proposer draw), which read
+        // `epoch − 1` with no gate and would have become the odd one out the
+        // moment `ANCESTRY_SEED_ACTIVATION_EPOCH` was armed. It was deleted
+        // with the rest of the second derivation on 2026-09-06 (R1 H3, see
+        // `derive.rs`): the producer now draws through the transition's own
+        // `CommittedState::seed_for_epoch`. The two definitions left, that one
+        // and this one, are gated on the same constant, so that defect no
+        // longer stands between the gate and its arming. Arming is still a
+        // flag day with its own replay qualification (see the constant).
         let lookahead = if !bloch_pos_committee::params::epoch_gate_active(
             epoch,
             bloch_pos_committee::params::ANCESTRY_SEED_ACTIVATION_EPOCH,
