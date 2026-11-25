@@ -2247,8 +2247,8 @@ pub const SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// Arming it is a coordinated upgrade, not a wallet flag day: every shipped
 /// signer already produces FIPS 204 reference signatures, so no signer
 /// changes anything. [`SIG_CANONICAL_ACTIVATION_EPOCH`] implies it (its
-/// policies always use the pinned verifier). Ships INERT at `u64::MAX`;
-/// `mldsa_pin_gate_is_inert` pins the value.
+/// policies always use the pinned verifier). ARMED at 7270 (it shipped inert
+/// at `u64::MAX`); the test `mldsa_pin_gate_is_inert` pins the armed value.
 ///
 /// # GO criterion: full-history replay, byte-identical, x86_64 AND aarch64
 ///
@@ -2335,7 +2335,8 @@ pub fn mldsa_pin_active(epoch: u64) -> bool {
 /// Every validator signer (attestations, proposals, KES leaves) must sign v2
 /// for messages of this epoch onward; the whole fleet must run a binary that
 /// carries the v2 verifier first. Wallets and exchanges are NOT affected.
-/// Ships INERT at `u64::MAX`; `sig_canonical_gate_is_inert` pins the value.
+/// ARMED at 7270 (it shipped inert at `u64::MAX`); the test
+/// `sig_canonical_gate_is_inert` pins the armed value.
 /// The judged epoch is the signed message's own epoch, never a clock.
 pub const SIG_CANONICAL_ACTIVATION_EPOCH: u64 = 7270;
 
