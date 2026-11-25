@@ -67,7 +67,46 @@ use core::ffi::c_int;
 
 struct SeededEntry {
     id: Rc<()>,
-    rng: ChaCha20Rng,
+    /// Boxed so the generator has ONE address for its whole life: growing the
+    /// stack moves the pointer, never the key and keystream, and the wipe in
+    /// `Drop` therefore reaches the only heap copy there ever was.
+    rng: Box<ChaCha20Rng>,
+}
+
+/// Overwrite a seeded generator's whole state (key, counter and the buffered
+/// keystream block) with that of a fixed all-zero-seeded generator.
+///
+/// A leftover stream reproduces every key that was generated from the seed,
+/// so it must not outlive its scope. `rand_chacha` offers no erasure, hence
+/// this: one volatile store of a complete, valid value over the old one. It
+/// is a store of a `ChaCha20Rng`, not of raw bytes, so nothing is assumed
+/// about the type's layout, and the fence keeps the store from being elided
+/// as dead when the allocation is freed straight after.
+fn wipe_rng(rng: &mut ChaCha20Rng) {
+    let blank = ChaCha20Rng::from_seed([0u8; 32]);
+    // SAFETY: `rng` is a valid, aligned, exclusively borrowed `ChaCha20Rng`,
+    // and `ChaCha20Rng` has no destructor, so overwriting it without dropping
+    // the old value leaks nothing.
+    unsafe { core::ptr::write_volatile(rng, blank) };
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+impl Drop for SeededEntry {
+    fn drop(&mut self) {
+        wipe_rng(&mut self.rng);
+    }
+}
+
+/// Whether a seeded scope is active on this thread, i.e. whether PQClean
+/// randomness requested right now would be deterministic.
+///
+/// Signers use it to refuse to sign under a seed: a Falcon signature needs a
+/// fresh salt and fresh sampler randomness for every message, and a seeded
+/// stream hands different messages the same ones.
+pub fn seeded_rng_active() -> bool {
+    SEEDED_RNG_STACK
+        .try_with(|stack| stack.try_borrow().map(|stack| !stack.is_empty()).unwrap_or(true))
+        .unwrap_or(false)
 }
 
 thread_local! {
@@ -130,7 +169,7 @@ impl Drop for SeededRngGuard {
 /// This primitive stays private. Downstream code must use
 /// [`with_seeded_rng_scope`], which owns cleanup across return and unwind.
 fn with_seeded_rng(seed: &[u8; 32]) -> SeededRngGuard {
-    let rng = ChaCha20Rng::from_seed(*seed);
+    let rng = Box::new(ChaCha20Rng::from_seed(*seed));
     let id = Rc::new(());
     SEEDED_RNG_STACK.with(|stack| {
         stack.borrow_mut().push(SeededEntry { id: id.clone(), rng });
@@ -146,8 +185,10 @@ fn with_seeded_rng(seed: &[u8; 32]) -> SeededRngGuard {
 /// returned from the closure is already inactive. This does not clean up
 /// overrides forgotten *before* this scope, or promise cleanup after abort.
 /// Do not return an async future expecting the override to cover its polling.
-/// The ChaCha byte stream and C ABI are unchanged; opaque RNG state erasure
-/// remains unsupported by the current dependency.
+/// The ChaCha byte stream and C ABI are unchanged. When a scope ends (return,
+/// unwind, or thread exit) its generator state is overwritten before it is
+/// freed, see `wipe_rng`; the caller's own copy of `seed` is the caller's
+/// to wipe.
 ///
 /// The old manual guard is deliberately not part of the public API:
 ///
@@ -311,6 +352,52 @@ pub unsafe extern "C" fn PQCRYPTO_RUST_randombytes(buf: *mut u8, len: size_t) ->
 
 #[cfg(test)]
 mod tests {
+    /// F7: a wiped generator holds nothing of its seed: it continues exactly
+    /// as a fresh zero-seeded one would, whatever it was and however far it
+    /// had run (so the key, the counter and the buffered block are all gone).
+    #[test]
+    fn wiped_generator_keeps_nothing_of_its_seed() {
+        use rand_core::{RngCore, SeedableRng};
+        let mut blank = super::ChaCha20Rng::from_seed([0u8; 32]);
+        let mut expected = [0u8; 200];
+        blank.fill_bytes(&mut expected);
+        for consumed in [0usize, 1, 63, 64, 65, 1_000] {
+            let mut rng = super::ChaCha20Rng::from_seed([0xA5; 32]);
+            let mut sink = vec![0u8; consumed];
+            rng.fill_bytes(&mut sink);
+            super::wipe_rng(&mut rng);
+            let mut after = [0u8; 200];
+            rng.fill_bytes(&mut after);
+            assert_eq!(after, expected, "after consuming {consumed} bytes");
+        }
+    }
+
+    /// F3: the query is true exactly inside a scope, including nested ones
+    /// and after an unwind, and the stream itself is unchanged by the wipe.
+    #[test]
+    fn seeded_rng_active_tracks_the_scope() {
+        assert!(!super::seeded_rng_active());
+        let draw = || {
+            let mut bytes = [0u8; 48];
+            super::randombytes_fill(&mut bytes);
+            bytes
+        };
+        let first = super::with_seeded_rng_scope(&[9u8; 32], || {
+            assert!(super::seeded_rng_active());
+            super::with_seeded_rng_scope(&[10u8; 32], || assert!(super::seeded_rng_active()));
+            assert!(super::seeded_rng_active());
+            draw()
+        });
+        assert!(!super::seeded_rng_active());
+        let again = super::with_seeded_rng_scope(&[9u8; 32], draw);
+        assert_eq!(first, again, "the seeded stream is still a function of the seed alone");
+        let unwound = std::panic::catch_unwind(|| {
+            super::with_seeded_rng_scope(&[11u8; 32], || panic!("unwind through the scope"))
+        });
+        assert!(unwound.is_err());
+        assert!(!super::seeded_rng_active());
+    }
+
     use super::*;
 
     #[test]
