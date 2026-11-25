@@ -2390,7 +2390,80 @@ pub fn sig_canonical_active(epoch: u64) -> bool {
     epoch_gate_active(epoch, SIG_CANONICAL_ACTIVATION_EPOCH)
 }
 
+/// Flag day for **network-bound static-key duty signatures** (review B2).
+///
+/// # The hole this closes
+///
+/// A KES leaf signs `kes::leaf_message`, which carries the network domain, so
+/// a KES signature is a statement about one network. The static key does not:
+/// it signs the bare consensus root. After KES binds, a validator that never
+/// registered a KES key still signs with its static key (the fallback of
+/// `KES_RESCUE_DELAY_PERIODS`' docs, kept so such validators cannot halt
+/// finality), and before KES binds on a network every validator does. A
+/// header or vote signed that way on ANY network that shares the validator
+/// index and key (a testnet, a fork cloned from this genesis) is a valid
+/// signature here, and two of them for one slot are valid equivocation
+/// evidence: the validator is slashed on this network for what it signed on
+/// another.
+///
+/// # What the gate switches at one epoch
+///
+/// - **below**: the static key signs and verifies the bare consensus root,
+///   byte for byte the chain as it stands;
+/// - **at and above**: the static key signs and verifies
+///   `kes::static_message` (network domain ‖ validator ‖ root under its own
+///   tag). KES signatures are untouched: they are bound already.
+///
+/// Every consensus verification of a proposal or a vote goes through
+/// `kes::verify_validator` (the transition, attestation admission, gossip,
+/// slashing evidence, the node's doors, the finality-certificate verifier),
+/// so the rule has one definition. The judged epoch is the signed message's
+/// own epoch, never a clock.
+///
+/// # ARMING THIS IS A FOUNDER DECISION AND A VALIDATOR-FACING FLAG DAY
+///
+/// Every static-key signer must sign the bound message for duties of this
+/// epoch onward, so the whole fleet must run a binary that carries this rule
+/// first. Any verifier outside this repository that checks static-key duty
+/// signatures (light-client guests, bridges) must carry it too. Wallets and
+/// exchanges are not affected. Ships INERT at `u64::MAX`;
+/// `static_key_network_binding_gate_is_inert` pins the value.
+pub const STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+#[cfg(test)]
+thread_local! {
+    static STATIC_KEY_NETWORK_BINDING_GATE_AT_TL: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: arm [`STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH`] at `epoch`
+/// for this thread until the guard drops (including on unwind). Production
+/// has no override.
+#[cfg(test)]
+pub(crate) fn static_key_network_binding_gate_at_guard(epoch: u64) -> impl Drop {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            STATIC_KEY_NETWORK_BINDING_GATE_AT_TL.with(|c| c.set(self.0));
+        }
+    }
+    Restore(STATIC_KEY_NETWORK_BINDING_GATE_AT_TL.with(|c| c.replace(Some(epoch))))
+}
+
+/// Is the network-bound static-key signature rule active in `epoch`?
+pub fn static_key_network_binding_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if let Some(at) = STATIC_KEY_NETWORK_BINDING_GATE_AT_TL.with(|c| c.get()) {
+        return epoch >= at;
+    }
+    epoch_gate_active(epoch, STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH)
+}
+
 /// Candidate flag day for genesis-bound validator duty signatures.
+///
+/// Superseded for static-key duty signatures by
+/// [`STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH`], which binds them at the
+/// authority layer (`kes::verify_validator`) instead of per message type. The
+/// per-message candidate roots below remain fixtures only.
 ///
 /// This remains deliberately unarmed. Attestation and proposal candidate roots
 /// are available for interoperability fixtures, but production signing,

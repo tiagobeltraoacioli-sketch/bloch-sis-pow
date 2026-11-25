@@ -646,6 +646,7 @@ dependencies = [
 name = "bloch-mldsa-clean"
 version = "0.1.0"
 dependencies = [
+ "pqcrypto-falcon",
  "pqcrypto-mldsa",
 ]
 

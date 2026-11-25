@@ -66,6 +66,10 @@ const DS_SIGN: &[u8] = b"BLOCH-KES-v2/sign";
 const DS_AUTHORITY: &[u8] = b"BLOCH-KES-v1/authority";
 const DS_ROTATE: &[u8] = b"BLOCH-KES-v1/rotate";
 const DS_CORRECT: &[u8] = b"BLOCH-KES-v1/correct";
+/// What the STATIC key signs once
+/// `params::STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH` is reached. Not a
+/// prefix of, nor prefixed by, any tag above.
+const DS_STATIC_SIGN: &[u8] = b"BLOCH-KES-v1/static-sign";
 
 /// Transaction tag of `PosTransaction::KesRegister`. Free on the mainnet line
 /// (highest 0x16, the L2 range 0x12-0x16) and the same byte devnet4 used.
@@ -562,6 +566,30 @@ pub fn leaf_message(
     network_domain.map(|domain| bound_signing_root(&domain, validator, public, period, signing_root))
 }
 
+/// The 32 bytes the STATIC key signs for a consensus message (a proposal or a
+/// vote) by `validator` in `epoch` (review B2).
+///
+/// Below `params::STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH` it is
+/// `signing_root` itself, so every static signature the chain has ever
+/// carried verifies exactly as before. From it on it is the root bound to the
+/// network domain and the validator index under [`DS_STATIC_SIGN`], so a
+/// static-key signature made on another network (same key, same index, same
+/// consensus root) is not a signature here and cannot be paired into
+/// equivocation evidence. `None` (refuse) when the rule is active and no
+/// network domain is known, the same fail-closed rule as [`leaf_message`].
+/// The node signer and every verifier go through this one function.
+pub fn static_message(
+    network_domain: Option<[u8; 32]>,
+    validator: u32,
+    epoch: u64,
+    signing_root: &[u8; 32],
+) -> Option<[u8; 32]> {
+    if !crate::params::static_key_network_binding_active(epoch) {
+        return Some(*signing_root);
+    }
+    network_domain.map(|domain| h(&[DS_STATIC_SIGN, &domain, &validator.to_le_bytes(), signing_root]))
+}
+
 /// Which key authenticates `validator`'s consensus signature for `epoch`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SigningMode {
@@ -633,7 +661,9 @@ pub fn verify_validator(
     signature: &[u8],
 ) -> Option<bool> {
     let period = match signing_mode(keys, validator, epoch) {
-        SigningMode::Static => None,
+        SigningMode::Static => {
+            return verify_validator_static(keys, verifier, validator, epoch, signing_root, signature);
+        }
         SigningMode::Kes(period) => Some(period),
         SigningMode::FailClosed => {
             keys.pubkey(validator)?;
@@ -643,9 +673,34 @@ pub fn verify_validator(
     verify_validator_in(keys, verifier, validator, period, signing_root, signature)
 }
 
+/// Verify `signature` as a STATIC-key consensus signature by `validator` for
+/// `epoch`: the static key over [`static_message`]. Below the network-binding
+/// gate that is the bare root, exactly `verify_validator_in(.., None, ..)`.
+/// For callers that already know the static rule applies (the node's block
+/// door probes it beside the KES rule); consensus reaches it through
+/// [`verify_validator`]. `None` when `keys` does not know the validator.
+pub fn verify_validator_static(
+    keys: &dyn KeyLookup,
+    verifier: &dyn SignatureVerifier,
+    validator: u32,
+    epoch: u64,
+    signing_root: &[u8; 32],
+    signature: &[u8],
+) -> Option<bool> {
+    let static_key = keys.pubkey(validator)?;
+    let Some(message) = static_message(keys.kes_network_domain(), validator, epoch, signing_root) else {
+        return Some(false);
+    };
+    Some(verifier.verify_with_key(static_key, &message, signature))
+}
+
 /// [`verify_validator`] with the period given: `None` is the static key,
 /// `Some(p)` the KES leaf of global period `p`. For callers (and tests) that
 /// hold the period already; consensus uses [`verify_validator`].
+///
+/// `None` verifies the BARE root: this entry has no epoch, so it cannot apply
+/// the network binding of [`static_message`]. A caller judging a real
+/// static-key duty signature uses [`verify_validator_static`].
 pub fn verify_validator_in(
     keys: &dyn KeyLookup,
     verifier: &dyn SignatureVerifier,
@@ -682,6 +737,19 @@ pub fn authority_fingerprint(keys: &dyn KeyLookup, validator: u32, epoch: u64) -
         // After KES binds, a never-registered validator's static key is a
         // fallback authority: tagged, so no verdict cached under the plain
         // pre-enforcement form is reused across the bind.
+        // From the static-key network binding on, the static authority is
+        // "this key, on this network": a verdict cached under the bare-root
+        // rule is never reused across the gate, nor across networks.
+        SigningMode::Static if crate::params::static_key_network_binding_active(epoch) => {
+            let domain = keys.kes_network_domain();
+            return Some(h(&[
+                DS_AUTHORITY,
+                &static_hash,
+                b"static-network-bound",
+                &[u8::from(domain.is_some())],
+                &domain.unwrap_or([0; 32]),
+            ]));
+        }
         SigningMode::Static if is_bound(keys, epoch) => return Some(h(&[DS_AUTHORITY, &static_hash, b"static-fallback"])),
         SigningMode::Static => return Some(static_hash),
         SigningMode::FailClosed => return Some(h(&[DS_AUTHORITY, &static_hash, b"fail-closed"])),
@@ -1292,5 +1360,133 @@ mod attribution_tests {
             }
         }
         assert!(!failure_is_attributable(&Opaque, Some(&state.finalized(120)), 4, 130));
+    }
+}
+
+#[cfg(test)]
+mod static_network_binding_tests {
+    use super::*;
+
+    struct ToyVerifier;
+    impl SignatureVerifier for ToyVerifier {
+        fn verify_with_key(&self, pubkey: &[u8], root: &[u8; 32], signature: &[u8]) -> bool {
+            signature == h(&[pubkey, root])
+        }
+    }
+
+    const STATIC_KEY: &[u8] = b"static-key-of-validator-4";
+    const HERE: [u8; 32] = [0xD7; 32];
+    const ELSEWHERE: [u8; 32] = [0xE8; 32];
+
+    /// A state on which nobody has a KES key and KES has not bound: every
+    /// validator signs with its static key. `domain` is the network it names.
+    struct Net(Option<[u8; 32]>);
+    impl KeyLookup for Net {
+        fn pubkey(&self, validator: u32) -> Option<&[u8]> {
+            (validator == 4 || validator == 5).then_some(STATIC_KEY)
+        }
+        fn kes_public(&self, _: u32, _: u64) -> Option<KesPublic> {
+            None
+        }
+        fn kes_network_domain(&self) -> Option<[u8; 32]> {
+            self.0
+        }
+        fn kes_enforced_from(&self) -> Option<Option<u64>> {
+            Some(None)
+        }
+    }
+
+    fn static_sign(message: &[u8; 32]) -> Vec<u8> {
+        h(&[STATIC_KEY, message]).to_vec()
+    }
+
+    /// TRIPWIRE. Arming is a founder decision and a validator-facing flag
+    /// day (read the constant's docs). Whoever arms it updates this test in
+    /// the same commit.
+    #[test]
+    fn static_key_network_binding_gate_is_inert() {
+        assert_eq!(crate::params::STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH, u64::MAX);
+        for epoch in [0, 1, 8_620, 1_000_000, u64::MAX - 1, u64::MAX] {
+            assert!(!crate::params::static_key_network_binding_active(epoch), "{epoch}");
+            // Inert: the static key signs the bare root, with or without a domain.
+            assert_eq!(static_message(Some(HERE), 4, epoch, &[9; 32]), Some([9; 32]));
+            assert_eq!(static_message(None, 4, epoch, &[9; 32]), Some([9; 32]));
+        }
+    }
+
+    /// The message is the bare root below the gate and, from it, a function
+    /// of the network, the validator and the root, and of nothing else.
+    #[test]
+    fn the_static_message_binds_network_and_validator_from_the_gate() {
+        let _gate = crate::params::static_key_network_binding_gate_at_guard(20);
+        let root = [0x42; 32];
+        assert_eq!(static_message(Some(HERE), 4, 19, &root), Some(root));
+        assert_eq!(static_message(None, 4, 19, &root), Some(root));
+
+        let bound = static_message(Some(HERE), 4, 20, &root).expect("a domain is known");
+        assert_ne!(bound, root);
+        assert_eq!(static_message(Some(HERE), 4, 21, &root), Some(bound), "the epoch only selects the rule");
+        assert_ne!(static_message(Some(ELSEWHERE), 4, 20, &root), Some(bound));
+        assert_ne!(static_message(Some(HERE), 5, 20, &root), Some(bound));
+        assert_ne!(static_message(Some(HERE), 4, 20, &[0x43; 32]), Some(bound));
+        assert_eq!(static_message(None, 4, 20, &root), None, "no network named: refuse, never sign the bare root");
+        // Distinct from what a KES leaf of the same validator signs.
+        let public = KesPublic::new(3, [1; 32], 0);
+        assert_ne!(bound, bound_signing_root(&HERE, 4, &public, 0, &root));
+    }
+
+    /// The cross-network replay the gate exists for: one key and one index
+    /// on two networks. Below the gate a signature from either is accepted on
+    /// both; from the gate each network accepts only its own.
+    #[test]
+    fn a_static_signature_from_another_network_stops_verifying_at_the_gate() {
+        let _gate = crate::params::static_key_network_binding_gate_at_guard(20);
+        let root = [0x42; 32];
+        let (here, elsewhere, nowhere) = (Net(Some(HERE)), Net(Some(ELSEWHERE)), Net(None));
+        assert_eq!(signing_mode(&here, 4, 19), SigningMode::Static);
+        assert_eq!(signing_mode(&here, 4, 20), SigningMode::Static);
+
+        // Below the gate: the historical rule, byte for byte.
+        let bare = static_sign(&root);
+        for net in [&here, &elsewhere, &nowhere] {
+            assert_eq!(verify_validator(net, &ToyVerifier, 4, 19, &root, &bare), Some(true));
+            assert_eq!(verify_validator_static(net, &ToyVerifier, 4, 19, &root, &bare), Some(true));
+        }
+
+        // From the gate: a bare-root signature is not one any more ...
+        assert_eq!(verify_validator(&here, &ToyVerifier, 4, 20, &root, &bare), Some(false));
+        // ... the signer's own network accepts what it signs ...
+        let ours = static_sign(&static_message(Some(HERE), 4, 20, &root).unwrap());
+        assert_eq!(verify_validator(&here, &ToyVerifier, 4, 20, &root, &ours), Some(true));
+        assert_eq!(verify_validator_static(&here, &ToyVerifier, 4, 20, &root, &ours), Some(true));
+        // ... another network does not, in either direction ...
+        assert_eq!(verify_validator(&elsewhere, &ToyVerifier, 4, 20, &root, &ours), Some(false));
+        let theirs = static_sign(&static_message(Some(ELSEWHERE), 4, 20, &root).unwrap());
+        assert_eq!(verify_validator(&here, &ToyVerifier, 4, 20, &root, &theirs), Some(false));
+        // ... nor does another validator index holding the same key ...
+        assert_eq!(verify_validator(&here, &ToyVerifier, 5, 20, &root, &ours), Some(false));
+        // ... and a state that names no network refuses everything.
+        assert_eq!(verify_validator(&nowhere, &ToyVerifier, 4, 20, &root, &ours), Some(false));
+        assert_eq!(verify_validator(&nowhere, &ToyVerifier, 4, 20, &root, &bare), Some(false));
+        // An unknown validator is still "unknown", not "invalid".
+        assert_eq!(verify_validator(&here, &ToyVerifier, 9, 20, &root, &ours), None);
+        // The period-only entry has no epoch and keeps the bare rule.
+        assert_eq!(verify_validator_in(&here, &ToyVerifier, 4, None, &root, &bare), Some(true));
+    }
+
+    /// A verdict cached under the bare-root authority is never reused across
+    /// the gate or across networks.
+    #[test]
+    fn the_authority_fingerprint_changes_at_the_gate_and_per_network() {
+        let (here, elsewhere, nowhere) = (Net(Some(HERE)), Net(Some(ELSEWHERE)), Net(None));
+        let before = authority_fingerprint(&here, 4, 20);
+        assert_eq!(before, authority_fingerprint(&elsewhere, 4, 20), "inert: the static key alone");
+        let _gate = crate::params::static_key_network_binding_gate_at_guard(20);
+        assert_eq!(authority_fingerprint(&here, 4, 19), before);
+        let after = authority_fingerprint(&here, 4, 20);
+        assert_ne!(after, before);
+        assert_ne!(after, authority_fingerprint(&elsewhere, 4, 20));
+        assert_ne!(after, authority_fingerprint(&nowhere, 4, 20));
+        assert_eq!(authority_fingerprint(&here, 9, 20), None);
     }
 }

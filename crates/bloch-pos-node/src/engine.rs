@@ -5230,7 +5230,7 @@ impl Engine {
                     == Some(true);
             if !kes_ok && !verifier.limited() {
                 static_verdict = Some(
-                    bloch_pos_committee::kes::verify_validator_in(&*fallback, &policy, validator, None, &root, &env.proposer_sig)
+                    bloch_pos_committee::kes::verify_validator_static(&*fallback, &policy, validator, epoch, &root, &env.proposer_sig)
                         == Some(true),
                 );
             }
@@ -12393,7 +12393,15 @@ fn sign_duty(
     // Static key (before KES binds, or never registered): the consensus
     // signature rule of the duty's own epoch (HF2), never a bare v1 sign.
     let Some((period, public)) = kes_duty else {
-        return keys.sign_for_epoch(epoch, root);
+        // What the static key signs is the committee's to say (review B2):
+        // the bare root below the network-binding gate, the root bound to
+        // this network and validator from it on. No message (the rule is
+        // active and the duty state names no network) is an empty signature,
+        // which consensus refuses, exactly as on the KES path below.
+        let Some(message) = bloch_pos_committee::kes::static_message(network_domain, validator, epoch, root) else {
+            return Vec::new();
+        };
+        return keys.sign_for_epoch(epoch, &message);
     };
     let Some(kes) = kes else {
         return Vec::new();
