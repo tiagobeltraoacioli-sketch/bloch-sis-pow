@@ -721,7 +721,7 @@ pub fn split_envelope(bytes: &[u8]) -> Option<(u16, &[u8])> {
 // * [`SignaturePolicy::CompatiblePinned`] — every byte form [`verify`]
 //   admits, but the ML-DSA half judged by the pinned PQClean `clean`
 //   verifier instead of the CPU-dispatching one (see `mldsa65_verify_legacy`).
-//   Consensus from the committee's `MLDSA_PIN_ACTIVATION_EPOCH` (inert).
+//   Consensus from the committee's `MLDSA_PIN_ACTIVATION_EPOCH` (armed, 7270).
 //
 // * [`SignaturePolicy::CanonicalUnbound`] — today's (context-free) signing
 //   math, but exactly one byte form: the suite header is mandatory, every
@@ -735,7 +735,7 @@ pub fn split_envelope(bytes: &[u8]) -> Option<(u16, &[u8])> {
 //   it commits to the exact ML-DSA half it travels with. Closes (a3) and (b).
 //   Becomes the consensus rule FOR CONSENSUS MESSAGES (votes, proposer
 //   signatures, slashing evidence, KES leaves; never transaction witnesses)
-//   at the committee's `SIG_CANONICAL_ACTIVATION_EPOCH` (inert, `u64::MAX`).
+//   at the committee's `SIG_CANONICAL_ACTIVATION_EPOCH` (armed, 7270).
 //
 // Public keys: an enveloped key must have the exact body length of its suite.
 // The raw legacy hybrid key (exact length, carry-over addresses) stays

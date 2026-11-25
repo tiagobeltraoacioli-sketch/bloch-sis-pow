@@ -312,7 +312,15 @@ impl HdWallet {
             return Err("imported keypair public key does not match address".into());
         }
         let proof = keypair.sign_message(IMPORT_KEY_AUTH_CHALLENGE)
-            .map_err(|_| "imported keypair private key is invalid".to_string())?;
+            .map_err(|e| {
+                // Signing now withholds a signature its own public key rejects,
+                // so a mismatched pair is reported here, before the check below.
+                if e == Keypair::SIGNATURE_WITHHELD {
+                    "imported keypair private/public keys do not match".to_string()
+                } else {
+                    "imported keypair private key is invalid".to_string()
+                }
+            })?;
         if !Keypair::verify_message(&keypair.public_key, IMPORT_KEY_AUTH_CHALLENGE, &proof) {
             return Err("imported keypair private/public keys do not match".into());
         }
