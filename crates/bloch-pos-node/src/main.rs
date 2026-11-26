@@ -756,9 +756,10 @@ fn print_help() {
                --allow-public-metrics explicitly acknowledges the exposure;\n\
                that flag adds no authentication, so firewall it like RPC.\n\
                --metrics-token-file <path> (24 to 256 printable characters\n\
-               in the file) makes both endpoints require\n\
-               `Authorization: Bearer <token>`, else 401; it is what a\n\
-               Prometheus bearer_token_file sends. Plain HTTP still.\n\
+               in the file, readable by its owner only) makes /metrics\n\
+               require `Authorization: Bearer <token>`, else 401; it is\n\
+               what a Prometheus bearer_token_file sends. /health stays\n\
+               open, so liveness probes keep working. Plain HTTP still.\n\
                Requests must carry a Host naming loopback, the bound\n\
                address (on 0.0.0.0/::, the IP the scraper connected to) or\n\
                a name in BLOCH_RPC_HOST_ALLOWLIST; others get 403.\n\
@@ -802,7 +803,8 @@ fn print_help() {
                --rpc-read-only refuses sendrawtransaction, so a node behind\n\
                a public read gateway cannot be used to submit;\n\
                --rpc-api-key-file <path> requires every request to carry\n\
-               the key in that file (24 to 256 printable characters) in an\n\
+               the key in that file (24 to 256 printable characters, the\n\
+               file readable by its owner only) in an\n\
                X-API-Key header, else 401; --rpc-rate-limit <n> allows n\n\
                requests per second per source address (burst 2n), else\n\
                429. None of them encrypts anything: the RPC is still plain\n\
@@ -1120,6 +1122,48 @@ fn reject_block_root_args(args: &[String]) -> Result<Vec<String>, String> {
         }
     }
     Ok(roots)
+}
+
+/// The opt-in restriction flags of the RPC and metrics listeners, and whether
+/// each takes a value.
+const RESTRICTION_FLAGS: &[(&str, bool)] = &[
+    ("--rpc-read-only", false),
+    ("--rpc-api-key-file", true),
+    ("--rpc-rate-limit", true),
+    ("--metrics-token-file", true),
+];
+
+/// Refuse the spellings of a restriction flag that the argv readers would
+/// silently ignore (audit of 2026-11-26). `arg_value` and `run_switch` match
+/// the exact token only, so `--rpc-api-key-file=/path`, `--rpc-read-only=1`
+/// and a value flag given last or followed by another flag all parsed as
+/// "not given", and the node started with the listener open while its
+/// operator believed it restricted. Same class as `--reject-block-root=`
+/// (audit L1-11): a safety control is never ignored.
+fn restriction_flags_are_well_formed(args: &[String]) -> Result<(), String> {
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "--" {
+            break;
+        }
+        for (flag, takes_value) in RESTRICTION_FLAGS {
+            if let Some(rest) = arg.strip_prefix(flag) {
+                if rest.starts_with('=') {
+                    return Err(if *takes_value {
+                        format!("{flag} takes its value as the next argument: write `{flag} {}`, not `{arg}`", &rest[1..])
+                    } else {
+                        format!("{flag} takes no value: write `{flag}`, not `{arg}`")
+                    });
+                }
+            }
+            if arg == flag && *takes_value {
+                match args.get(index.saturating_add(1)) {
+                    Some(value) if !value.starts_with("--") => {}
+                    _ => return Err(format!("{flag} needs a value")),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The run flags that do not consume a following value.
@@ -2157,6 +2201,10 @@ fn run_cmd(args: &[String]) {
     // The opt-in RPC restrictions. Same sugar-over-env shape as the trusted
     // proxies above, and validated now for the same reason: a restriction the
     // operator asked for and mistyped must stop the boot, not be dropped.
+    if let Err(why) = restriction_flags_are_well_formed(args) {
+        eprintln!("run: {why}");
+        exit(2);
+    }
     if run_switch(args, "--rpc-read-only") {
         unsafe { std::env::set_var(rpc::RPC_READ_ONLY_ENV, "1") };
     }
@@ -2209,7 +2257,7 @@ fn run_cmd(args: &[String]) {
     }
     match metrics::bearer_token_from_env() {
         Ok(Some(_)) if metrics_port.is_some() => {
-            println!("metrics: /health and /metrics require an Authorization: Bearer token");
+            println!("metrics: /metrics requires an Authorization: Bearer token (/health stays open)");
         }
         Ok(_) => {}
         Err(why) => {
@@ -2555,6 +2603,32 @@ mod transport_tests {
         let plan = decide_transport(&argv("--transport devnet --listen 16400 --max-peers 32 --behind-proxy")).unwrap();
         assert_eq!(plan.transport, engine::Transport::Devnet);
         assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
+        // Audit of 2026-11-26: spellings of a restriction flag that the argv
+        // readers would ignore stop the boot instead of leaving the listener
+        // open.
+        for ignored in [
+            "--rpc-api-key-file=/etc/bloch/key",
+            "--rpc-rate-limit=50",
+            "--metrics-token-file=/p",
+            "--rpc-read-only=1",
+            "--rpc-read-only=",
+            "--rpc-api-key-file",
+            "--rpc-rate-limit --rpc-read-only",
+            "--metrics-port 9100 --metrics-token-file",
+        ] {
+            let refusal = restriction_flags_are_well_formed(&argv(ignored)).expect_err(ignored);
+            assert!(refusal.starts_with("--"), "{ignored}: {refusal}");
+        }
+        for fine in [
+            "",
+            "--rpc-read-only",
+            "--rpc-api-key-file /etc/bloch/key --rpc-rate-limit 50 --rpc-read-only",
+            "--metrics-port 9100 --metrics-token-file /p",
+            "--rpc-port 16310",
+            "-- --rpc-api-key-file=/ignored-after-double-dash",
+        ] {
+            assert_eq!(restriction_flags_are_well_formed(&argv(fine)), Ok(()), "{fine}");
+        }
         // P3: a plan that runs libp2p says its key exchange is classical; a
         // devnet-only plan does not carry that line.
         for transport in ["libp2p", "dual --listen 16400"] {

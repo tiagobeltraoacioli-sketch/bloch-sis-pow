@@ -156,6 +156,7 @@ dependencies = [
  "bloch-sis-pow",
  "chrono",
  "coherence-core",
+ "fips205",
  "hex",
  "hmac 0.12.1",
  "log",
@@ -166,6 +167,7 @@ dependencies = [
  "pqcrypto-traits",
  "primitive-types",
  "rand 0.9.5",
+ "rand_core 0.6.4",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -178,6 +180,7 @@ dependencies = [
 name = "bloch-mldsa-clean"
 version = "0.1.0"
 dependencies = [
+ "pqcrypto-falcon",
  "pqcrypto-mldsa",
 ]
 
