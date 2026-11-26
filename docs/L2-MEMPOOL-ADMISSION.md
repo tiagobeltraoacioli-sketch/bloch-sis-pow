@@ -1,5 +1,16 @@
 # Mempool admission of the L2 transaction kinds: where each release stands
 
+> **Status on `main` since 2026-11-26.** Sections 1 to 3 describe code that is
+> in this tree. The later sections describe the December L2 native line (the
+> forced transaction 0x1C, `check_l2_funding`, `check_l2_applicable`,
+> `apply_l2_forced_transaction`, the L2 revenue gate) as merged here. It no
+> longer is: `main` now holds the audited node line (merge `f2988f0d`), and
+> the December line is in that merge's first parent, `2708a994`, pending its
+> own integration and audit. The tests this note cites as
+> `r308_3_unbacked_l2_entries_at_the_highest_tip_take_no_place_in_the_pool`
+> and `r308_3p_1_the_da_rule_the_door_shares_with_consensus` left the tree
+> with it.
+
 Written for the L2 audit list, item B1 ("the released node admits L2 kinds on a signature alone", review
 R308-3) and item B2 ("entries sharing one funding output compete by tip"). Both were opened against release
 `78d4921c` and the L2 development line that branches from it. This note records what the later node releases

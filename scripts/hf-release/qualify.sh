@@ -42,6 +42,21 @@
 #                       explains it; --expect-halt LABEL=SLOT pins B.
 #              Forced binaries carry a synthetic commit and are never staged.
 #
+# Fresh build context (every build, canonical, test images and forced): all
+# `buildx build` calls go through $OUT/engine-fresh (fresh-build.py engine),
+# which drops the builder's synced local contexts and adds --no-cache. Each
+# canonical and forced build log is then checked (fresh-build.py check): a
+# CACHED RUN/COPY/ADD step, or a build context transfer smaller than the
+# tree's source-digest scope, is refused ("cached build context"). A forced
+# binary must also report a source-digest different from the candidate's and
+# from every known fleet release (35c2b943... of 78d4921c and a4c4af85... of
+# fa980367, plus any --fleet-digest).
+#
+# --dry-run (no container engine needed, e.g. on a Mac): checks the arguments,
+# the commits, the source index, gate discovery and the schedule against the
+# index head, patches every forced tree and predicts its source-digest, then
+# stops. Nothing is built, tested or replayed; the verdict is DRY-RUN.
+#
 # Steps 2-4 run concurrently (tests in the container, replays on the host,
 # forced builds serially in the container); wall time is about one canonical
 # build + max(tests, forced builds + ~45 min of replays).
@@ -79,6 +94,10 @@
 #                           expected (tests that pin an ARMED gate to u64::MAX are
 #                           found and accepted automatically; see hf-gates.py tripwires)
 #     --skip-tests | --skip-forced | --allow-unsandboxed
+#     --fleet-digest HEX    another fleet release source-digest (repeatable); a forced
+#                           binary or patched tree with any of them is a stale build.
+#                           Built in: 35c2b943... (78d4921c), a4c4af85... (fa980367)
+#     --dry-run             plan only: no build, tests or replays (see above)
 #   env: CONTAINER_ENGINE (default docker; e.g. a `sudo -n docker` wrapper)
 #
 # Exit 0 and "VERDICT: PASS" only if no step FAILed (WARN is reported, not fatal).
@@ -89,22 +108,26 @@ REPO="$(cd "$KIT/../.." && pwd)"
 REPLAY="$REPO/scripts/l2-activation/replay-mainnet-history.sh"
 GATES_PY="$KIT/hf-gates.py"
 DIGEST_PY="$KIT/source-digest.py"
+FRESH_PY="$KIT/fresh-build.py"
 PREFIX_PY="$KIT/log-prefix.py"
 ENGINE="${CONTAINER_ENGINE:-docker}"
 SLOTS_PER_EPOCH=32
 
 case "${1:-}" in -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;; esac
 COMMIT_ARG="${1:-}"; [ $# -gt 0 ] && shift
-SOURCE="" BASELINE_BIN="" OUT="" BASE_COMMIT=b4a21fb657d0beb17f64c62889b605c9a7a2d031
+FLEET_BASE_COMMIT=b4a21fb657d0beb17f64c62889b605c9a7a2d031
+SOURCE="" BASELINE_BIN="" OUT="" BASE_COMMIT=$FLEET_BASE_COMMIT BASE_COMMIT_DEFAULT=1
 FORCE_EPOCH="" WINDOW=16 JOBS=8 PIN_CANDIDATES=4 EXPECT_SLOT="" EXPECT_ROOT=""
-SKIP_TESTS=0 SKIP_FORCED=0 UNSANDBOXED=0 GATES_ONLY=0 FORCED_ONLY=0 RELAX_ORDER=0
+SKIP_TESTS=0 SKIP_FORCED=0 UNSANDBOXED=0 GATES_ONLY=0 FORCED_ONLY=0 RELAX_ORDER=0 DRY_RUN=0
+# Source-digests of the releases the fleet has run (78d4921c, fa980367).
+FLEET_DIGESTS="35c2b943d42ec370d087ac69c417492df4063e51547482cfc8346aeb19b1f177 a4c4af850fec3efd66485558282e1ca9381a70874750ab2373be3e23fd866308"
 GATE_ARGS=() ALLOW_FAIL=() ALLOW_TEST=() SET_ARGS=() EXPECT_HALT=() ALLOW_INERT=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --source) SOURCE="$2"; shift 2 ;;
     --baseline-bin) BASELINE_BIN="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
-    --base-commit) BASE_COMMIT="$2"; shift 2 ;;
+    --base-commit) BASE_COMMIT="$2"; BASE_COMMIT_DEFAULT=0; shift 2 ;;
     --gate) GATE_ARGS+=("$2"); shift 2 ;;
     --gates-only) GATES_ONLY=1; shift ;;
     --forced-set) SET_ARGS+=("$2"); shift 2 ;;
@@ -123,6 +146,8 @@ while [ $# -gt 0 ]; do
     --skip-tests) SKIP_TESTS=1; shift ;;
     --skip-forced) SKIP_FORCED=1; shift ;;
     --allow-unsandboxed) UNSANDBOXED=1; shift ;;
+    --fleet-digest) FLEET_DIGESTS="$FLEET_DIGESTS $2"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -135,6 +160,12 @@ for n in "$WINDOW" "$JOBS" "$PIN_CANDIDATES" ${FORCE_EPOCH:+"$FORCE_EPOCH"}; do
   case "$n" in ''|*[!0-9]*) echo "numeric option expected, got '$n'" >&2; exit 2 ;; esac
 done
 [ "$JOBS" -ge 1 ] || JOBS=1
+for x in $FLEET_DIGESTS; do
+  case "$x" in *[!0-9a-f]*) echo "--fleet-digest must be 64 lowercase hex digits" >&2; exit 2 ;; esac
+  [ "${#x}" -eq 64 ] || { echo "--fleet-digest must be 64 lowercase hex digits" >&2; exit 2; }
+done
+# is_fleet_digest <hex>: true if it is the source-digest of a fleet release.
+is_fleet_digest() { local x; for x in $FLEET_DIGESTS; do [ "$x" != "$1" ] || return 0; done; return 1; }
 [ "$GATES_ONLY" = 0 ] || [ $(( ${#GATE_ARGS[@]} + ${#SET_ARGS[@]} )) -gt 0 ] || { echo "--gates-only needs --gate or --forced-set" >&2; exit 2; }
 for x in ${SET_ARGS[@]+"${SET_ARGS[@]}"}; do
   case "$x" in [A-Za-z0-9_-]*=[A-Z]*=[0-9]*) : ;; *) echo "bad --forced-set $x" >&2; exit 2 ;; esac
@@ -147,23 +178,60 @@ done
 die() { echo "qualify: FAIL - $*" >&2; exit 1; }
 COMMIT="$(git -C "$REPO" rev-parse --verify --quiet "$COMMIT_ARG^{commit}")" || die "unknown commit $COMMIT_ARG"
 BASE_COMMIT="$(git -C "$REPO" rev-parse --verify --quiet "$BASE_COMMIT^{commit}")" || die "unknown base commit"
+# The default named explicitly is still the default (review R308-10): the G-3
+# refusal below keys on the commit, not on whether the option was typed.
+if [ "$BASE_COMMIT" = "$(git -C "$REPO" rev-parse --verify --quiet "$FLEET_BASE_COMMIT^{commit}" || true)" ]; then
+  BASE_COMMIT_DEFAULT=1
+fi
 # Release integrity (HF1 review H-3): the candidate must descend from the
 # fleet release, or it silently drops what that release fixed (for example
 # the pre-activation offence refusal). Never qualify a source branch that
 # forks before it.
 git -C "$REPO" merge-base --is-ancestor "$BASE_COMMIT" "$COMMIT" \
   || die "$COMMIT does not descend from the fleet release $BASE_COMMIT"
+# Tabletop finding G-3 (169): an emergency L2 program swap or rollback build arms
+# L2_NEXT_PROGRAM_EPOCH / L2_PROGRAM_ROLLBACK_EPOCH on top of a SHIPPED release that
+# already activated HF1-3, KES and (for a rollback) the swap. Gate discovery diffs
+# the candidate against --base-commit; with the default fleet release b4a21fb6 every
+# one of those inherited gates shows as newly armed and lands before the replayed
+# head, so the gate-schedule check FAILs misleadingly and the only real change
+# (the rollback epoch) is drowned out. The fix: when the candidate arms either L2
+# program gate and --base-commit was left at the default, refuse with the one thing
+# the operator must pass -- the commit of the release the fleet is actually running.
+# Armed means: defined at the candidate and not evaluated to u64::MAX. The value is
+# evaluated by hf-gates.py (review R308-10: a gate armed through another constant,
+# a hex literal or an expression was not seen by the earlier plain-decimal match);
+# a value the tool cannot evaluate, or two definitions, count as armed.
+l2_gate_armed() {
+  local st
+  st="$(python3 -I "$GATES_PY" status --repo "$REPO" --commit "$COMMIT" --gate "$1" | cut -f2)" \
+    || die "hf-gates.py status failed for $1"
+  case "$st" in inert|missing) return 1 ;; *) return 0 ;; esac
+}
+if [ "$BASE_COMMIT_DEFAULT" = 1 ]; then
+  for g in L2_PROGRAM_ROLLBACK_EPOCH L2_NEXT_PROGRAM_EPOCH; do
+    if l2_gate_armed "$g"; then
+      die "$COMMIT arms $g but --base-commit is the default fleet release. An emergency
+       L2 program build is qualified against the SHIPPED release it is built on, or
+       the inherited HF1-3/KES/swap gates all count as changed and the gate-schedule
+       check fails. Re-run with --base-commit <the commit the fleet runs today> (for a
+       rollback, the swap release's commit)."
+    fi
+  done
+fi
 C12="${COMMIT:0:12}"
 OUT="${OUT:-$HOME/hf-qualify-$C12-$(date -u +%Y%m%dT%H%M%SZ)}"
 [ ! -e "$OUT" ] || die "$OUT exists; give a new directory"
 [ -z "$BASELINE_BIN" ] || [ -x "$BASELINE_BIN" ] || die "baseline binary $BASELINE_BIN is not executable"
 for f in blocks.log blocks.idx meta.bin; do [ -f "$SOURCE/$f" ] || die "$SOURCE/$f missing"; done
-command -v "$ENGINE" >/dev/null 2>&1 || die "container engine not found: $ENGINE"
+[ "$DRY_RUN" = 1 ] || command -v "$ENGINE" >/dev/null 2>&1 || die "container engine not found: $ENGINE"
 command -v python3 >/dev/null || die "python3 is required"
 [ -x "$REPLAY" ] || die "$REPLAY missing"
+[ -f "$FRESH_PY" ] || die "$FRESH_PY missing"
 SDE="$(git -C "$REPO" show -s --format=%ct "$COMMIT")"
 
-mkdir -m 700 -p "$OUT"/{replay,data,forced}
+mkdir -p "$(dirname "$OUT")"
+mkdir -m 700 "$OUT" "$OUT"/replay "$OUT"/data "$OUT"/forced
 exec > >(tee -a "$OUT/qualify.log") 2>&1
 RESULTS="$OUT/RESULTS.tsv"; : > "$RESULTS"
 say() { echo "[$(date -u +%H:%M:%S)] $*"; }
@@ -180,12 +248,22 @@ say "kit: $(git -C "$REPO" rev-parse HEAD)  engine: $ENGINE  source: $SOURCE"
   echo "kit_commit=$(git -C "$REPO" rev-parse HEAD)"; echo "started=$(date -u +%FT%TZ)"
   echo "source_blocks_log_bytes=$(wc -c < "$SOURCE/blocks.log" | tr -d ' ')"
   [ -z "$BASELINE_BIN" ] || echo "baseline_bin_sha256=$(sha256sum "$BASELINE_BIN" | awk '{print $1}')"
-  echo "forced_only=$FORCED_ONLY"
+  echo "forced_only=$FORCED_ONLY"; echo "dry_run=$DRY_RUN"; echo "fleet_source_digests=$FLEET_DIGESTS"
 } > "$OUT/qualify.env"
+# Every `buildx build` of this run goes through this wrapper (fresh context,
+# --no-cache); the canonical and forced build logs are checked afterwards.
+FRESH_ENGINE="$OUT/engine-fresh"
+python3 -I "$FRESH_PY" engine --engine "$(command -v "$ENGINE" || echo "$ENGINE")" --out "$FRESH_ENGINE"
+# fresh_check <log> <min context bytes>: prints the checker's line, fails on a cached context.
+fresh_check() { python3 -I "$FRESH_PY" check --log "$1" --min-context-bytes "$2"; }
 
 # ── 1. canonical build ────────────────────────────────────────────────────
 WT="$OUT/src"
-git -C "$REPO" worktree add --detach "$WT" "$COMMIT" >/dev/null
+if [ "$DRY_RUN" = 1 ]; then
+  mkdir -p "$WT"; git -C "$REPO" archive --format=tar "$COMMIT" | tar -xf - -C "$WT"
+else
+  git -C "$REPO" worktree add --detach "$WT" "$COMMIT" >/dev/null
+fi
 # The ML-DSA pin's QUALIFICATION-ONLY feature arms MLDSA_PIN_ACTIVATION_EPOCH
 # at 0 (all of history under the pinned rule). It must never reach a release
 # build: not in a default feature set, not in the release build script.
@@ -197,29 +275,43 @@ if grep -n 'mldsa-pin-replay-qualification' "$WT/scripts/build-pos-release-conta
   die "the release build script enables mldsa-pin-replay-qualification"
 fi
 record qualification-features-off PASS "mldsa-pin-replay-qualification not enabled by the release build"
-say "building in the canonical container (log: $OUT/build.log)"
-if (cd "$WT" && CONTAINER_ENGINE="$ENGINE" scripts/build-pos-release-container.sh "$OUT/release") > "$OUT/build.log" 2>&1; then
-  BIN="$OUT/release/bloch-pos"
-  BIN_SHA="$(sha256sum "$BIN" | awk '{print $1}')"
-  "$BIN" --version > "$OUT/release/VERSION.txt"
-  grep -qF "($COMMIT)" "$OUT/release/VERSION.txt" || die "built binary does not report $COMMIT"
-  "$BIN" buildinfo > "$OUT/release/buildinfo.json"
-  record build PASS "bloch-pos sha256 $BIN_SHA"
-else
-  tail -30 "$OUT/build.log"; record build FAIL "see build.log"; die "canonical build failed"
-fi
-# The release source-digest, read from the binary and recomputed from the
-# archived tree. Forced builds are judged against both, so the tool that
-# predicts a forced digest is itself checked here on the release.
+# The release source-digest, recomputed from the archived tree (and, after the
+# build, read from the binary). Forced builds are judged against both, so the
+# tool that predicts a forced digest is itself checked here on the release.
+read -r REL_TREE_DIGEST _ REL_TREE_BYTES <<<"$(python3 -I "$DIGEST_PY" --tree "$WT")"
+[ -n "$REL_TREE_DIGEST" ] && [ -n "$REL_TREE_BYTES" ] || die "source-digest.py failed on $COMMIT"
 version_digest() { sed -n '2p' "$1" | sed -nE 's/^source-digest sha3-256:([0-9a-f]{64}) .*/\1/p'; }
-REL_DIGEST="$(version_digest "$OUT/release/VERSION.txt")"
-[ -n "$REL_DIGEST" ] || die "release binary reports no source-digest"
-REL_TREE_DIGEST="$(python3 -I "$DIGEST_PY" --tree "$WT" | awk '{print $1}')"
-[ "$REL_TREE_DIGEST" = "$REL_DIGEST" ] \
-  || die "source-digest.py gives $REL_TREE_DIGEST for $COMMIT, the release binary reports $REL_DIGEST"
+if [ "$DRY_RUN" = 1 ]; then
+  REL_DIGEST="$REL_TREE_DIGEST" BIN="(dry run: not built)"
+  record build SKIPPED "--dry-run; would run: (cd <worktree of $C12> && CONTAINER_ENGINE=$FRESH_ENGINE scripts/build-pos-release-container.sh $OUT/release)"
+  record source-digest SKIPPED "--dry-run; source-digest.py gives $REL_DIGEST ($REL_TREE_BYTES bytes in scope)"
+else
+  say "building in the canonical container (fresh context; log: $OUT/build.log)"
+  if (cd "$WT" && CONTAINER_ENGINE="$FRESH_ENGINE" scripts/build-pos-release-container.sh "$OUT/release") > "$OUT/build.log" 2>&1; then
+    BIN="$OUT/release/bloch-pos"
+    BIN_SHA="$(sha256sum "$BIN" | awk '{print $1}')"
+    "$BIN" --version > "$OUT/release/VERSION.txt"
+    grep -qF "($COMMIT)" "$OUT/release/VERSION.txt" || die "built binary does not report $COMMIT"
+    "$BIN" buildinfo > "$OUT/release/buildinfo.json"
+    record build PASS "bloch-pos sha256 $BIN_SHA"
+  else
+    tail -30 "$OUT/build.log"; record build FAIL "see build.log"; die "canonical build failed"
+  fi
+  if ctx="$(fresh_check "$OUT/build.log" "$REL_TREE_BYTES")"; then
+    record build-context PASS "${ctx#PASS }"
+  else
+    record build-context FAIL "${ctx#FAIL }"
+    die "refusing a cached build context for the canonical build: ${ctx#FAIL }"
+  fi
+  REL_DIGEST="$(version_digest "$OUT/release/VERSION.txt")"
+  [ -n "$REL_DIGEST" ] || die "release binary reports no source-digest"
+  [ "$REL_TREE_DIGEST" = "$REL_DIGEST" ] \
+    || die "source-digest.py gives $REL_TREE_DIGEST for $COMMIT, the release binary reports $REL_DIGEST"
+  record source-digest PASS "release $REL_DIGEST (binary and source-digest.py agree)"
+fi
 echo "release_source_digest=$REL_DIGEST" >> "$OUT/qualify.env"
-record source-digest PASS "release $REL_DIGEST (binary and source-digest.py agree)"
-cleanup; WT=""
+if [ "$DRY_RUN" = 1 ]; then rm -rf "$WT"; else cleanup; fi
+WT=""
 
 # ── gates (git only), before the tests so armed-gate tripwires are known ──
 IDX_LAST_SLOT="$(python3 -I -c '
@@ -251,17 +343,22 @@ run_tests() {
   mkdir -p "$ctx" "$OUT/tests"
   git -C "$REPO" archive --format=tar "$COMMIT" | tar -xf - -C "$ctx"
   say "tests: canonical build image $build_tag"
-  if ! "$ENGINE" buildx build --progress=plain --target build --load -t "$build_tag" \
+  if ! "$FRESH_ENGINE" buildx build --progress=plain --target build --load -t "$build_tag" \
     --build-arg "BLOCH_BUILD_COMMIT=$COMMIT" --build-arg "SOURCE_DATE_EPOCH=$SDE" \
     --file "$ctx/deploy/pos-release/Dockerfile" "$ctx" > "$OUT/tests-image.log" 2>&1; then
     record tests FAIL "base image build failed (tests-image.log)"; return 0
   fi
-  if ! "$ENGINE" buildx build --progress=plain --load -t "$tag" \
+  if ! "$FRESH_ENGINE" buildx build --progress=plain --load -t "$tag" \
     --build-arg "BUILD_IMAGE=$build_tag" \
     --file "$ctx/scripts/hf-release/Tests.Dockerfile" "$ctx" >> "$OUT/tests-image.log" 2>&1; then
     record tests FAIL "test image build failed (tests-image.log)"; return 0
   fi
   rm -rf "$ctx"
+  # The second image reuses the first one's context in the same run, so only
+  # the CACHED rule applies here (the canonical build carries the size rule).
+  if ! python3 -I "$FRESH_PY" check --log "$OUT/tests-image.log" --no-context-floor > "$OUT/tests-image.fresh" 2>&1; then
+    record tests FAIL "cached test image build: $(cat "$OUT/tests-image.fresh")"; return 0
+  fi
   for a in ${ALLOW_FAIL[@]+"${ALLOW_FAIL[@]}"}; do allow_args+=(--allow-package "$a"); done
   for a in ${ALLOW_TEST[@]+"${ALLOW_TEST[@]}"}; do allow_args+=(--allow-test "$a"); done
   say "tests: live debug, legacy release, proof release, explicit indexer lib (logs: $OUT/tests)"
@@ -285,7 +382,9 @@ run_tests() {
   esac
 }
 TESTS_PID=""
-if [ "$SKIP_TESTS" = 1 ]; then
+if [ "$DRY_RUN" = 1 ]; then
+  record tests SKIPPED "--dry-run"
+elif [ "$SKIP_TESTS" = 1 ]; then
   record tests SKIPPED "--skip-tests"
 else
   run_tests & TESTS_PID=$!
@@ -315,7 +414,9 @@ replay() {
   REPLAY_PIDS+=($!)
   say "  replay $label started"
 }
-head_of() { awk '$1=="candidate" && NF==4 {print $2, $3, $4}' "$OUT/replay/$1.out" 2>/dev/null | tail -1; }
+# A missing .out (dry run, or a replay never started) is an empty head, not a
+# pipefail exit of the whole script.
+head_of() { [ -f "$OUT/replay/$1.out" ] || return 0; awk '$1=="candidate" && NF==4 {print $2, $3, $4}' "$OUT/replay/$1.out" | tail -1; }
 rc_of() { cat "$OUT/replay/$1.rc" 2>/dev/null || echo none; }
 
 # ── forced sets (from the index, before any replay) ───────────────────────
@@ -362,18 +463,22 @@ for item in ${forced[@]+"${forced[@]}"}; do
   say "forced set $label: $spec (pre: slots < e$lo, post: slots < e$((hi + WINDOW)))"
   cuts="$cuts $lo $((hi + WINDOW))"
 done
+# shellcheck disable=SC2086 # $cuts is a space-separated list of epochs, split on purpose
 cuts=$(printf '%s\n' $cuts | sort -un)
 for c in $cuts; do
+  if [ "$DRY_RUN" = 1 ]; then say "  would cut history before slot $((c * SLOTS_PER_EPOCH)) into data/cut-e$c"; continue; fi
   python3 -I "$PREFIX_PY" --source "$SOURCE" --dest "$OUT/data/cut-e$c" --before-slot $((c * SLOTS_PER_EPOCH)) | sed 's/^/  cut-e'"$c"': /'
 done
 
 # ── 3. configured replays + candidate references on each prefix ───────────
 expect=(); [ -z "$EXPECT_ROOT" ] || expect=(--expect-root "$EXPECT_ROOT" --expect-slot "$EXPECT_SLOT")
-if [ "$FORCED_ONLY" = 0 ]; then
+if [ "$DRY_RUN" = 1 ]; then
+  say "dry run: no replays (would run full-candidate, full-baseline and ref-cut-e<c> for each cut)"
+elif [ "$FORCED_ONLY" = 0 ]; then
   replay full-candidate "$BIN" "$SOURCE" ${expect[@]+"${expect[@]}"}
   replay full-baseline "$BASELINE_BIN" "$SOURCE" ${expect[@]+"${expect[@]}"}
 fi
-for c in $cuts; do replay "ref-cut-e$c" "$BIN" "$OUT/data/cut-e$c"; done
+[ "$DRY_RUN" = 1 ] || for c in $cuts; do replay "ref-cut-e$c" "$BIN" "$OUT/data/cut-e$c"; done
 
 # ── 4. forced builds (serially, in the container) and their replays ───────
 for item in ${forced[@]+"${forced[@]}"}; do
@@ -393,33 +498,37 @@ for item in ${forced[@]+"${forced[@]}"}; do
   if [ "$ok" = 0 ]; then echo "FAIL	could not patch $spec" > "$d/verdict"; continue; fi
   # The hashed source must actually change; then predict the digest the
   # forced binary has to report.
-  tree_digest="$(python3 -I "$DIGEST_PY" --tree "$d/tree" | awk '{print $1}')" || tree_digest=""
-  [ -n "$tree_digest" ] || { echo "FAIL	source-digest.py failed on the forced tree" > "$d/verdict"; continue; }
+  tree_digest="" tree_bytes=""
+  read -r tree_digest _ tree_bytes <<<"$(python3 -I "$DIGEST_PY" --tree "$d/tree" || true)"
+  [ -n "$tree_digest" ] && [ -n "$tree_bytes" ] || { echo "FAIL	source-digest.py failed on the forced tree" > "$d/verdict"; continue; }
   echo "$tree_digest" > "$d/expected-source-digest"
   if [ "$tree_digest" = "$REL_DIGEST" ]; then
     echo "FAIL	the patch left the hashed source identical to the release ($REL_DIGEST)" > "$d/verdict"; continue
+  fi
+  if is_fleet_digest "$tree_digest"; then
+    echo "FAIL	the patched tree hashes to a fleet release source-digest ($tree_digest)" > "$d/verdict"; continue
+  fi
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "SKIPPED	--dry-run; patched tree source-digest $tree_digest ($tree_bytes bytes in scope), differs from the candidate $REL_DIGEST and every fleet release digest; would build with CONTAINER_ENGINE=$FRESH_ENGINE" > "$d/verdict"
+    say "forced set $label (dry run): $(tr '\n' ' ' < "$d/patch.txt"); predicted source-digest $tree_digest"
+    rm -rf "$d/tree"
+    continue
   fi
   # Fresh build context. build-pos-release-container.sh archives the commit,
   # and `git archive` stamps every file with the commit time. Dating the
   # synthetic commit at the release time ($SDE) gave a same-size patched
   # params.rs the release's size and mtime, and the forced binary of the
-  # 78d4921c qualification reported the release digest (most likely the
-  # engine's incremental context transfer reused the unpatched file). Date it now instead, and
-  # pass --no-cache to every `buildx build` through a wrapper engine.
+  # 78d4921c qualification reported the release digest: the builder's
+  # incremental context transfer (79.74 kB instead of 53.8 MB) reused the
+  # unpatched file. Date it now, build through the fresh engine (drops synced
+  # contexts, --no-cache), and refuse the build if its log shows a cached step
+  # or a context smaller than the hashed scope.
   forced_date="$(date +%s)"; [ "$forced_date" != "$SDE" ] || forced_date=$((SDE + 1))
   (cd "$d/tree" && git init -q && git add -A \
     && GIT_AUTHOR_DATE="@$forced_date" GIT_COMMITTER_DATE="@$forced_date" git -c user.name=hf-qualify -c user.email=hf-qualify@invalid \
        commit -q -m "QUALIFICATION ONLY - NEVER RELEASE: $spec on top of $COMMIT")
-  nocache="$d/engine-nocache"
-  {
-    echo '#!/usr/bin/env bash'
-    printf 'engine=%q\n' "$(command -v "$ENGINE")"
-    echo 'if [ "${1:-}" = buildx ] && [ "${2:-}" = build ]; then shift 2; exec "$engine" buildx build --no-cache "$@"; fi'
-    echo 'exec "$engine" "$@"'
-  } > "$nocache"
-  chmod 700 "$nocache"
   say "forced build $label ($(tr '\n' ' ' < "$d/patch.txt")); expected source-digest $tree_digest"
-  if (cd "$d/tree" && CONTAINER_ENGINE="$nocache" scripts/build-pos-release-container.sh "$d/build") > "$d/build.log" 2>&1; then
+  if (cd "$d/tree" && CONTAINER_ENGINE="$FRESH_ENGINE" scripts/build-pos-release-container.sh "$d/build") > "$d/build.log" 2>&1; then
     fb="$d/bloch-pos-FORCED-$label"
     mv "$d/build/bloch-pos" "$fb"
     rm -f "$d/build/SHA256SUMS"
@@ -427,12 +536,14 @@ for item in ${forced[@]+"${forced[@]}"}; do
     "$fb" --version > "$d/VERSION.txt" || true
     got="$(version_digest "$d/VERSION.txt")"
     grep -E 'transferring context' "$d/build.log" | sed 's/^/    /' || true
-    if [ "$got" = "$REL_DIGEST" ]; then
-      echo "FAIL	stale build: forced binary reports the RELEASE source-digest $got (expected $tree_digest)" > "$d/verdict"; continue
+    if ! ctx="$(fresh_check "$d/build.log" "$tree_bytes")"; then
+      echo "FAIL	cached build context refused: ${ctx#FAIL }" > "$d/verdict"; continue
+    elif [ "$got" = "$REL_DIGEST" ] || is_fleet_digest "$got"; then
+      echo "FAIL	stale build: forced binary reports the release or fleet source-digest $got (expected $tree_digest)" > "$d/verdict"; continue
     elif [ "$got" != "$tree_digest" ]; then
       echo "FAIL	forced binary reports source-digest ${got:-none}, the patched tree is $tree_digest" > "$d/verdict"; continue
     fi
-    say "forced build $label: source-digest $got (patched tree; release is $REL_DIGEST)"
+    say "forced build $label: source-digest $got (patched tree; release is $REL_DIGEST, fleet releases $FLEET_DIGESTS); ${ctx#PASS }"
     rm -rf "$d/tree"
     replay "forced-$label-pre" "$fb" "$OUT/data/cut-e$lo"
     replay "forced-$label-post" "$fb" "$OUT/data/cut-e$((hi + WINDOW))"
@@ -451,7 +562,10 @@ if [ "$FORCED_ONLY" = 1 ]; then
   record gate-schedule SKIPPED "--forced-only"
 else
   ref_full="$(head_of full-candidate)"; base_full="$(head_of full-baseline)"
-  if [ "$(rc_of full-candidate)" = 0 ] && [ "$(rc_of full-baseline)" = 0 ] && [ -n "$ref_full" ] && [ "$ref_full" = "$base_full" ]; then
+  if [ "$DRY_RUN" = 1 ]; then
+    record replay-configured SKIPPED "--dry-run; the schedule below is checked against the index head, not a replayed head"
+    HEAD_SLOT="$IDX_LAST_SLOT"
+  elif [ "$(rc_of full-candidate)" = 0 ] && [ "$(rc_of full-baseline)" = 0 ] && [ -n "$ref_full" ] && [ "$ref_full" = "$base_full" ]; then
     record replay-configured PASS "head (slot blocks root) $ref_full, identical to baseline"
     read -r HEAD_SLOT _ _ <<<"$ref_full"
   else
@@ -491,7 +605,7 @@ else
   if [ -n "$sched_bad" ]; then
     record gate-schedule FAIL "changed gate at or before the replayed head:$sched_bad"
   else
-    record gate-schedule PASS "$(grep -c scheduled: "$OUT/gates.tsv" || true) armed, $(grep -c inert "$OUT/gates.tsv" || true) inert; replayed head e$HEAD_EPOCH"
+    record gate-schedule PASS "$(grep -c scheduled: "$OUT/gates.tsv" || true) armed, $(grep -c inert "$OUT/gates.tsv" || true) inert; $([ "$DRY_RUN" = 1 ] && echo "index head (dry run)" || echo "replayed head") e$HEAD_EPOCH"
   fi
 
 fi
@@ -625,6 +739,7 @@ for row in sorted(set(out))[:k]:
 fi
 
 if [ -n "$TESTS_PID" ]; then say "waiting for the workspace tests"; wait "$TESTS_PID" || true; fi
+[ "$DRY_RUN" = 0 ] || echo "dry_run_finished=1" >> "$OUT/qualify.env"
 echo "finished=$(date -u +%FT%TZ)" >> "$OUT/qualify.env"
 echo
 echo "── results ($RESULTS) ──"
@@ -632,6 +747,11 @@ column -t -s $'\t' "$RESULTS" 2>/dev/null || cat "$RESULTS"
 if awk -F'\t' '$2=="FAIL"{bad=1} END{exit bad?0:1}' "$RESULTS"; then
   echo "VERDICT: FAIL - do not sign $COMMIT"
   exit 1
+fi
+if [ "$DRY_RUN" = 1 ]; then
+  echo
+  echo "VERDICT: DRY-RUN - arguments, commits, source index, gates and forced patches checked; nothing was built, tested or replayed. Not a qualification of $COMMIT."
+  exit 0
 fi
 if [ "$FORCED_ONLY" = 1 ]; then
   echo
