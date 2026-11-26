@@ -97,7 +97,9 @@ ARMED_CONSTANTS: list[tuple[str, str, str, str]] = [
 # (file, name, rust type, value that must be present exactly once, unchanged).
 PINNED_CONSTANTS: list[tuple[str, str, str, str]] = [
     (PARAMS, "DEPOSIT_ACTIVATION_EPOCH", "u64", "u64::MAX"),
-    (PARAMS, "ANCESTRY_SEED_ACTIVATION_EPOCH", "u64", "u64::MAX"),
+    # Armed at 10010 (docs/FLAG-DAY-E10010.md). A soak devnet never reaches
+    # that epoch, so for the harness the gate is as closed as it was.
+    (PARAMS, "ANCESTRY_SEED_ACTIVATION_EPOCH", "u64", "10_010"),
     (STAKING, "ACTIVATION_DELAY_EPOCHS", "u64", "8"),
 ]
 

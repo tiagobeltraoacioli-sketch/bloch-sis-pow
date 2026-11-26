@@ -17,8 +17,14 @@ is postponed.
 This file is a sibling of `docs/RELANCA-G4-DIAS-DE-BANDEIRA.md`, which is the
 operational runbook for arming `ANCESTRY_SEED_ACTIVATION_EPOCH`. Its §2
 (choosing E\*), §3 (the predicate on every node), §4 (verification after the
-boundary), §5 (disarming) and §6 (the silently parked node) apply here
-unchanged and are not repeated.
+boundary), §5 (disarming) and §6 (the silently parked node) are the method
+followed here and are not repeated. They do not apply word for word: that
+runbook was written for 64 nodes, the binary `bloch-pos-e1400`, ports
+16400 + index and line numbers of `relanca/e1400`; it pairs the seed gate with
+`LEAK_RECOVERY_ACTIVATION_EPOCH`, which was armed separately at 2880; and its
+formula rounds E\* up to the next hundred where this one rounds to the next
+ten. Read its commands as templates and take hosts, ports and the binary name
+from the current fleet.
 
 ---
 
@@ -33,13 +39,34 @@ E*                    = 10010              (rounded up to the next ten)
 epoch_start_utc(E*)   = 1786656679 + 960 x 10010 = 1796266279
                       = 2026-12-03 02:51:19 UTC (2026-12-02 23:51:19 BRT)
 first slot of E*      = 320320
-lead at writing       = 637 epochs (7 d 1 h 52 min)
+lead at writing       = 636.4 epochs (7 d 1 h 42 min)
 ```
 
 The epoch number is binding. Clock times are estimates.
 
-`params::FLAG_DAY_E10010_EPOCH` is the one definition; the three gates below
-are aliases of it.
+`params::FLAG_DAY_E10010` names the epoch. Each of the three gates below
+carries the literal `10_010` in its own declaration (the tools that read
+`params.rs` need a value there), with a compile-time assertion that keeps it
+equal to `FLAG_DAY_E10010`.
+
+### 1.1 The schedule is at the limit of the sibling runbook's own formula
+
+Sibling runbook §2.2 asks for `E* - epoch_at_tag >= 2 x (R + S + D)`, with
+S = 90 (the soak) and D = 180 (the 48 hours before E\*), and R the rollout in
+epochs. That is at least 540 + 2R epochs between the tag and E\*:
+
+```
+R = 5   (parallel rollout)      tag no later than epoch 9460 = 2026-11-27 00:11 UTC
+R = 48  (serialized 64 nodes)   tag no later than epoch 9374 = already past at writing
+```
+
+R is not known here. The sibling's replay time (7 min) was measured near epoch
+1006; the chain is about nine times longer now and the local state cache is
+bound to the build digest, so every node replays in full on upgrade. **Measure
+R first. If the tag cannot be cut by the deadline that R gives, postpone
+(§6) rather than compress the soak or the 48 hours.** "Tag" in that formula is
+the moment the armed build is cut for rollout; the public tag of §5 comes
+later, after the predicate.
 
 ## 2. What is armed
 
@@ -73,6 +100,8 @@ late splits the chain (`RELANCA-G4-DIAS-DE-BANDEIRA.md` §3, item 0).
 | --- | --- | --- |
 | Every validator and every observer | Run the armed binary before E\*. | All three rules change which blocks or signatures are valid. A node on the old binary at E\* follows a different chain, and with the seed rule it parks silently (§6 of the sibling runbook). |
 | Operators of validators WITHOUT a registered KES key | Run the armed binary before E\*, or their proposals and votes stop verifying at E\*. | Their static key must sign the bound message from E\*. Registering a KES key before E\* removes the dependency. |
+| Operators of `tools/bloch-indexer` | Rebuild from this tree before E\*. | It replays through the linked transition: a build from this tree is correct across the gate, an older one stops at the first block of epoch 10010. |
+| Users of `tools/participation/participation.py` | Use the version in this tree. | Older copies partition every epoch with the mix of E - 1; from 10010 they would report mass missed duties that did not happen. |
 | Maintainers of every verifier outside this repository that checks validator duty signatures (L2 light-client guests, bridges, indexers that verify) | Carry `kes::static_message` before E\*, or accept that static-key votes stop counting for them at E\*. | `kes::verify_validator` is the one definition inside this repository; anything that re-implements it is not updated by this commit. With at least 90% of stake on KES at the bind, a verifier that drops static-key votes still sees a two-thirds majority, but that is an estimate, not a check: **measure the registered share before the tag.** |
 | Wallets, exchanges, pools | Nothing. | No transaction rule they sign under changes. |
 
@@ -87,10 +116,13 @@ Verified, on `aarch64`, debug builds, 2026-11-25:
   `the_attester_and_the_judge_agree_on_both_sides_of_the_flag_day` grows one
   chain through epoch 6 in that build. The head advances in every epoch, so
   the producer and the real transition agree on the proposer draw under the
-  look-ahead seed, on the network-bound static signature and on the count
-  bound; and at every epoch the seed a validator attests under equals the seed
-  its peers judge it against. That is the agreement the pre-flag-day test says
-  must be re-derived once the gate is armed.
+  look-ahead seed and on the network-bound static signature; and at every
+  epoch, once that epoch is fully produced, the seed a validator attests under
+  equals the seed its peers judge it against, in that one engine and on its
+  own branch. That is the agreement the pre-flag-day test says must be
+  re-derived once the gate is armed. It says nothing about the count bound
+  (the test's mempool is empty, so 4,096 is never approached), about a second
+  node, or about the moment a head is still in the previous epoch.
 - The whole `bloch-pos-node` suite was also run in that build. It passes
   except `ws_boot::tests::the_compiled_anchor_is_the_hashed_file_and_names_mainnet`,
   which fails by design there: gates at epoch 2 sit below the release anchor
@@ -128,8 +160,11 @@ NOT verified, and required by the sibling runbook before the tag:
 2. Run the devnet rehearsal with control (§4 item 1) on the armed branch.
 3. Build the armed release. Distribute it. Bring it up on the fleet.
 4. Check the predicate (§4 item 2) no later than E\* - 180 (2026-12-01
-   02:51 UTC).
-5. Only then publish the tag, with §7 filled in.
+   02:51 UTC). Its 90-epoch soak has to end by then, so the fleet must be on
+   the armed binary by E\* - 270 (2026-11-30 02:51 UTC).
+5. Only then publish the public tag, with §7 filled in. The lead the formula
+   of §1.1 constrains is the earlier moment the armed build was cut, not this
+   one.
 6. After E\*: the checks of the sibling runbook §4, from the first boundary at
    or past E\*.
 
@@ -140,13 +175,24 @@ of stake; otherwise postpone.
 
 ## 6. Postponing, and why there is no rollback
 
-Postponing is one edit: change `FLAG_DAY_E10010_EPOCH` (or set the three
-aliases back to `u64::MAX`), update the three tripwires
-(`the_replay_compatibility_gates_are_inert_until_armed`,
-`staking_tx_metering_gate_is_inert`,
-`static_key_network_binding_gate_is_inert`) and the assertion in
-`hard_forks::tests::a_gate_armed_into_anchored_history_is_refused`, in the same
-commit, and roll that binary before E\*. A postponed epoch must again be
+Postponing is one commit, not one line. The epoch is written in:
+
+- `params.rs`: `FLAG_DAY_E10010` and the literal in each of the three gate
+  declarations (the compile-time assertions fail if they disagree);
+- the tripwires `the_replay_compatibility_gates_are_inert_until_armed`,
+  `staking_tx_metering_gate_is_inert`,
+  `static_key_network_binding_gate_is_inert` (`kes.rs`), and the neighbouring
+  boundary tests in `transition.rs` that use 10_007 to 10_011;
+- `hard_forks::tests::a_gate_armed_into_anchored_history_is_refused`;
+- the node tests `a_replay_failure_names_a_gate_armed_at_or_below_the_failing_epoch`
+  and `the_block_admission_authority_is_the_static_key_hash_while_unarmed`;
+- `scripts/lifecycle_devnet_soak_lib.py` (the pinned value) and
+  `tools/participation/participation.py` (`ANCESTRY_SEED_ACTIVATION_EPOCH`);
+- prose in `schedule.rs`, `params.rs`, `docs/VALIDATOR-OPENING.md` and this
+  file.
+
+`grep -rn "10_010\|10010\|10_009\|10_008"` finds them. Roll that binary
+before E\*. A postponed epoch must again be
 strictly in the future and after the rollout.
 
 Once one block exists at or past E\*, the fold that produced it is consensus
@@ -163,10 +209,11 @@ in the commit that re-bakes the anchor above them.
 
 | field | value |
 | --- | --- |
-| `FLAG_DAY_E10010_EPOCH` | 10010 |
+| `FLAG_DAY_E10010` | 10010 |
 | `utc(E*)` | 2026-12-03 02:51:19 UTC |
-| wall epoch at the instant of `git tag` | |
-| `E* - epoch_at_tag` (at least `2 x (R + S + D)`, sibling runbook §2.2) | |
+| epoch at which the armed build was cut for rollout | |
+| `E* - that epoch` (at least `2 x (R + S + D)`, §1.1) | |
+| wall epoch at the instant of the public `git tag` | |
 | `t_replay` re-measured, host and date | |
 | registered KES share of effective stake, epoch and source | |
 | external verifiers confirmed to carry `kes::static_message` | |

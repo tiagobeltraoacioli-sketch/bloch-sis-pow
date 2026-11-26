@@ -575,6 +575,14 @@ fn main() {
     if std::env::var_os("CARGO_FEATURE_MLDSA_PIN_REPLAY_QUALIFICATION").is_some() {
         devnet.push_str("+mldsa-pin-replay-qualification");
     }
+    // Audit of 2026-11-26: the qualification build that moves the three gates
+    // of the epoch-10010 flag day to epoch 2 names itself, like the switches
+    // above. Enable it through THIS crate's feature
+    // (`--features flag-day-e10010-rehearsal`): the crate-qualified form
+    // (`bloch-pos-committee/...`) never reaches this build script.
+    if std::env::var_os("CARGO_FEATURE_FLAG_DAY_E10010_REHEARSAL").is_some() {
+        devnet.push_str("+flag-day-e10010-rehearsal");
+    }
     println!("cargo:rerun-if-env-changed=BLOCH_DEVNET_FINALIZED_CLAIMS_FROM_HEIGHT");
     if let Some(height) = std::env::var_os("BLOCH_DEVNET_FINALIZED_CLAIMS_FROM_HEIGHT") {
         let height = height.to_string_lossy();

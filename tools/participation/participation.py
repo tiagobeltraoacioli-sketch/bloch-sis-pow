@@ -26,8 +26,9 @@ Consensus rules mirrored here (bloch-pos-committee, release in force):
 
 * committee partition: ``committees::epoch_committees`` (SHAKE256 Fisher-Yates
   over the sorted active index set, role 0x03), seeded by the boundary mix at
-  the close of epoch E-1 (``seed_for_epoch``; the ancestry-seed gate is not
-  active, so look-ahead is 0);
+  the close of epoch E-1 below the ancestry-seed gate and of epoch E-2 from
+  it (``seed_for_epoch``; ``ANCESTRY_SEED_ACTIVATION_EPOCH`` is 10010,
+  docs/FLAG-DAY-E10010.md);
 * proposer: ``schedule::proposer`` is a stake-weighted draw ``v mod total``
   over the leak-adjusted roster of that epoch. Any change in total stake
   reshuffles every draw, and per-epoch historical stakes are not queryable,
@@ -350,6 +351,15 @@ def boundary_mixes(blocks_by_slot: Dict[int, Block], epochs: Iterable[int]) -> D
     return out
 
 
+# The seed look-ahead gate (bloch-pos-committee `ANCESTRY_SEED_ACTIVATION_EPOCH`).
+ANCESTRY_SEED_ACTIVATION_EPOCH = 10_010
+
+
+def seed_boundary(epoch: int) -> int:
+    """The epoch whose closing mix seeds ``epoch``: E-1 below the gate, E-2 from it."""
+    return epoch - 2 if epoch >= ANCESTRY_SEED_ACTIVATION_EPOCH else epoch - 1
+
+
 def analyse(
     epochs: Sequence[int],
     canonical: Dict[int, Optional[str]],
@@ -362,7 +372,7 @@ def analyse(
     own_set = set(own)
     stakes = {i: v.stake for i, v in validators.items() if v.stake > 0 and not v.slashed}
     total_stake = sum(stakes.values())
-    mixes = boundary_mixes(blocks, [e - 1 for e in epochs] + list(epochs))
+    mixes = boundary_mixes(blocks, [seed_boundary(e) for e in epochs] + [e - 1 for e in epochs] + list(epochs))
 
     per = {i: defaultdict(int) for i in own}
     dist = {i: [] for i in own}
@@ -371,7 +381,7 @@ def analyse(
     lost_sat = defaultdict(int)
 
     for e in epochs:
-        seed = mixes.get(e - 1)
+        seed = mixes.get(seed_boundary(e))
         if seed is None:
             check["epochs_without_seed"] += 1
             continue

@@ -1264,10 +1264,16 @@ pub mod rehearsal {
 /// [`STAKING_TX_METERING_ACTIVATION_EPOCH`] and
 /// [`STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH`]. Runbook and tag-time
 /// checklist: docs/FLAG-DAY-E10010.md.
-pub const FLAG_DAY_E10010_EPOCH: u64 = 10_010;
+///
+/// The three gates carry the literal themselves, one declaration each, so the
+/// tools that read `params.rs` (`scripts/hf-release/hf-gates.py`, the indexer's
+/// gate list, `scripts/lifecycle_devnet_soak_lib.py`) see a value; a
+/// compile-time assertion beside each keeps it equal to this one. This name
+/// does not end in `_EPOCH` on purpose: it is not a fourth gate.
+pub const FLAG_DAY_E10010: u64 = 10_010;
 /// Where the `flag-day-e10010-rehearsal` qualification build puts the same
 /// three gates: the third epoch of a chain started at genesis.
-pub const FLAG_DAY_E10010_REHEARSAL_EPOCH: u64 = 2;
+pub const FLAG_DAY_E10010_REHEARSAL: u64 = 2;
 
 /// Flag day for the **seed look-ahead** (`CommittedState::seed_for_epoch`).
 ///
@@ -1300,21 +1306,25 @@ pub const FLAG_DAY_E10010_REHEARSAL_EPOCH: u64 = 2;
 /// common ground. Without this gate the new binary stops near the start of the
 /// chain.
 ///
-/// `u64::MAX` means INERT. Fill at tag time, and it must be **strictly in the
+/// A `u64::MAX` here WOULD mean inert. An armed value must be **strictly in the
 /// future** and **after the rollout completes** — arming an epoch already in the
 /// past is the failure mode that let 1,600,000 BLCH escape a write-off that
 /// never fired, and it fails SILENTLY. The gate reads the epoch derived from the
 /// BLOCK, never a local clock: reading node-local mutable state is what caused
 /// the 2026-08-08 `expected_bits` consensus split.
 ///
-/// ARMED at 10010 ([`FLAG_DAY_E10010_EPOCH`], owner decision 2026-11-25,
+/// ARMED at 10010 ([`FLAG_DAY_E10010`], owner decision 2026-11-25,
 /// docs/FLAG-DAY-E10010.md). `the_replay_compatibility_gates_are_inert_until_armed`
 /// pins the value.
 #[cfg(not(feature = "flag-day-e10010-rehearsal"))]
-pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = FLAG_DAY_E10010_EPOCH;
+pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = 10_010;
 /// QUALIFICATION BUILD (`flag-day-e10010-rehearsal`): armed at epoch 2.
 #[cfg(feature = "flag-day-e10010-rehearsal")]
-pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = FLAG_DAY_E10010_REHEARSAL_EPOCH;
+pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = FLAG_DAY_E10010_REHEARSAL;
+const _: () = assert!(
+    ANCESTRY_SEED_ACTIVATION_EPOCH == FLAG_DAY_E10010 || cfg!(feature = "flag-day-e10010-rehearsal"),
+    "ANCESTRY_SEED_ACTIVATION_EPOCH must equal FLAG_DAY_E10010 in a shipped build"
+);
 
 /// Flag day for **inactivity-leak recovery and the quorum-denominator floor**
 /// ([`INACTIVITY_LEAK_RECOVERY_QUOTIENT`], [`MIN_QUORUM_DENOMINATOR_NUM`]).
@@ -2113,14 +2123,18 @@ pub const FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS: u64 = SLOTS_PER_EPOCH;
 /// the old rules accepted may now hit `BlockGasLimitExceeded` or
 /// `BlockByteLimitExceeded` on staking bytes alone) on a body the old rules
 /// accept, so the whole fleet must run a binary carrying this rule before
-/// any epoch is named. ARMED at 10010 ([`FLAG_DAY_E10010_EPOCH`], owner
+/// any epoch is named. ARMED at 10010 ([`FLAG_DAY_E10010`], owner
 /// decision 2026-11-25, docs/FLAG-DAY-E10010.md; it shipped inert at
 /// `u64::MAX`); `staking_tx_metering_gate_is_inert` pins the armed value.
 #[cfg(not(feature = "flag-day-e10010-rehearsal"))]
-pub const STAKING_TX_METERING_ACTIVATION_EPOCH: u64 = FLAG_DAY_E10010_EPOCH;
+pub const STAKING_TX_METERING_ACTIVATION_EPOCH: u64 = 10_010;
 /// QUALIFICATION BUILD (`flag-day-e10010-rehearsal`): armed at epoch 2.
 #[cfg(feature = "flag-day-e10010-rehearsal")]
-pub const STAKING_TX_METERING_ACTIVATION_EPOCH: u64 = FLAG_DAY_E10010_REHEARSAL_EPOCH;
+pub const STAKING_TX_METERING_ACTIVATION_EPOCH: u64 = FLAG_DAY_E10010_REHEARSAL;
+const _: () = assert!(
+    STAKING_TX_METERING_ACTIVATION_EPOCH == FLAG_DAY_E10010 || cfg!(feature = "flag-day-e10010-rehearsal"),
+    "STAKING_TX_METERING_ACTIVATION_EPOCH must equal FLAG_DAY_E10010 in a shipped build"
+);
 
 /// HF3 flag day for the optional signature suite 0x0003
 /// (SLH-DSA-SHAKE-128s ‖ Falcon-1024; suite 0x0001 stays the default). In
@@ -2451,14 +2465,18 @@ pub fn sig_canonical_active(epoch: u64) -> bool {
 /// epoch onward, so the whole fleet must run a binary that carries this rule
 /// first. Any verifier outside this repository that checks static-key duty
 /// signatures (light-client guests, bridges) must carry it too. Wallets and
-/// exchanges are not affected. ARMED at 10010 ([`FLAG_DAY_E10010_EPOCH`],
+/// exchanges are not affected. ARMED at 10010 ([`FLAG_DAY_E10010`],
 /// owner decision 2026-11-25, docs/FLAG-DAY-E10010.md);
 /// `static_key_network_binding_gate_is_inert` pins the armed value.
 #[cfg(not(feature = "flag-day-e10010-rehearsal"))]
-pub const STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = FLAG_DAY_E10010_EPOCH;
+pub const STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = 10_010;
 /// QUALIFICATION BUILD (`flag-day-e10010-rehearsal`): armed at epoch 2.
 #[cfg(feature = "flag-day-e10010-rehearsal")]
-pub const STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = FLAG_DAY_E10010_REHEARSAL_EPOCH;
+pub const STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = FLAG_DAY_E10010_REHEARSAL;
+const _: () = assert!(
+    STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH == FLAG_DAY_E10010 || cfg!(feature = "flag-day-e10010-rehearsal"),
+    "STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH must equal FLAG_DAY_E10010 in a shipped build"
+);
 
 #[cfg(test)]
 thread_local! {

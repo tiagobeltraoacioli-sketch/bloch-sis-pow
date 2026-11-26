@@ -2687,13 +2687,14 @@ impl CommittedState {
     ///
     /// `back = 1 + `[`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`] **only at
     /// and above [`crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH`]**, which is
-    /// `u64::MAX`. Below it — that is, for every epoch any chain can reach —
-    /// this function computes `back = 1`, the original pre-F6 rule, exactly as
-    /// the `GATED.` note in the body says. Until 2026-09-02 this doc said the
+    /// armed at 10010 (docs/FLAG-DAY-E10010.md). Below it — every epoch the
+    /// chain had reached when it was armed — this function computes
+    /// `back = 1`, the original pre-F6 rule, exactly as the `GATED.` note in
+    /// the body says. Until 2026-09-02 this doc said the
     /// look-ahead was unconditional and pointed at the constant as removed. It
     /// was deleted on 2026-08-24 and restored; see its doc block for why the
-    /// coordinated-relaunch premise was wrong. **F6 is not closed in the
-    /// shipped binary**; arming that constant is what closes it.
+    /// coordinated-relaunch premise was wrong. F6 is closed from the armed
+    /// epoch on, and open below it.
     ///
     /// `back = 2` is what closes finding F6: at `back = 1` the seed for epoch
     /// `E` is the mix at the close of `E − 1`, so the trailing proposers of
