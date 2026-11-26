@@ -561,8 +561,16 @@ fn prompt_new_password() -> zeroize::Zeroizing<String> {
 fn rpc_authority_is_loopback(authority: &str) -> bool {
     let host = if let Some(rest) = authority.strip_prefix('[') {
         match rest.split_once(']') {
-            Some((host, _)) => host,
-            None => return false,
+            // Only `[v6]` or `[v6]:port`. Anything else after the bracket
+            // (`[::1].evil.example:80`) is a hostname the resolver would look
+            // up, not this machine (audit of 2026-11-26).
+            Some((host, after))
+                if after.is_empty()
+                    || after.strip_prefix(':').is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())) =>
+            {
+                host
+            }
+            _ => return false,
         }
     } else {
         match authority.rsplit_once(':') {
@@ -640,6 +648,7 @@ mod audit_cli_input_tests {
         for remote in [
             "10.0.0.5:16210", "node.example:16210", "0.0.0.0:16210", "[2001:db8::1]:16210",
             "localhost.example:16210", "127.0.0.1.example:16210", "[::1", "",
+            "[::1].evil.example:80", "[::1]evil", "[::1]:", "[::1]:80x", "[::1]:80:90",
         ] {
             assert!(!rpc_authority_is_loopback(remote), "{remote}");
         }

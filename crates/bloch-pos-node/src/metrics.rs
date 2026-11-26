@@ -322,8 +322,9 @@ pub struct NodeMetrics {
     /// Own blocks the real transition refused after they were built and
     /// signed: the slot is lost, the block is never broadcast.
     pub own_blocks_refused_total: AtomicU64,
-    /// Proposals whose build ran past its time budget and was cut short
-    /// (the block went out with what had been validated by then).
+    /// Proposals whose build ran past its time budget and was cut short:
+    /// the transactions still unproven at that point were left out of the
+    /// block (they stay pending).
     pub proposal_build_deadline_total: AtomicU64,
 }
 
@@ -874,9 +875,10 @@ pub fn serve(bind_addr: &str, port: u16, metrics: &'static NodeMetrics) -> std::
     serve_with_token(bind_addr, port, metrics, token)
 }
 
-/// Path of a file holding the bearer token both endpoints then require
+/// Path of a file holding the bearer token `/metrics` then requires
 /// (`--metrics-token-file`): `Authorization: Bearer <token>`, which is what a
 /// Prometheus `bearer_token_file` / `authorization.credentials_file` sends.
+/// `/health` stays open: it is the liveness probe (see `serve_connection`).
 /// Unset means no token, which is the default. Like the RPC API key this is
 /// authentication, not encryption: the listener is plain HTTP.
 pub(crate) const METRICS_TOKEN_FILE_ENV: &str = "BLOCH_METRICS_TOKEN_FILE";
@@ -887,8 +889,7 @@ pub(crate) fn bearer_token_from_env() -> Result<Option<[u8; 32]>, String> {
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(format!("{METRICS_TOKEN_FILE_ENV} is not valid UTF-8")),
         Ok(path) => {
-            let text = std::fs::read_to_string(&path)
-                .map_err(|e| format!("cannot read the metrics token file `{path}`: {e}"))?;
+            let text = crate::rpc::read_secret_file(&path, "metrics token")?;
             let token = crate::rpc::Access::parse_api_key(&text)
                 .map_err(|why| why.replace("RPC API key", "metrics token"))?;
             Ok(Some(crate::rpc::Access::key_digest(token)))
@@ -1038,15 +1039,21 @@ fn serve_connection(sock: &mut TcpStream, metrics: &NodeMetrics, hosts: &Metrics
         );
         return;
     }
-    if let Some(expected) = &hosts.token {
+    // Route on the path WITHOUT any query string.
+    let path = path.split('?').next().unwrap_or("");
+    // The token guards the metrics, not the liveness probe. `/health` is what
+    // the shipped watchdog (`os/health-watchdog.nix`) and systemd-style probes
+    // poll with a bare `curl -f`: behind the token every poll would read 401,
+    // and the watchdog would restart a healthy validator every ten minutes
+    // (audit of 2026-11-26). It answers one word and a status code.
+    let is_health = matches!(path, "/health" | "/health/");
+    if let Some(expected) = hosts.token.as_ref().filter(|_| !is_health) {
         let presented = bearer_credential(&head);
         if !presented.is_some_and(|credential| crate::rpc::Access::digest_matches(expected, credential)) {
             let _ = respond(sock, 401, "text/plain", "a valid Authorization: Bearer token is required");
             return;
         }
     }
-    // Route on the path WITHOUT any query string.
-    let path = path.split('?').next().unwrap_or("");
     match path {
         "/health" | "/health/" => {
             let (status, body) = metrics.health(now_unix());
@@ -1090,11 +1097,13 @@ fn respond(sock: &mut TcpStream, status: u16, ctype: &str, body: &str) -> std::i
 
 #[cfg(test)]
 mod tests {
-    /// P5: with a token configured, both endpoints answer 401 unless the
-    /// request carries exactly that bearer credential; without one, nothing
+    /// P5: with a token configured, `/metrics` answers 401 unless the request
+    /// carries exactly that bearer credential; `/health` stays open, because
+    /// the watchdog and liveness probes poll it with a bare `curl -f` and a
+    /// 401 there restarts a healthy validator; without a token nothing
     /// changes.
     #[test]
-    fn bearer_token_guards_both_endpoints() {
+    fn bearer_token_guards_metrics_and_leaves_health_open() {
         use std::io::{Read as _, Write as _};
         static TOKEN_TEST_METRICS: super::NodeMetrics = super::NodeMetrics::new();
         const TOKEN: &str = "0123456789abcdef0123456789abcdef";
@@ -1109,7 +1118,14 @@ mod tests {
             resp.split(' ').nth(1).and_then(|s| s.parse().ok()).expect("status line")
         };
         let good = format!("Authorization: Bearer {TOKEN}\r\n");
-        for path in ["/metrics", "/health"] {
+        for path in ["/health", "/health/", "/health?x=1"] {
+            // No credential, a wrong one, the right one: never 401.
+            for headers in ["", "Authorization: Bearer wrong\r\n", good.as_str()] {
+                assert_ne!(status(guarded, path, headers), 401, "{path} with {headers:?}");
+            }
+            assert_eq!(status(guarded, path, ""), status(open, path, ""), "{path}: the token changes nothing");
+        }
+        for path in ["/metrics", "/metrics/", "/", "/metrics?x=1", "/nothing-here"] {
             for bad in [
                 String::new(),
                 "Authorization: Bearer wrong\r\n".to_string(),

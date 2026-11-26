@@ -2643,8 +2643,10 @@ fn the_request_head_reports_forwarding_headers() {
         let hosts = HostPolicy::with_extra("127.0.0.1", None);
         let mut seen = None;
         let deadline = Instant::now() + Duration::from_secs(5);
-        let out = read_request_attributed(&mut sock, &hosts, deadline, &mut |_, relayed, _| {
-            seen = Some(relayed);
+        let out = read_request_attributed(&mut sock, &hosts, deadline, &mut |head| {
+            if let Head::Parsed { relay_header, .. } = head {
+                seen = Some(relay_header);
+            }
             Ok(())
         });
         drop(writer.join());
@@ -2786,8 +2788,10 @@ fn access_read_only_refuses_sendrawtransaction_only() {
         let body = reply.split_once("\r\n\r\n").expect("a body").1;
         assert_eq!(error_code(&parse_json(body).unwrap()), Some(WRITES_DISABLED), "{reply}");
     }
+    assert!(spy.last().is_none(), "a refused write reached the backend: {:?}", spy.last().is_some());
     let reply = post(addr, &request("getchaininfo", "[]"));
     assert!(reply.starts_with("HTTP/1.1 200 OK") && !reply.contains("\"error\""), "{reply}");
+    assert!(matches!(spy.last(), Some(RpcRequest::ChainInfo)), "the read reached the backend");
     // The in-process dispatcher has no listener policy and is unchanged.
     let direct = call(spy.as_ref(), &request("sendrawtransaction", r#"["00"]"#));
     assert_ne!(error_code(&direct), Some(WRITES_DISABLED));
@@ -2848,6 +2852,27 @@ fn access_rate_limit_bucket_arithmetic() {
     let later = start + Duration::from_millis(200);
     assert!(limit.take(a, later));
     assert!(!limit.take(a, later));
+
+    // Audit of 2026-11-26: a client faster than one request per millisecond
+    // is credited for the time between its requests. At 5000/s, a steady
+    // 2000/s stream (0.5 ms apart) is under the limit and is never refused,
+    // however long it runs; at 10000/s offered it settles at the limit.
+    let fast = RateLimit::new(5_000);
+    let c: IpAddr = "192.0.2.3".parse().unwrap();
+    for i in 0..40_000u64 {
+        assert!(fast.take(c, start + Duration::from_micros(i * 500)), "request {i} of a 2000/s stream");
+    }
+    let flood = RateLimit::new(5_000);
+    let d: IpAddr = "192.0.2.4".parse().unwrap();
+    let served = (0..100_000u64).filter(|i| flood.take(d, start + Duration::from_micros(i * 100))).count();
+    // 10 s at 5000/s plus the 10000 burst, give or take one.
+    assert!((59_999..=60_001).contains(&served), "{served}");
+    // A refusal does not push recovery away: after the flood, one idle
+    // millisecond buys the five requests it is worth (plus at most the
+    // fraction the flood's last refusal left in the bucket), not zero.
+    let after = start + Duration::from_micros(99_999 * 100 + 1_000);
+    let recovered = (0..10).filter(|_| flood.take(d, after)).count();
+    assert!((5..=6).contains(&recovered), "{recovered}");
     // A long idle period refills to the burst and no further.
     let much_later = start + Duration::from_secs(3_600);
     for _ in 0..10 {
@@ -2871,18 +2896,53 @@ fn access_rate_limit_bucket_arithmetic() {
     assert!(full.take(newcomer, start + Duration::from_secs(10)), "refilled sources are forgotten");
 }
 
-/// End to end: past the burst the listener answers 429, and a wrong key is
-/// metered too (the rate is charged before the key is judged).
+/// End to end: past the burst the listener answers 429. A request without
+/// the key, or one the browser gate refuses, spends nothing from the bucket,
+/// so it cannot lock out the keyed client it shares a source with.
 #[test]
-fn access_rate_limit_answers_429() {
+fn access_rate_limit_answers_429_and_only_served_requests_spend() {
     let spy = Spy::new();
     let addr = serve_with(
         "127.0.0.1", 0, spy.clone(), TrustedProxies::default(), access_with(false, Some(TEST_API_KEY), Some(1)),
     ).unwrap();
-    let first = http(addr, &keyed_post("getchaininfo", &["wrong"]));
-    assert!(first.starts_with("HTTP/1.1 401 Unauthorized\r\n"), "{first}");
-    let second = http(addr, &keyed_post("getchaininfo", &[TEST_API_KEY]));
-    assert!(second.starts_with("HTTP/1.1 200 OK"), "{second}");
-    let third = http(addr, &keyed_post("getchaininfo", &[TEST_API_KEY]));
-    assert!(third.starts_with("HTTP/1.1 429 Too Many Requests\r\n"), "{third}");
+    // Burst is 2 at 1/s. Twenty refused requests first: none may spend.
+    for _ in 0..10 {
+        let keyless = http(addr, &keyed_post("getchaininfo", &["wrong"]));
+        assert!(keyless.starts_with("HTTP/1.1 401 Unauthorized\r\n"), "{keyless}");
+        let body = request("getchaininfo", "[]");
+        let browser = http(addr, &format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nOrigin: http://evil.example\r\nContent-Type: application/json\r\n\
+             X-API-Key: {TEST_API_KEY}\r\nContent-Length: {}\r\n\r\n{body}", body.len()));
+        assert!(browser.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{browser}");
+    }
+    let replies: Vec<String> = (0..6).map(|_| http(addr, &keyed_post("getchaininfo", &[TEST_API_KEY]))).collect();
+    let served = replies.iter().filter(|r| r.starts_with("HTTP/1.1 200 OK")).count();
+    let limited = replies.iter().filter(|r| r.starts_with("HTTP/1.1 429 Too Many Requests\r\n")).count();
+    assert_eq!(served + limited, 6, "{replies:?}");
+    // The burst of two is served whatever the machine's load; the refusals
+    // above took nothing from it. A slow run may refill one or two more.
+    assert!(served >= 2 && limited >= 1, "served {served}, limited {limited}");
+}
+
+/// A credential file that group or others can read is refused; an owner-only
+/// one is read.
+#[cfg(unix)]
+#[test]
+fn access_secret_files_must_be_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::temp_dir().join(format!("rpc-key-{}-{:?}", std::process::id(), std::thread::current().id()));
+    std::fs::write(&path, format!("{TEST_API_KEY}\n")).unwrap();
+    let name = path.to_str().unwrap();
+    for open in [0o644, 0o640, 0o604, 0o660] {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(open)).unwrap();
+        let refusal = read_secret_file(name, "RPC API key").unwrap_err();
+        assert!(refusal.contains("readable by group or others"), "{open:o}: {refusal}");
+        assert!(!refusal.contains(TEST_API_KEY), "the refusal must not echo the key");
+    }
+    for owner_only in [0o600, 0o400] {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(owner_only)).unwrap();
+        assert_eq!(read_secret_file(name, "RPC API key").unwrap().trim(), TEST_API_KEY);
+    }
+    std::fs::remove_file(&path).unwrap();
+    assert!(read_secret_file(name, "RPC API key").unwrap_err().contains("cannot read"));
 }

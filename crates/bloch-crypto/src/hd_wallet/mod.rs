@@ -317,6 +317,10 @@ impl HdWallet {
                 // so a mismatched pair is reported here, before the check below.
                 if e == Keypair::SIGNATURE_WITHHELD {
                     "imported keypair private/public keys do not match".to_string()
+                } else if e.starts_with("refusing to sign") {
+                    // Not the key's fault: this build or scope does not sign
+                    // at all (unvetted platform, seeded scope). Say so.
+                    e
                 } else {
                     "imported keypair private key is invalid".to_string()
                 }

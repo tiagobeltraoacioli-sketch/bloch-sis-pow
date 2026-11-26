@@ -3176,10 +3176,13 @@ const PROPOSAL_RESELECTIONS_MAX: usize = 4;
 /// B3). Every refused transaction costs a full probe transition on the
 /// consensus thread, and the count bounds above still allow a few hundred of
 /// them, which an adversarial mempool can turn into more than a slot. Past
-/// this budget the remaining transactions are left out of THIS block (they
-/// stay pending, none is barred for it) and the block is built with the votes
-/// alone. A third of the slot: enough for every honest case observed, and it
-/// leaves the block time to propagate and be attested.
+/// this budget the build stops paying one probe per refusal: the selection as
+/// it stands gets ONE more probe, so a list the last removal already made
+/// valid still goes out whole, and only if that probe is refused too are the
+/// remaining transactions left out of THIS block (they stay pending, none is
+/// barred for it) or, for a refused vote, the votes. A third of the slot:
+/// enough for every honest case observed, and it leaves the block time to
+/// propagate and be attested.
 const PROPOSAL_BUILD_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(bloch_pos_committee::params::SLOT_DURATION_SECS / 3);
 
@@ -4541,16 +4544,19 @@ impl Engine {
             // B3: the retries below are bounded by count, not by time. Once
             // the budget is gone, stop paying one probe per refused
             // transaction: leave the rest of the selection out of this block.
-            if !budget_spent && !txs.is_empty() && proposal_budget_spent(build_started, std::time::Instant::now()) {
+            // The list is NOT emptied here: the removal that brought the loop
+            // back may already have made it valid, and throwing away a block
+            // of honest transactions for being late would be worse than the
+            // lateness (audit of 2026-11-26). It gets this one probe; the
+            // refusal arms below do the cutting.
+            if !budget_spent && proposal_budget_spent(build_started, std::time::Instant::now()) {
                 budget_spent = true;
                 crate::metrics::NodeMetrics::inc(&crate::metrics::NODE.proposal_build_deadline_total);
                 eprintln!(
-                    "[slot {slot}] building this proposal has taken more than {}s; proposing \
-                     without its {} remaining transaction(s), which stay pending",
+                    "[slot {slot}] building this proposal has taken more than {}s; one more refusal \
+                     and it goes out without what is still unproven",
                     PROPOSAL_BUILD_BUDGET.as_secs(),
-                    txs.len(),
                 );
-                txs.clear();
             }
             let tx_bytes: Vec<Vec<u8>> = txs.iter().map(PosTransaction::canonical_bytes).collect();
             header.body_root = derive::body_root(&tx_bytes);
@@ -4570,7 +4576,10 @@ impl Engine {
                 // than not at all.
                 Err(TransitionError::Attestation(i)) if (i as usize) < atts.len() => {
                     vote_retries = vote_retries.saturating_add(1);
-                    if vote_retries > PROPOSAL_VOTE_RETRY_MAX {
+                    if budget_spent {
+                        eprintln!("[slot {slot}] out of build time and a pooled vote is still refused; proposing without votes");
+                        atts.clear();
+                    } else if vote_retries > PROPOSAL_VOTE_RETRY_MAX {
                         eprintln!("[slot {slot}] the transition keeps refusing pooled votes; proposing without votes");
                         atts.clear();
                     } else {
@@ -4579,6 +4588,17 @@ impl Engine {
                         self.evict_pool_vote(&(bad.validator, bad.data.signing_root()));
                     }
                     header.attestation_root = derive::attestation_root(&atts);
+                }
+                // Out of build time and the list is still refused: stop
+                // removing one transaction per probe and leave the rest out.
+                // Nothing is evicted or barred for it; they stay pending.
+                Err(_) if budget_spent && !txs.is_empty() => {
+                    eprintln!(
+                        "[slot {slot}] out of build time; proposing without the {} transaction(s) still \
+                         unproven, which stay pending",
+                        txs.len(),
+                    );
+                    txs.clear();
                 }
                 Err(err) => {
                     let indexed = culprit_index(&err, txs.len()).is_some();
