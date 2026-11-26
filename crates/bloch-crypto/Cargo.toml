@@ -33,6 +33,15 @@ node = ["dep:reqwest", "dep:async-trait"]
 # tokio / rocksdb / libp2p anywhere in its tree. Off by default; combine with
 # `node` only if WalletClient is wanted.
 wallet-cli = ["dep:clap", "dep:rpassword"]
+# Review F2. The integer-only Falcon signer's constant-time argument has been
+# reviewed on x86_64 and aarch64 only (`crypto::hardening::VETTED_SIGNING_ARCHES`).
+# On every other target (wasm32, armv7, riscv, ...) the wallet's signing entry
+# points REFUSE unless this feature is enabled. Enabling it is the build's
+# recorded decision to sign on a platform whose timing behaviour nobody has
+# reviewed; it changes nothing on a vetted target. The node has the same rule
+# with an environment override; a library cannot read one on wasm, hence a
+# feature.
+allow-unvetted-signing-arch = []
 # `mainnet` is an EMPTY marker feature (like `wallet-cli`) with NO deps. It exists
 # only so the release CI guard `mainnet_release_guard::canonical_k_activation_height_is_set_for_mainnet`
 # (core/mod.rs) compiles and runs. Ordinary `--features node` builds do NOT enable

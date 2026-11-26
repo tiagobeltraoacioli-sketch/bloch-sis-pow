@@ -762,6 +762,31 @@ impl Drop for BorrowedKeystorePayload<'_> {
     }
 }
 
+/// Whether this build may sign on the platform it was compiled for (review
+/// F2): `Ok` on an architecture where the Falcon signer's constant-time
+/// argument has been reviewed, or on any other when the build opted in with
+/// the `allow-unvetted-signing-arch` feature; otherwise the reason.
+///
+/// A wallet UI can call this once at start-up to tell the user, instead of
+/// learning it from the first failed signature.
+pub fn signing_platform_status() -> Result<(), String> {
+    platform_gate(
+        crypto::hardening::signing_platform_check(),
+        cfg!(feature = "allow-unvetted-signing-arch"),
+    )
+}
+
+fn platform_gate(vetted: Result<(), String>, build_opted_in: bool) -> Result<(), String> {
+    match vetted {
+        Ok(()) => Ok(()),
+        Err(_) if build_opted_in => Ok(()),
+        Err(why) => Err(format!(
+            "refusing to sign: {why}. A build that accepts this enables the bloch-crypto feature \
+             `allow-unvetted-signing-arch`"
+        )),
+    }
+}
+
 /// Wallet signing never runs under a seeded PQClean scope.
 ///
 /// `pqcrypto_internals::with_seeded_rng_scope` exists for key generation. A
@@ -771,6 +796,9 @@ impl Drop for BorrowedKeystorePayload<'_> {
 /// [`crypto::sign`] stays usable under a seed for known-answer tests; the
 /// wallet's own signing entry points, which sign real spends, refuse.
 fn refuse_seeded_signing() -> Result<(), String> {
+    // The platform rule rides on the same door: both are "this wallet must
+    // not produce a signature here", checked before the secret is touched.
+    signing_platform_status()?;
     if pqcrypto_internals::seeded_rng_active() {
         return Err("refusing to sign inside a seeded RNG scope: wallet signatures must use \
                     fresh randomness (the seeded scope is for key generation only)"
@@ -1977,6 +2005,20 @@ mod verify_before_release {
         assert!(refusal.contains("signature withheld"), "{refusal}");
         assert!(mismatched.sign_fitting(msg, max).is_err());
         assert!(mismatched.sign_message(b"hello").is_err());
+    }
+
+    /// F2: a vetted platform signs; an unvetted one signs only when the build
+    /// opted in, and the refusal names the feature. This host is vetted, so
+    /// the wallet's own entry points sign.
+    #[test]
+    fn signing_on_an_unvetted_platform_needs_the_build_to_opt_in() {
+        assert_eq!(platform_gate(Ok(()), false), Ok(()));
+        assert_eq!(platform_gate(Ok(()), true), Ok(()));
+        assert_eq!(platform_gate(Err("unvetted wasm32".into()), true), Ok(()));
+        let refusal = platform_gate(Err("unvetted wasm32".into()), false).unwrap_err();
+        assert!(refusal.contains("unvetted wasm32") && refusal.contains("allow-unvetted-signing-arch"), "{refusal}");
+        assert!(crypto::hardening::VETTED_SIGNING_ARCHES.contains(&crypto::hardening::target_arch()));
+        assert_eq!(signing_platform_status(), Ok(()));
     }
 
     /// F3: the wallet's signing entry points refuse under a seeded scope and
