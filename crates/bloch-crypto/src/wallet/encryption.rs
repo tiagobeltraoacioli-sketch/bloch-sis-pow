@@ -109,6 +109,40 @@ pub struct KdfParams {
     pub p_cost: u32,    // Parallelism. 4 threads
 }
 
+impl KdfParams {
+    /// Lowest Argon2id cost a NEW keyfile may be written with (OWASP's
+    /// minimum Argon2id setting: 19 MiB, 2 passes). Loading is not affected:
+    /// an existing file decrypts with whatever cost it carries.
+    pub const MIN_M_COST_KIB: u32 = 19_456;
+    pub const MIN_T_COST: u32 = 2;
+    pub const MIN_P_COST: u32 = 1;
+
+    /// Refuse parameters below the floor, so a caller of the `*_with_params`
+    /// constructors cannot write a keyfile whose KDF is trivially brute-forced.
+    pub fn check_floor(&self) -> Result<(), WalletError> {
+        if self.m_cost < Self::MIN_M_COST_KIB
+            || self.t_cost < Self::MIN_T_COST
+            || self.p_cost < Self::MIN_P_COST
+        {
+            return Err(WalletError::Parse(format!(
+                "KDF params below the minimum for a new keyfile (m_cost={} KiB, t_cost={}, \
+                 p_cost={}; minimum {} KiB, {}, {})",
+                self.m_cost, self.t_cost, self.p_cost,
+                Self::MIN_M_COST_KIB, Self::MIN_T_COST, Self::MIN_P_COST
+            )));
+        }
+        Ok(())
+    }
+
+    /// The floor as the constructors apply it. This crate's own unit tests
+    /// encrypt with deliberately tiny parameters to stay fast, so the floor is
+    /// not applied there; every other build (including integration tests)
+    /// enforces it.
+    fn check_floor_for_encrypt(&self) -> Result<(), WalletError> {
+        if cfg!(test) { Ok(()) } else { self.check_floor() }
+    }
+}
+
 impl Default for KdfParams {
     fn default() -> Self {
         Self {
@@ -202,6 +236,7 @@ impl EncryptedKeyfile {
         // a BLOCKING check, not a warning — a weak password renders all the
         // Argon2 hardening moot.
         validate_password_strength(password)?;
+        params.check_floor_for_encrypt()?;
 
         // Generate random salt + nonce
         let mut salt = [0u8; 16];
@@ -396,6 +431,7 @@ impl EncryptedKeyfile {
         }
         // Same blocking password policy as v1 (Sprint T.3 / Audit M-5).
         validate_password_strength(password)?;
+        params.check_floor_for_encrypt()?;
 
         let mut salt = [0u8; 16];
         let mut nonce_bytes = [0u8; 12];

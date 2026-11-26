@@ -143,7 +143,7 @@ fn main() {
             let path = std::path::Path::new(params[0]);
             match bloch::wallet::Keypair::load_encrypted(path, &pw) {
                 Ok(kp) => {
-                    let pk = &kp.public_key; let sk = &kp.private_key;
+                    let pk = &kp.public_key; let sk = kp.expose_private_key();
                     let suite = |b: &[u8]| -> String {
                         if b.len() >= 4 && b[0]==0xB1 && b[1]==0x0C {
                             format!("enveloped suite 0x{:04x}", u16::from_le_bytes([b[2],b[3]]))

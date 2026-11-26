@@ -338,11 +338,7 @@ mod tests {
         let (public, secret) =
             bloch_crypto::crypto::generate_keypair_from_seed(&[0x71; 32]).unwrap();
         let raw_public_key = public[4..].to_vec();
-        let key = Keypair {
-            private_key: secret[4..].to_vec(),
-            public_key: raw_public_key.clone(),
-            address: bloch_crypto::crypto::address_from_pubkey(&raw_public_key, false),
-        };
+        let key = Keypair::from_parts(secret[4..].to_vec(), raw_public_key.clone(), bloch_crypto::crypto::address_from_pubkey(&raw_public_key, false));
         let mut p = plan(
             public[4..].to_vec(),
             [2; 32],
@@ -484,11 +480,7 @@ mod tests {
         use bloch_crypto::{crypto, wallet::Keypair};
         let (public, secret) = crypto::generate_keypair();
         let raw = public[4..].to_vec();
-        let key = Keypair {
-            private_key: secret[4..].to_vec(),
-            public_key: raw.clone(),
-            address: crypto::address_from_pubkey(&raw, false),
-        };
+        let key = Keypair::from_parts(secret[4..].to_vec(), raw.clone(), crypto::address_from_pubkey(&raw, false));
         let dir =
             std::env::temp_dir().join(format!("bloch-native-sign-test-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
@@ -550,11 +542,7 @@ mod tests {
             std::env::var("NATIVE_FUNDING_BIN").expect("build CLI and set NATIVE_FUNDING_BIN");
         let (public, secret) = crypto::generate_keypair();
         let raw = public[4..].to_vec();
-        let key = Keypair {
-            private_key: secret[4..].to_vec(),
-            public_key: raw.clone(),
-            address: crypto::address_from_pubkey(&raw, false),
-        };
+        let key = Keypair::from_parts(secret[4..].to_vec(), raw.clone(), crypto::address_from_pubkey(&raw, false));
         let dir =
             std::env::temp_dir().join(format!("bloch-native-cli-test-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();

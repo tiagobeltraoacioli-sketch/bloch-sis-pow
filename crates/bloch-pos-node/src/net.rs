@@ -132,6 +132,8 @@ mod source_budget;
 pub(crate) mod rejection_log;
 pub(crate) use source_budget::Reservation as SourceReservation;
 pub(crate) use source_budget::verification_source_for_ip;
+#[cfg(test)]
+mod announced_frame_tests;
 
 /// What the engine receives from a transport.
 pub enum NetEvent {
@@ -279,6 +281,25 @@ impl Net {
         }
     }
 
+    /// Ask for canonical blocks above `after_slot` (audit L1C-60).
+    ///
+    /// `preferred` names mesh connections, most wanted first, that should be
+    /// asked before the ordinary rotation: the connections that delivered
+    /// the authenticated orphans a rewind is trying to connect, which are
+    /// the peers known to hold that branch. A name that is closed or unknown
+    /// is skipped; the fan-out and lease bounds are unchanged. libp2p keeps
+    /// its own directed-sync peer choice.
+    pub(crate) fn request_blocks(&self, after_slot: u64, preferred: &[u64]) {
+        match self {
+            Net::Devnet(m) => m.request_blocks(after_slot, preferred),
+            Net::Libp2p(h) => h.broadcast(get_blocks_frame(after_slot)),
+            Net::Both(m, h) => {
+                m.request_blocks(after_slot, preferred);
+                h.broadcast(get_blocks_frame(after_slot));
+            }
+        }
+    }
+
     /// Hand a gossip message's verdict back to the transport.
     ///
     /// This is the other half of wiring `gossip.rs`: with gossipsub in
@@ -355,6 +376,30 @@ const SYNC_FANOUT: usize = 2;
 /// One request per lease; expiration permits another connection's turn even
 /// when peers stay silent or the applied head has not moved.
 const SYNC_LEASE: Duration = Duration::from_secs(5);
+/// Slots below the applied head that a head-forward request still asks for
+/// (audit L1C-60). `get-blocks{after_slot}` returns canonical blocks whose
+/// slot is ABOVE the cursor, so a cursor equal to the head slot can never
+/// return a block of the network's branch at or below that slot: a node that
+/// adopted a sibling built over a block it had not received (the block of
+/// slot `s` arrives late, the next proposer builds on `s - 1`) asked for
+/// "after `s + 1`" for ever and was repaired only by the rationed rewind
+/// (mainnet, 2026-11-19). With the overlap, the ordinary 5-second lease
+/// returns the missing ancestor from the first peer that holds it. The
+/// repeated blocks are dropped by the block door before any signature work
+/// (already known). Kept small: every node asks two peers per lease.
+pub(crate) const SYNC_HEAD_OVERLAP_SLOTS: u64 = 3;
+/// Connections a rewind may name as preferred (audit L1C-60): the latest
+/// distinct deliverers of authenticated orphans. More than the fan-out so a
+/// preferred connection that has closed still leaves a targeted choice.
+pub(crate) const SYNC_PREFERRED_PEERS: usize = 4;
+
+/// Process-wide identity of one mesh connection (audit L1C-60). Node-local:
+/// never on the wire, never persisted, never reused within a process. It
+/// lets the engine say "ask the connection that delivered this block".
+fn next_connection_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 /// Each worker is one thread and one page in memory (at most
 /// `codec::MAX_FIELD_LEN` of block bytes), so this is also the memory bound
 /// of sync serving: 64 MiB at the very worst.
@@ -1033,6 +1078,8 @@ impl InboundPeer {
 /// Both workers share one counted lifetime. Exiting either half shuts down
 /// the socket; capacity is released only after BOTH workers have stopped.
 struct Connection {
+    /// See [`next_connection_id`].
+    id: u64,
     socket: TcpStream,
     closed: AtomicBool,
     pending_sync: Mutex<Option<(u64, Instant)>>,
@@ -1194,7 +1241,7 @@ fn run_outbound_reader(
             Ok(frame) => {
                 if frame.first() == Some(&FRAME_GET_BLOCKS) {
                     responder.answer(&_half.0, address.ip(), frame, &mut limiter);
-                } else if !decode_and_send_from_peer(&events, &budget, address.ip(), &frame, true) {
+                } else if admit_frame_with_proof(&events, &budget, address.ip(), &frame, true, None, Some(_half.0.id)) == FrameOutcome::EngineGone {
                     // `true`: this connection was dialled to an address the
                     // operator configured, and it is the one sync is asked on.
                     return;
@@ -1232,6 +1279,11 @@ impl DevnetMesh {
     /// Address actually bound by the inbound listener.
     pub fn listen_addr(&self) -> SocketAddr {
         self.listen_addr
+    }
+
+    /// One engine-driven sync request; see [`Net::request_blocks`].
+    pub(crate) fn request_blocks(&self, after_slot: u64, preferred: &[u64]) {
+        self.sync.pump_preferring(Instant::now(), Some(after_slot), preferred);
     }
 
     /// Broadcast one frame (type byte + payload, no length prefix) to every
@@ -1303,11 +1355,28 @@ impl SyncScheduler {
     }
 
     fn pump(&self, now: Instant, requested_after: Option<u64>) {
+        self.pump_preferring(now, requested_after, &[]);
+    }
+
+    /// [`Self::pump`], with the connections named in `preferred` (most
+    /// wanted first) moved to the head of the rotation before leases are
+    /// handed out (audit L1C-60). Only the order changes: a preferred
+    /// connection still needs a free lease, an idle writer and a place under
+    /// [`SYNC_FANOUT`], and one whose lease is still running is not asked twice.
+    fn pump_preferring(&self, now: Instant, requested_after: Option<u64>, preferred: &[u64]) {
         let Ok(mut schedule) = self.schedule.lock() else { return };
         if let Some(after) = requested_after {
             schedule.requested_after = Some(schedule.requested_after.map_or(after, |old| old.min(after)));
         }
         schedule.peers.retain(|p| p.peer.is_open());
+        for wanted in preferred.iter().take(SYNC_PREFERRED_PEERS).rev() {
+            let at = schedule.peers.iter().position(|p| {
+                p.peer.connection.upgrade().is_some_and(|c| c.id == *wanted)
+            });
+            if let Some(peer) = at.and_then(|at| schedule.peers.remove(at)) {
+                schedule.peers.push_front(peer);
+            }
+        }
         for peer in &mut schedule.peers {
             if peer.requested_at.is_some_and(|at| now.saturating_duration_since(at) >= SYNC_LEASE) {
                 peer.requested_at = None;
@@ -1320,7 +1389,9 @@ impl SyncScheduler {
             return;
         }
         let mut active = schedule.peers.iter().filter(|p| p.requested_at.is_some()).count();
-        let after = schedule.requested_after.unwrap_or_else(|| self.head.load(Ordering::Acquire));
+        let after = schedule
+            .requested_after
+            .unwrap_or_else(|| self.head.load(Ordering::Acquire).saturating_sub(SYNC_HEAD_OVERLAP_SLOTS));
         let frame: SharedFrame = get_blocks_frame(after).into();
         let mut sent = false;
         for _ in 0..schedule.peers.len() {
@@ -1445,7 +1516,7 @@ fn admit_frame_from_ip(
     frame: &[u8],
     configured: bool,
 ) -> FrameOutcome {
-    admit_frame_with_proof(events, budget, ip, frame, configured, None)
+    admit_frame_with_proof(events, budget, ip, frame, configured, None, None)
 }
 
 /// [`admit_frame_from_ip`] for an unconfigured inbound connection: a block
@@ -1458,6 +1529,7 @@ fn admit_frame_with_proof(
     frame: &[u8],
     configured: bool,
     proof: Option<&DeliveryProof>,
+    connection: Option<u64>,
 ) -> FrameOutcome {
     let Some((class, size)) = framed_event_shape(frame) else { return FrameOutcome::Ignored };
     let Some(source_guard) = source_budget::Registry::reserve(
@@ -1498,6 +1570,11 @@ fn admit_frame_with_proof(
         if let NetEvent::Block(_, origin) = &mut event {
             origin.mark_directed_block();
         }
+    }
+    // Audit L1C-60: a block remembers the connection it was read from, so a
+    // rewind for an orphan can be asked of the peer that delivered it.
+    if let (Some(connection), NetEvent::Block(_, origin)) = (connection, &mut event) {
+        origin.set_mesh_connection(connection);
     }
     if events.send(EngineEvent::Net(event)).is_err() {
         budget.release_raw(size);
@@ -1908,9 +1985,76 @@ fn read_frame_until(sock: &mut TcpStream, deadline: Instant) -> std::io::Result<
     if len == 0 || len > crate::codec::MAX_FIELD_LEN {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad frame length"));
     }
-    let mut buf = vec![0u8; len];
-    read_exact_until(sock, &mut buf, deadline)?;
-    Ok(buf)
+    read_announced_until(sock, len, deadline)
+}
+
+/// Bytes the buffer of a frame being read is extended by at a time; see
+/// [`AnnouncedFrame`].
+pub(crate) const FRAME_READ_STEP: usize = 64 * 1024;
+
+/// The buffer of a frame whose length the peer announced and whose bytes
+/// have not arrived yet (audit L1N-04).
+///
+/// Both mesh readers used to allocate the whole announced length at once,
+/// up to [`crate::codec::MAX_FIELD_LEN`] (8 MiB), on four bytes from a
+/// connection that had proven nothing, before the frame's type was known and
+/// before any budget saw it. Whether that memory was resident before the
+/// bytes arrived was left to the allocator: a zeroed allocation served from
+/// fresh pages costs nothing until written, one served from recycled memory
+/// is cleared, and so resident, immediately.
+///
+/// This buffer grows with what was actually received instead: its capacity
+/// is never more than twice the bytes delivered plus one step, and never
+/// more than the announced length. To hold memory here a peer has to send
+/// the bytes, under the frame's one deadline. Same bytes on the wire, same
+/// frame handed to the caller.
+pub(crate) struct AnnouncedFrame {
+    buf: Vec<u8>,
+    len: usize,
+}
+
+impl AnnouncedFrame {
+    pub(crate) fn new(len: usize) -> Self {
+        AnnouncedFrame { buf: Vec::new(), len }
+    }
+
+    /// The next part of the frame to fill, at most [`FRAME_READ_STEP`]
+    /// bytes, or `None` once the announced length has been handed out. The
+    /// caller fills the whole slice before asking again.
+    pub(crate) fn next_chunk(&mut self) -> Option<&mut [u8]> {
+        let at = self.buf.len();
+        if at >= self.len {
+            return None;
+        }
+        let end = at + (self.len - at).min(FRAME_READ_STEP);
+        if self.buf.capacity() < end {
+            // Double, so a full-size frame is copied a bounded number of
+            // times, but never past what was announced.
+            let want = self.buf.capacity().saturating_mul(2).clamp(end, self.len);
+            self.buf.reserve_exact(want - at);
+        }
+        self.buf.resize(end, 0);
+        Some(&mut self.buf[at..])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
+    pub(crate) fn finish(self) -> Vec<u8> {
+        self.buf
+    }
+}
+
+/// Read exactly `len` announced bytes before `deadline`, growing the buffer
+/// as they arrive ([`AnnouncedFrame`]).
+pub(crate) fn read_announced_until(sock: &mut TcpStream, len: usize, deadline: Instant) -> std::io::Result<Vec<u8>> {
+    let mut frame = AnnouncedFrame::new(len);
+    while let Some(chunk) = frame.next_chunk() {
+        read_exact_until(sock, chunk, deadline)?;
+    }
+    Ok(frame.finish())
 }
 
 /// A single frame budget covers both its length prefix and payload. `read_exact`
@@ -2497,7 +2641,7 @@ pub fn start(
                     // and a broadcast must not wait behind it.
                     let Ok((mut reader, writer)) = split_session(sock, session) else { return };
                     let connection = Arc::new(Connection {
-                        socket: shutdown_socket,
+                        id: next_connection_id(), socket: shutdown_socket,
                         closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
                         _counts: (ConnCount::new(&live), Some(inbound_slot)),
                         slot: Some(slot),
@@ -2575,7 +2719,7 @@ pub fn start(
                                     }
                                     continue;
                                 }
-                                let outcome = admit_frame_with_proof(&events, &inflight, address.ip(), &frame, false, proof.as_ref());
+                                let outcome = admit_frame_with_proof(&events, &inflight, address.ip(), &frame, false, proof.as_ref(), Some(_half.0.id));
                                 let Some(slot) = _half.0.slot.as_ref() else { return };
                                 let now = Instant::now();
                                 match outcome {
@@ -2766,7 +2910,7 @@ pub fn start(
             let Ok((reader, writer)) = split_session(sock, session) else { continue };
             let session_started = Instant::now();
             let connection = Arc::new(Connection {
-                socket: shutdown_socket,
+                id: next_connection_id(), socket: shutdown_socket,
                 closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
                 _counts: (ConnCount::new(&live), None),
                     slot: None,
@@ -2860,11 +3004,63 @@ mod tests {
         let remote = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (socket, _) = listener.accept().unwrap();
         let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let connection = Arc::new(Connection { socket, closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
+        let connection = Arc::new(Connection { id: next_connection_id(), socket, closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
             _counts: (ConnCount::new(&live), None), slot: None });
         let (frames, received) = mpsc::sync_channel(1);
         let peer = InboundPeer { frames, connection: Arc::downgrade(&connection) };
         SyncTestPeer { peer, received, connection, _remote: remote }
+    }
+
+    /// Audit L1C-60: the timer-driven request reaches below the head slot,
+    /// so the page a peer on the network's branch answers with contains the
+    /// block this node is missing at or just below its own head slot.
+    #[test]
+    fn head_forward_requests_overlap_the_head_slot() {
+        let now = Instant::now();
+        let scheduler = SyncScheduler::new(Arc::new(AtomicU64::new(281_664)), QueueBudget::new());
+        let peer = sync_test_peer();
+        scheduler.register(peer.peer.clone(), now);
+        let frame = peer.receive().unwrap();
+        let after = u64::from_le_bytes(frame.as_ref()[1..9].try_into().unwrap());
+        assert!(after < 281_663, "the cursor {after} cannot return the block of slot 281663 (only slots above it)");
+    }
+
+    /// Audit L1C-60: a rewind names the connections that delivered the
+    /// orphans it wants connected. They are asked before the rotation's
+    /// next peers; the fan-out bound is unchanged, and a name that is closed
+    /// or unknown changes nothing.
+    #[test]
+    fn a_rewind_is_asked_of_the_preferred_connections_first() {
+        let now = Instant::now();
+        let scheduler = SyncScheduler::new(Arc::new(AtomicU64::new(42)), QueueBudget::new());
+        let peers: Vec<_> = (0..5).map(|_| sync_test_peer()).collect();
+        for peer in &peers { scheduler.register(peer.peer.clone(), now); }
+        // The registration round leased the first two in rotation order.
+        assert!(peers[0].receive().is_ok() && peers[1].receive().is_ok());
+        let deliverer = peers[4].connection.id;
+        let closed = sync_test_peer();
+        let gone = closed.connection.id;
+        drop(closed);
+        // Both leases are still running: the rewind waits, it is not lost
+        // and it does not exceed the fan-out.
+        scheduler.pump_preferring(now, Some(7), &[gone, deliverer, u64::MAX]);
+        assert!(peers.iter().all(|p| p.receive().is_err()), "no third concurrent request");
+        // Leases expire: the deliverer is asked first, although three other
+        // connections were ahead of it in the rotation.
+        scheduler.pump(now + SYNC_LEASE, None);
+        assert_eq!(peers[4].receive().unwrap().as_ref(), get_blocks_frame(7).as_slice(), "the deliverer gets the rewind");
+        assert_eq!(peers[2].receive().unwrap().as_ref(), get_blocks_frame(7).as_slice(), "then the rotation's next peer");
+        assert!(peers[3].receive().is_err() && peers[0].receive().is_err() && peers[1].receive().is_err());
+        assert!(scheduler.schedule.lock().unwrap().peers.iter().filter(|p| p.requested_at.is_some()).count() <= SYNC_FANOUT);
+        // Without a preference the same rewind goes to the rotation's head.
+        let plain = SyncScheduler::new(Arc::new(AtomicU64::new(42)), QueueBudget::new());
+        let others: Vec<_> = (0..5).map(|_| sync_test_peer()).collect();
+        for peer in &others { plain.register(peer.peer.clone(), now); }
+        assert!(others[0].receive().is_ok() && others[1].receive().is_ok());
+        plain.pump(now, Some(7));
+        plain.pump(now + SYNC_LEASE, None);
+        assert!(others[4].receive().is_err(), "the fifth connection is not reached by rotation");
+        assert_eq!(others[2].receive().unwrap().as_ref(), get_blocks_frame(7).as_slice());
     }
 
     #[test]
@@ -2873,8 +3069,8 @@ mod tests {
         let scheduler = SyncScheduler::new(Arc::new(AtomicU64::new(42)), QueueBudget::new());
         let peers: Vec<_> = (0..3).map(|_| sync_test_peer()).collect();
         for peer in &peers { scheduler.register(peer.peer.clone(), now); }
-        assert_eq!(peers[0].receive().unwrap().as_ref(), get_blocks_frame(42).as_slice());
-        assert_eq!(peers[1].receive().unwrap().as_ref(), get_blocks_frame(42).as_slice());
+        assert_eq!(peers[0].receive().unwrap().as_ref(), get_blocks_frame(42 - SYNC_HEAD_OVERLAP_SLOTS).as_slice());
+        assert_eq!(peers[1].receive().unwrap().as_ref(), get_blocks_frame(42 - SYNC_HEAD_OVERLAP_SLOTS).as_slice());
         assert!(peers[2].receive().is_err());
         for _ in 0..100 {
             scheduler.pump(now, Some(7));
@@ -2907,8 +3103,8 @@ mod tests {
         scheduler.register(first.peer.clone(), now);
         scheduler.register(second.peer.clone(), now);
         scheduler.register(third.peer.clone(), now);
-        assert_eq!(second.receive().unwrap().as_ref(), get_blocks_frame(42).as_slice());
-        assert_eq!(third.receive().unwrap().as_ref(), get_blocks_frame(42).as_slice());
+        assert_eq!(second.receive().unwrap().as_ref(), get_blocks_frame(42 - SYNC_HEAD_OVERLAP_SLOTS).as_slice());
+        assert_eq!(third.receive().unwrap().as_ref(), get_blocks_frame(42 - SYNC_HEAD_OVERLAP_SLOTS).as_slice());
         assert_eq!(first.receive().unwrap().as_ref(), [FRAME_ATT]);
         assert!(budget.reserve_raw(EventClass::Block, 60)); // slow application
         scheduler.pump(now + SYNC_LEASE, Some(3));
@@ -2924,11 +3120,11 @@ mod tests {
         assert_eq!(second.receive().unwrap().as_ref(), get_blocks_frame(3).as_slice());
         second.connection.closed.store(true, Ordering::Release);
         scheduler.pump(now + SYNC_LEASE, None);
-        assert_eq!(third.receive().unwrap().as_ref(), get_blocks_frame(42).as_slice(), "disconnect frees its lease without waiting for expiry");
+        assert_eq!(third.receive().unwrap().as_ref(), get_blocks_frame(42 - SYNC_HEAD_OVERLAP_SLOTS).as_slice(), "disconnect frees its lease without waiting for expiry");
         let replacement = sync_test_peer();
         scheduler.register(replacement.peer.clone(), now + SYNC_LEASE);
         scheduler.pump(now + SYNC_LEASE * 2, None);
-        assert_eq!(replacement.receive().unwrap().as_ref(), get_blocks_frame(42).as_slice(), "reconnection enters the fair queue");
+        assert_eq!(replacement.receive().unwrap().as_ref(), get_blocks_frame(42 - SYNC_HEAD_OVERLAP_SLOTS).as_slice(), "reconnection enters the fair queue");
     }
 
     #[test]
@@ -2939,7 +3135,7 @@ mod tests {
         scheduler.register(peer.peer.clone(), now);
         for turn in 1..=5 { scheduler.pump(now + SYNC_LEASE * turn, Some(3)); }
         let stale = peer.received.try_recv().unwrap();
-        assert_eq!(stale.as_ref(), get_blocks_frame(42).as_slice());
+        assert_eq!(stale.as_ref(), get_blocks_frame(42 - SYNC_HEAD_OVERLAP_SLOTS).as_slice());
         assert!(peer.received.try_recv().is_err(), "only one authorization may wait behind a blocked writer");
         assert!(!peer.connection.take_sync_request(stale.as_ref(), now + SYNC_LEASE * 5));
         scheduler.pump(now + SYNC_LEASE * 5, None);
@@ -3078,7 +3274,7 @@ mod tests {
         let (mut a, _) = silent_a.accept().unwrap();
         let (mut b, _) = silent_b.accept().unwrap();
         for socket in [&mut a, &mut b] {
-            assert_eq!(read_frame_until(socket, Instant::now() + Duration::from_secs(3)).unwrap(), get_blocks_frame(42));
+            assert_eq!(read_frame_until(socket, Instant::now() + Duration::from_secs(3)).unwrap(), get_blocks_frame(42 - SYNC_HEAD_OVERLAP_SLOTS));
         }
         let mut responder = TcpStream::connect(("127.0.0.1", port)).unwrap();
         for _ in 0..20 { mesh.broadcast(get_blocks_frame(42)); }
@@ -3103,7 +3299,7 @@ mod tests {
         let _mesh = start("127.0.0.1", 0, vec![listener.local_addr().unwrap().to_string()],
             events, dir.clone(), Arc::new(AtomicU64::new(43)), QueueBudget::new(), Arc::new(crate::mesh_pq::MeshSecurity::plain())).unwrap();
         let (mut remote, _) = listener.accept().unwrap();
-        assert_eq!(read_frame_until(&mut remote, Instant::now() + Duration::from_secs(3)).unwrap(), get_blocks_frame(43));
+        assert_eq!(read_frame_until(&mut remote, Instant::now() + Duration::from_secs(3)).unwrap(), get_blocks_frame(43 - SYNC_HEAD_OVERLAP_SLOTS));
         write_frame(&mut remote, &get_blocks_frame(42)).unwrap();
         assert_eq!(read_frame_until(&mut remote, Instant::now() + Duration::from_secs(3)).unwrap(), block_frame(&block));
         drop(remote);
@@ -3144,9 +3340,53 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    /// How long a page that must cross two real meshes is waited for. A bound
+    /// on a hang, not a performance expectation.
+    ///
+    /// The cases below push a 4 MiB page each way through a sealed session,
+    /// and in an unoptimised test build ChaCha20-Poly1305 is the whole cost:
+    /// about 1.5 s to seal and 1.5 s to open one page on an idle 16-core
+    /// machine, against about 0.05 s to read it off the socket. The four
+    /// tests that use this helper start together and the suite runs sixteen
+    /// tests at once, so a page that needs 3 s alone was measured at 6 s with
+    /// every core busy and at 10 to 11 s with the cores oversubscribed more
+    /// than twice, whole and equal each time. The 8 s this used to wait was
+    /// missed by those runs, by the same cases and in the same way with and
+    /// without the audit fixes of 2026-11-23: it measured the load of the
+    /// machine, not the mesh.
+    ///
+    /// A session that stalls still fails here: the test retries nothing, and
+    /// the page has to arrive, whole and equal, in both directions.
+    /// Production timeouts are not involved and are unchanged.
+    const SYNC_ARRIVAL_BOUND: Duration = Duration::from_secs(60);
+    /// The least time two meshes that must stay apart are watched.
+    const SYNC_SILENCE_FLOOR: Duration = Duration::from_secs(8);
+    /// The slowest page that did cross, in milliseconds, over every case run
+    /// so far in this process; see [`sync_silence_window`].
+    static SLOWEST_SYNC_ARRIVAL_MS: AtomicU64 = AtomicU64::new(0);
+
+    /// How long two meshes that must stay apart are watched: twice the
+    /// slowest page that has crossed in this process, and never less than
+    /// [`SYNC_SILENCE_FLOOR`] nor more than [`SYNC_ARRIVAL_BOUND`].
+    ///
+    /// "Nothing arrived" proves a refusal only if a page between two meshes
+    /// that had been let together would have arrived in that time. On a
+    /// loaded machine such a page takes longer than the fixed 8 s (see
+    /// [`SYNC_ARRIVAL_BOUND`]), and a fixed window would then pass whether
+    /// the session was refused or not. Every test that expects silence runs
+    /// a case that must deliver first, so the window follows the machine.
+    fn sync_silence_window() -> Duration {
+        sync_silence_window_after(Duration::from_millis(SLOWEST_SYNC_ARRIVAL_MS.load(Ordering::Relaxed)))
+    }
+
+    fn sync_silence_window_after(slowest_arrival: Duration) -> Duration {
+        slowest_arrival.saturating_mul(2).clamp(SYNC_SILENCE_FLOOR, SYNC_ARRIVAL_BOUND)
+    }
+
     /// Two real meshes, right dialling left, each holding one 4 MiB block and
     /// asking the other for it. True when both sides received the other's
-    /// page within the timeout.
+    /// page within [`SYNC_ARRIVAL_BOUND`]. For two meshes that must be let
+    /// together; [`kept_apart`] is the assertion for two that must not.
     fn sync_across(left: crate::mesh_pq::MeshSecurity, right: crate::mesh_pq::MeshSecurity, tag: &str) -> bool {
         sync_across_with(left, |_| right, tag)
     }
@@ -3158,6 +3398,47 @@ mod tests {
         right: impl FnOnce(&str) -> crate::mesh_pq::MeshSecurity,
         tag: &str,
     ) -> bool {
+        let (sides, took) = pages_cross(left, right, tag, SYNC_ARRIVAL_BOUND);
+        if sides == 2 {
+            SLOWEST_SYNC_ARRIVAL_MS.fetch_max(u64::try_from(took.as_millis()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        } else {
+            eprintln!("{tag}: {sides} of 2 pages crossed within {SYNC_ARRIVAL_BOUND:?}");
+        }
+        sides == 2
+    }
+
+    /// The same two meshes, which must NOT be let together. True when no
+    /// page crossed in either direction for the whole of
+    /// [`sync_silence_window`].
+    fn kept_apart(left: crate::mesh_pq::MeshSecurity, right: crate::mesh_pq::MeshSecurity, tag: &str) -> bool {
+        kept_apart_with(left, |_| right, tag)
+    }
+
+    /// [`kept_apart`], with the dialing side built from the address it dials.
+    fn kept_apart_with(
+        left: crate::mesh_pq::MeshSecurity,
+        right: impl FnOnce(&str) -> crate::mesh_pq::MeshSecurity,
+        tag: &str,
+    ) -> bool {
+        let window = sync_silence_window();
+        let (sides, took) = pages_cross(left, right, tag, window);
+        if sides != 0 {
+            eprintln!("{tag}: {sides} of 2 pages crossed within {took:?}, between two meshes that must stay apart (watched for {window:?})");
+        }
+        sides == 0
+    }
+
+    /// Start the two meshes of [`sync_across`] and wait at most `window`,
+    /// counted from the start of the dialing mesh, for each side to receive
+    /// the other's page. How many of the two sides did (a side that received
+    /// anything else first did not), and how long the wait lasted: until the
+    /// second page, or the whole window.
+    fn pages_cross(
+        left: crate::mesh_pq::MeshSecurity,
+        right: impl FnOnce(&str) -> crate::mesh_pq::MeshSecurity,
+        tag: &str,
+        window: Duration,
+    ) -> (usize, Duration) {
         let base = std::env::temp_dir().join(format!("bloch-mesh-pq-{tag}-{}-{}", std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         let left_dir = base.join("left");
@@ -3177,13 +3458,33 @@ mod tests {
         let right = right(&dialed);
         let right_mesh = start("127.0.0.1", 0, vec![dialed], right_tx, right_dir,
             Arc::new(AtomicU64::new(42)), QueueBudget::new(), Arc::new(right)).unwrap();
-        let delivered = [left_rx, right_rx].into_iter().all(|received| {
-            matches!(received.recv_timeout(Duration::from_secs(8)),
+        // One window for both directions. Both sides are always looked at:
+        // once the window is spent the second wait is a look at what is
+        // already there, so a page that crossed one way only is counted.
+        let started = Instant::now();
+        let sides = [left_rx, right_rx].into_iter().filter(|received| {
+            let left_of_window = window.saturating_sub(started.elapsed());
+            matches!(received.recv_timeout(left_of_window),
                 Ok(EngineEvent::Net(NetEvent::Block(actual, _))) if actual.body.transactions == block.body.transactions)
-        });
+        }).count();
+        let took = started.elapsed();
         drop((left_mesh, right_mesh, left_store, right_store));
         let _ = std::fs::remove_dir_all(base);
-        delivered
+        (sides, took)
+    }
+
+    /// The window two meshes that must stay apart are watched for is the
+    /// old fixed one on an idle machine and follows the slowest page that
+    /// did cross on a loaded one, up to the bound on a hang.
+    #[test]
+    fn the_silence_window_follows_the_slowest_page_that_crossed() {
+        let after = |ms| sync_silence_window_after(Duration::from_millis(ms));
+        assert_eq!(after(0), SYNC_SILENCE_FLOOR, "no page has crossed yet");
+        assert_eq!(after(3_000), SYNC_SILENCE_FLOOR, "an idle machine keeps the old window");
+        assert_eq!(after(10_500), Duration::from_secs(21), "a loaded machine is watched for twice its slowest page");
+        assert_eq!(after(45_000), SYNC_ARRIVAL_BOUND, "never past the bound on a hang");
+        assert_eq!(after(u64::MAX), SYNC_ARRIVAL_BOUND);
+        assert!(SYNC_SILENCE_FLOOR < SYNC_ARRIVAL_BOUND);
     }
 
     #[test]
@@ -3198,9 +3499,9 @@ mod tests {
         assert!(sync_across(pq(Mode::Offer), MeshSecurity::plain(), "offer-plain"));
         assert!(sync_across(MeshSecurity::plain(), pq(Mode::Offer), "plain-offer"));
         // `require` does not, in either direction, and neither does another network.
-        assert!(!sync_across(pq(Mode::Require), MeshSecurity::plain(), "req-plain"));
-        assert!(!sync_across(MeshSecurity::plain(), pq(Mode::Require), "plain-req"));
-        assert!(!sync_across(pq(Mode::Require), MeshSecurity::ephemeral(Mode::Require, [8; 32], None), "other-net"));
+        assert!(kept_apart(pq(Mode::Require), MeshSecurity::plain(), "req-plain"));
+        assert!(kept_apart(MeshSecurity::plain(), pq(Mode::Require), "plain-req"));
+        assert!(kept_apart(pq(Mode::Require), MeshSecurity::ephemeral(Mode::Require, [8; 32], None), "other-net"));
     }
 
     #[test]
@@ -3211,7 +3512,7 @@ mod tests {
         let gate = |allowed| MeshSecurity::ephemeral(Mode::Require, net, Some(std::collections::HashSet::from([allowed])));
         let member_id = member.identity_id().unwrap();
         assert!(sync_across(gate(member_id), member, "allow-member"));
-        assert!(!sync_across(gate(member_id), MeshSecurity::ephemeral(Mode::Require, net, None), "allow-stranger"));
+        assert!(kept_apart(gate(member_id), MeshSecurity::ephemeral(Mode::Require, net, None), "allow-stranger"));
     }
 
     #[test]
@@ -3235,10 +3536,10 @@ mod tests {
         // An exception for another address changes nothing here: refused in
         // both directions, and the refusals are counted.
         let refused = count(&NODE.mesh_plain_refused_total);
-        assert!(!sync_across(require().with_plain_allow_ip(elsewhere), MeshSecurity::plain(), "req-other-in"));
+        assert!(kept_apart(require().with_plain_allow_ip(elsewhere), MeshSecurity::plain(), "req-other-in"));
         assert!(count(&NODE.mesh_plain_refused_total) > refused);
         let refused = count(&NODE.mesh_plain_refused_total);
-        assert!(!sync_across(MeshSecurity::plain(), require().with_plain_allow_ip(elsewhere), "req-other-out"));
+        assert!(kept_apart(MeshSecurity::plain(), require().with_plain_allow_ip(elsewhere), "req-other-out"));
         assert!(count(&NODE.mesh_plain_refused_total) > refused);
 
         // Upgraded peers are sealed with an excepting node as with any other.
@@ -3373,11 +3674,11 @@ mod tests {
         let left_id = left.identity_id().unwrap();
         assert!(sync_across_with(left, |addr| pq(Mode::Require).with_pin(addr, left_id), "pin-match"));
         // The listener holds another key than the pinned one: no session.
-        assert!(!sync_across_with(pq(Mode::Require), |addr| pq(Mode::Require).with_pin(addr, [0x11; 32]), "pin-mismatch"));
+        assert!(kept_apart_with(pq(Mode::Require), |addr| pq(Mode::Require).with_pin(addr, [0x11; 32]), "pin-mismatch"));
         // `offer` falls back to plain for an unpinned legacy peer (asserted
         // in `mesh_security_modes_interoperate_as_documented`), but never
         // for a pinned one.
-        assert!(!sync_across_with(MeshSecurity::plain(), |addr| pq(Mode::Offer).with_pin(addr, [0x11; 32]), "pin-no-plain"));
+        assert!(kept_apart_with(MeshSecurity::plain(), |addr| pq(Mode::Offer).with_pin(addr, [0x11; 32]), "pin-no-plain"));
     }
 
     #[test]
@@ -3698,7 +3999,7 @@ mod tests {
             socket.set_nonblocking(false).unwrap();
             assert_eq!(
                 read_frame_until(&mut socket, Instant::now() + Duration::from_secs(2)).unwrap(),
-                get_blocks_frame(42),
+                get_blocks_frame(42 - SYNC_HEAD_OVERLAP_SLOTS),
                 "each new connection must be able to acquire a sync permit",
             );
             // End the reader with an invalid frame while the peer keeps its
@@ -3708,7 +4009,7 @@ mod tests {
             socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             assert_eq!(socket.read(&mut [0; 1]).unwrap(), 0,
                 "reader failure left the outbound writer half alive");
-            mesh.broadcast(get_blocks_frame(42)); // wake the idle writer promptly
+            mesh.broadcast(get_blocks_frame(42 - SYNC_HEAD_OVERLAP_SLOTS)); // wake the idle writer promptly
         }
         drop(mesh);
     }
@@ -3721,7 +4022,7 @@ mod tests {
         let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let inbound_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let connection = Arc::new(Connection {
-            socket: socket.try_clone().unwrap(),
+            id: next_connection_id(), socket: socket.try_clone().unwrap(),
             closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
             _counts: (ConnCount::new(&live), Some(ConnCount::new(&inbound_live))),
                     slot: None,
@@ -3757,7 +4058,7 @@ mod tests {
         socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let connection = Arc::new(Connection {
-            socket: socket.try_clone().unwrap(),
+            id: next_connection_id(), socket: socket.try_clone().unwrap(),
             closed: AtomicBool::new(false), pending_sync: Mutex::new(None), serving_sync: AtomicBool::new(false),
             _counts: (ConnCount::new(&live), Some(ConnCount::new(&live))),
             slot: None,

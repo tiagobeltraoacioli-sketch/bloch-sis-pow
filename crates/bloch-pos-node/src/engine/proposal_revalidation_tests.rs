@@ -243,10 +243,18 @@ fn second_pending_spend_of_an_input_is_refused_and_the_first_is_kept() {
     assert_eq!(node.mempool.len(), 1);
     assert!(node.mempool.contains_key(&first.canonical_bytes()));
     assert!(!node.rejected.contains_key(&second.canonical_bytes()), "a pending conflict is not a bar");
-    // A forged conflicting spend is refused for its signature, as before.
+    // A forged conflicting spend gets the same answer, from the outpoint
+    // index, before its signature is looked at (audit L1N-02: verifying a
+    // spend whose input is held, only to refuse it afterwards, was a free
+    // unit of the allowance every source shares). Nothing is verified for
+    // it and nothing in the pool changes.
     let mut forged = second.clone();
     if let PosTransaction::Transfer { inputs, .. } = &mut forged { inputs[0].signature[0] ^= 1; }
-    assert!(matches!(node.on_transaction(forged), Err(Refusal::Invalid(_))));
+    let used = node.gossip_verifier.budget_used_at(node.wall_slot());
+    assert_eq!(node.on_transaction(forged), Err(Refusal::StateDependent(admission::INPUT_ALREADY_PENDING)));
+    assert_eq!(node.gossip_verifier.budget_used_at(node.wall_slot()), used);
+    assert_eq!(node.mempool.len(), 1);
+    assert!(node.mempool.contains_key(&first.canonical_bytes()));
     // Unrelated inputs and exact resubmission are unaffected.
     assert_eq!(node.on_transaction(first.clone()), Ok(Admitted::Duplicate));
     assert_eq!(node.on_transaction(spend(&funds[1], 9_000, 0, fee)), Ok(Admitted::New));

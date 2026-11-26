@@ -78,12 +78,9 @@ pub mod tx {
     pub const RESCUE_REVEAL: u8 = 0x1A;
     /// HF3: KES leaf-authorised rotation (p8b proposal, moved from 0x18).
     pub const KES_ROTATE: u8 = 0x1B;
-    /// CANDIDATE: L1 forced inclusion of one L2 transaction
-    /// (`params::L2_FORCED_INCLUSION_EPOCH`, inert).
-    pub const L2_FORCED_TRANSACTION: u8 = 0x1C;
 
     /// Next unallocated transaction tag.
-    pub const NEXT_FREE: u8 = 0x1D;
+    pub const NEXT_FREE: u8 = 0x1C;
 }
 
 /// State-root component tags — key prefix in the state SMT.
@@ -108,10 +105,12 @@ pub mod local_cache {
     pub const L2: &[u8; 16] = b"BPOSST01:L2:v1\0\0";
     /// Pending: `codex/native-claim-finality-20261019` (L2 checkpoint roots).
     pub const L2_CHECKPOINTS: &[u8; 16] = b"BPOSST01:L2CP:v1";
-    /// Candidate: `codex/forced-inclusion-r7-20261102` (L2 forced queue).
-    pub const L2_FORCED: &[u8; 16] = b"BPOSST01:L2FI:v1";
-    /// Candidate: `codex/l2-r15-20261110` (L2 paid leaves, review R308-7).
-    pub const L2_PAID: &[u8; 16] = b"BPOSST01:L2PL:v1";
+    /// L2 settler set (audit L2N-01,
+    /// `L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH`), after the L2 sections.
+    pub const L2_SETTLERS: &[u8; 16] = b"BPOSST01:L2ST:v1";
+    /// L2 attested release lane (audit L1X-01,
+    /// `L2_ATTESTED_RELEASE_LANE_ACTIVATION_EPOCH`), last of the L2 sections.
+    pub const L2_ATTESTED_RELEASE: &[u8; 16] = b"BPOSST01:L2AR:v1";
     /// HF3 KES (`v2`: entries with start periods and the enforcement bind
     /// epoch; the devnet lineage's `v1` section is not accepted).
     /// `v3` adds the retired-key history (review R-1); `v1`/`v2` sections
@@ -126,18 +125,12 @@ pub mod local_cache {
     /// Commission-update epochs of the current epoch (security review round
     /// 2 DET-3, `COMMISSION_UPDATE_LIMIT_ACTIVATION_EPOCH`).
     pub const COMMISSION_UPDATES: &[u8; 16] = b"BPOSST01:COMU:v1";
+    /// Credential-rotation epochs of the current epoch (audit L1S-02,
+    /// `CREDENTIAL_ROTATION_LIMIT_ACTIVATION_EPOCH`).
+    pub const CREDENTIAL_ROTATIONS: &[u8; 16] = b"BPOSST01:CROT:v1";
     /// Fixed merge/parse order.
-    pub const ORDER: [&[u8; 16]; 9] = [
-        L2,
-        L2_CHECKPOINTS,
-        L2_FORCED,
-        L2_PAID,
-        KES,
-        PQ,
-        FINALITY_SET,
-        OWN_CHECKPOINTS,
-        COMMISSION_UPDATES,
-    ];
+    pub const ORDER: [&[u8; 16]; 10] =
+        [L2, L2_CHECKPOINTS, L2_SETTLERS, L2_ATTESTED_RELEASE, KES, PQ, FINALITY_SET, OWN_CHECKPOINTS, COMMISSION_UPDATES, CREDENTIAL_ROTATIONS];
 }
 
 /// Trailing extensions of the finality leaf (state tag `0x09`). Absent while
@@ -225,11 +218,6 @@ pub const TX_TABLE: &[Row] = &[
         name: "KesRotate",
         status: Status::Pending { gate: "HF3_KES_EPOCH", branch: "codex/hf3-kes-20261020" },
     },
-    Row {
-        tag: tx::L2_FORCED_TRANSACTION,
-        name: "L2ForcedTransaction",
-        status: Status::Pending { gate: "L2_FORCED_INCLUSION_EPOCH", branch: "codex/forced-inclusion-r7-20261102" },
-    },
 ];
 
 /// State-root tags allocated beyond the mainnet range, ascending.
@@ -253,7 +241,7 @@ mod tests {
             TX_TABLE.iter().filter(|r| r.status != Status::Tombstoned).map(|r| r.name).collect();
         assert_eq!(names.len(), TX_TABLE.len() - 3, "a name is allocated twice");
         assert_eq!(TX_TABLE.last().unwrap().tag + 1, tx::NEXT_FREE);
-        assert_eq!(TX_TABLE.len(), 0x1C, "0x01..=0x1C allocated without gaps");
+        assert_eq!(TX_TABLE.len(), 0x1B, "0x01..=0x1B allocated without gaps");
     }
 
     /// The 2026-10-20 ruling, pinned byte by byte. Changing any line here
@@ -265,8 +253,7 @@ mod tests {
         assert_eq!(tx::RESCUE_COMMIT, 0x19);
         assert_eq!(tx::RESCUE_REVEAL, 0x1A);
         assert_eq!(tx::KES_ROTATE, 0x1B);
-        assert_eq!(tx::L2_FORCED_TRANSACTION, 0x1C);
-        assert_eq!(tx::NEXT_FREE, 0x1D);
+        assert_eq!(tx::NEXT_FREE, 0x1C);
         assert_eq!(state::KES_ROOT, 0x22);
         assert_eq!(state::LC_ROSTER, 0x23);
         assert_eq!(state::PQ_RESCUE_COMMIT, 0x24);

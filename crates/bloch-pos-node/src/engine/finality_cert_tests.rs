@@ -256,6 +256,9 @@ fn refused_certificate_requests_read_no_blocks() {
     assert!(!engine.finality_certs.registry.is_empty());
     engine.finality_certs.cache.clear();
     engine.finality_certs.default_source.clear();
+    // The links of epoch 5 are held since the assembly above (audit L1N-03);
+    // without them this request has to scan again, which is the case here.
+    engine.finality_certs.forget_links();
     let first = ask(&mut engine, 5, None).unwrap_err();
     let after_first = scans(&engine);
     assert!(after_first > 4, "the first such request had to look");

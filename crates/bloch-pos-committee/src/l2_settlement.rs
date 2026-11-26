@@ -108,6 +108,11 @@ pub mod da {
     /// DA transactions per native block, like blobs per block: inclusion is
     /// a fee auction, and the stored records stay bounded (see [`MAX_RECORDS`]).
     pub const MAX_PER_BLOCK: usize = 4;
+    /// Of those, the places only a registered settler key may take once
+    /// `params::L2_DA_SETTLER_SLOT_ACTIVATION_EPOCH` binds on an L2 with a
+    /// settler set (audit L1X-04): everybody else shares the rest.
+    pub const RESERVED_FOR_SETTLER: usize = 1;
+    const _: () = assert!(RESERVED_FOR_SETTLER < MAX_PER_BLOCK);
     /// A record serves settlements in the next `RETENTION_BLOCKS` native
     /// blocks after its inclusion, then expires (re-post the batch if the
     /// settlement has not landed by then).
@@ -119,65 +124,6 @@ pub mod da {
     /// the DA section of the committed L2 state stays below 193 KiB.
     pub const MAX_RECORDS: usize = MAX_PER_BLOCK * (RETENTION_BLOCKS as usize + 1);
     const _: () = assert!(MAX_RECORDS == 4_100);
-
-    /// DA slots per block that only the registered key may fill once
-    /// `params::L2_DA_RESERVED_SLOT_EPOCH` binds. The total stays
-    /// [`MAX_PER_BLOCK`], so [`MAX_RECORDS`] is unchanged.
-    pub const RESERVED_PER_BLOCK: usize = 1;
-    /// DA transactions per block from any other funding key, past the gate.
-    pub const OPEN_PER_BLOCK: usize = MAX_PER_BLOCK - RESERVED_PER_BLOCK;
-    const _: () = assert!(OPEN_PER_BLOCK >= 1 && RESERVED_PER_BLOCK >= 1);
-
-    /// The registered DA funding key: `Sha3_256(funding_pubkey)`, the same
-    /// hash as the key's script hash. Set once in the release
-    /// (`mainnet::DA_RESERVED_KEY`); a qualification build
-    /// (`l2-activation-rehearsal`) takes it from `BLOCH_L2_REHEARSAL_DA_KEY`
-    /// at compile time instead. No key, vote or runtime input changes it.
-    #[cfg(not(feature = "l2-activation-rehearsal"))]
-    pub const REGISTERED_KEY: Option<[u8; 32]> = super::mainnet::DA_RESERVED_KEY;
-    #[cfg(feature = "l2-activation-rehearsal")]
-    pub const REGISTERED_KEY: Option<[u8; 32]> = match option_env!("BLOCH_L2_REHEARSAL_DA_KEY") {
-        Some(text) => Some(super::mainnet::h32(text)),
-        None => None,
-    };
-
-    /// The registered key, or a test's override of it.
-    pub fn registered_key() -> Option<[u8; 32]> {
-        #[cfg(test)]
-        if let Some(key) = crate::params::l2_da_reserved_slot_test::key() {
-            return Some(key);
-        }
-        REGISTERED_KEY
-    }
-
-    /// The key that owns the reserved slot in a block of `epoch`: `None`
-    /// below the gate, or when no key is registered (then the old rule of
-    /// [`MAX_PER_BLOCK`] slots for anyone applies unchanged).
-    pub fn reserved_key_at(epoch: u64) -> Option<[u8; 32]> {
-        if crate::params::l2_da_reserved_slot_active(epoch) { registered_key() } else { None }
-    }
-
-    /// `Sha3_256(funding_pubkey)`, the hash [`reserved_key_at`] names.
-    pub fn funder(funding_pubkey: &[u8]) -> [u8; 32] {
-        use sha3::Sha3_256;
-        Sha3_256::digest(funding_pubkey).into()
-    }
-
-    /// Whether a block of `epoch` may carry DA transactions from these
-    /// funding keys, in any order: at most [`MAX_PER_BLOCK`] in all and,
-    /// past the gate, at most [`OPEN_PER_BLOCK`] from keys other than the
-    /// registered one.
-    pub fn block_admits<'a>(epoch: u64, funding_pubkeys: impl IntoIterator<Item = &'a [u8]>) -> bool {
-        let reserved = reserved_key_at(epoch);
-        let (mut total, mut open) = (0usize, 0usize);
-        for key in funding_pubkeys {
-            total += 1;
-            if reserved != Some(funder(key)) {
-                open += 1;
-            }
-        }
-        total <= MAX_PER_BLOCK && (reserved.is_none() || open <= OPEN_PER_BLOCK)
-    }
 
     /// Number of transactions in a canonical batch payload, or `None` if the
     /// payload is not exactly one canonical batch within the size cap.
@@ -630,32 +576,29 @@ pub mod withdrawal {
         /// sees, given the current escrow: rolled to a fresh window when the
         /// stored one is older.
         pub fn at(self, limits: &Limits, at_height: u64, escrow_sat: u128) -> Self {
+            self.at_bps(limits, at_height, escrow_sat, limits.release_window_bps)
+        }
+        /// [`Self::at`] with the escrow share given explicitly (the attested
+        /// lane, [`ATTESTED_RELEASE_WINDOW_BPS`]).
+        pub fn at_bps(self, limits: &Limits, at_height: u64, escrow_sat: u128, bps: u64) -> Self {
             let window = at_height / limits.release_window_blocks;
             if window == self.window && self.released != 0 {
                 return self;
             }
-            let share = escrow_sat.saturating_mul(u128::from(limits.release_window_bps)) / 10_000;
+            let share = escrow_sat.saturating_mul(u128::from(bps)) / 10_000;
             Self { window, released: 0, cap: share.max(u128::from(limits.release_floor_sat)) }
         }
         /// Whether `sats` more fits. An `exempt` claim (see
         /// [`RELEASE_WINDOW_BPS`]) may exceed the cap as the window's first.
         ///
-        /// `after_earlier_claims`: the exempt claim need not be the first. It
-        /// may exceed the cap while the window has released no more than its
+        /// `after_earlier_claims`
+        /// (`params::L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH`, security review
+        /// round 2 EXE-4): the exempt claim need not be the first. It may
+        /// exceed the cap while the window has released no more than its
         /// cap, so an earlier small claim no longer pushes it to the next
         /// window. Once it is paid `released > cap`, which is what records
         /// that the window's one exemption is spent: nothing else fits, and
-        /// the window releases at most its cap plus that one claim. A claim
-        /// without the exemption never takes `released` above the cap, so no
-        /// new state is needed.
-        ///
-        /// Two gates switch the rule on, and either is enough (they are the
-        /// same rule, reached on two lines): the release's
-        /// `params::L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH` (security review
-        /// round 2 EXE-4) and the next L2 program
-        /// (`params::L2_NEXT_PROGRAM_EPOCH`, whose guests compute the window
-        /// this way). Both are inert; with both inert this is the rule of the
-        /// program the epoch-5850 activation pinned.
+        /// the window releases at most its cap plus that one claim.
         pub fn admits(&self, sats: u64, exempt: bool, after_earlier_claims: bool) -> bool {
             self.released.saturating_add(u128::from(sats)) <= self.cap
                 || (exempt
@@ -664,6 +607,68 @@ pub mod withdrawal {
         /// Room left in the window (an exempt first claim may exceed it).
         pub fn remaining(&self) -> u128 {
             self.cap.saturating_sub(self.released)
+        }
+    }
+
+    /// Escrow share (basis points) the attested lane may release per window
+    /// once `params::L2_ATTESTED_RELEASE_LANE_ACTIVATION_EPOCH` binds (audit
+    /// L1X-01): half of the escrow at the lane's first claim of the window.
+    pub const ATTESTED_RELEASE_WINDOW_BPS: u64 = 5_000;
+
+    /// Which gated release rules are in force for a claim (the caller knows
+    /// the epoch, the L2 state does not).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct ReleaseRules {
+        /// `params::L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH` (EXE-4).
+        pub exempt_after_earlier_claims: bool,
+        /// `params::L2_ATTESTED_RELEASE_LANE_ACTIVATION_EPOCH` (L1X-01).
+        pub attested_lane: bool,
+    }
+    impl ReleaseRules {
+        pub fn at(epoch: u64) -> Self {
+            Self {
+                exempt_after_earlier_claims: crate::params::l2_release_exemption_active(epoch),
+                attested_lane: crate::params::l2_attested_release_lane_active(epoch),
+            }
+        }
+    }
+
+    /// What the release window still admits for the next native block, as
+    /// claims are taken from it one after another: the single place that
+    /// decides `RateLimited` (the claim check, the release, and the
+    /// proposer's packing all use it).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ReleaseBudget {
+        /// The ordinary window.
+        pub open: ReleaseWindow,
+        /// The attested lane (used only behind its gate).
+        pub attested: ReleaseWindow,
+        /// The policy has an attestor set.
+        pub attestors: bool,
+        pub rules: ReleaseRules,
+    }
+    impl ReleaseBudget {
+        /// Whether a claim that carries an attestation is judged in the lane.
+        fn in_lane(&self, attested: bool) -> bool {
+            self.rules.attested_lane && attested && self.attestors
+        }
+        pub fn admits(&self, sats: u64, attested: bool) -> bool {
+            if self.in_lane(attested) {
+                // Open while it has released no more than its budget; the
+                // claim that crosses the budget is paid in full.
+                self.attested.released <= self.attested.cap
+            } else {
+                self.open.admits(sats, attested || !self.attestors, self.rules.exempt_after_earlier_claims)
+            }
+        }
+        /// Take `sats` if admitted; false (and nothing moved) otherwise.
+        pub fn take(&mut self, sats: u64, attested: bool) -> bool {
+            if !self.admits(sats, attested) {
+                return false;
+            }
+            let window = if self.in_lane(attested) { &mut self.attested } else { &mut self.open };
+            window.released = window.released.saturating_add(u128::from(sats));
+            true
         }
     }
 
@@ -778,64 +783,6 @@ pub mod withdrawal {
         pub fn claims(&self) -> u64 {
             self.claims
         }
-        /// Forget every claim at or above `index` (a forfeit reset): those
-        /// leaves become claimable again, by whatever the new chain publishes
-        /// at their indices. Claims below `index` stay. Returns how many were
-        /// forgotten; `claims` drops by as much, so it keeps counting set bits.
-        pub(crate) fn forget_at_or_above(&mut self, index: u64) -> u64 {
-            let first = index / 256;
-            // Fully claimed words at or above `first` are stored again, so
-            // their high bits can be cleared one by one.
-            while self.floor > first {
-                self.floor -= 1;
-                self.words.insert(self.floor, [0xff; 32]);
-            }
-            let mut forgotten = 0u64;
-            for (word, bits) in self.words.range_mut(first..) {
-                for bit in 0..256u64 {
-                    let at = word.saturating_mul(256).saturating_add(bit);
-                    let mask = 1u8 << (bit % 8);
-                    if at >= index && bits[(bit / 8) as usize] & mask != 0 {
-                        bits[(bit / 8) as usize] &= !mask;
-                        forgotten += 1;
-                    }
-                }
-            }
-            self.words.retain(|_, bits| *bits != [0; 32]);
-            self.claims -= forgotten;
-            forgotten
-        }
-        /// Forget the claim of `index` alone (a forfeit reset); false if it
-        /// was not claimed.
-        pub(crate) fn forget(&mut self, index: u64) -> bool {
-            if !self.contains(index) {
-                return false;
-            }
-            let word = index / 256;
-            // Fully claimed words down to this one are stored again.
-            while self.floor > word {
-                self.floor -= 1;
-                self.words.insert(self.floor, [0xff; 32]);
-            }
-            let bit = (index % 256) as usize;
-            if let Some(bits) = self.words.get_mut(&word) {
-                bits[bit / 8] &= !(1 << (bit % 8));
-            }
-            self.words.retain(|_, bits| *bits != [0; 32]);
-            self.claims -= 1;
-            true
-        }
-        /// Whether any leaf at or above `index` is claimed.
-        pub fn any_at_or_above(&self, index: u64) -> bool {
-            if self.floor.saturating_mul(256) > index {
-                return true;
-            }
-            self.words.iter().any(|(word, bits)| {
-                (0..256u64).any(|bit| {
-                    bits[(bit / 8) as usize] & (1 << (bit % 8)) != 0 && word.saturating_mul(256).saturating_add(bit) >= index
-                })
-            })
-        }
         /// Words below this index are fully claimed (and not stored).
         pub fn floor(&self) -> u64 {
             self.floor
@@ -858,589 +805,151 @@ pub mod withdrawal {
             }
         }
     }
-
-    /// The leaves paid under the next program (review R308-7), each with the
-    /// L2 number of the withdrawal record its claim was proven against.
-    ///
-    /// The claim bitmap says that an index was paid, not which leaf nor
-    /// against which root, and L1 does not check that a later root extends an
-    /// earlier tree. A head reset ([`super::State::reset_head`]) therefore
-    /// reads here which claims were proven against a root of the tail it
-    /// drops, at any index. A paid leaf is never paid again, whatever a
-    /// forfeit reset forgets of the bitmap.
-    ///
-    /// Empty until the first claim under the next program, so every earlier
-    /// state keeps its bytes. Committed as its length and a running root. The
-    /// entries are kept in claim order, so the root folds again from them: a
-    /// cache restore refuses entries that do not fold to the committed root
-    /// (review R308-2P-1).
-    #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
-    #[derive(Clone, Debug, Default, PartialEq, Eq)]
-    pub struct PaidLeaves {
-        /// `(leaf index, leaf hash, L2 number of the record)` in claim order.
-        /// An entry at index [`PaidLeaves::DROPPED_TAIL`] is not a leaf: it
-        /// says that a forfeit reset dropped the tail above its number, so
-        /// the earlier entries proven above that number belong to no
-        /// retained chain any more (review R308-2P-5).
-        entries: Vec<(u64, [u8; 32], u64)>,
-        /// Leaf index -> positions in `entries`. Derived, never serialized.
-        #[cfg_attr(feature = "local-state-cache", serde(skip))]
-        by_index: std::collections::BTreeMap<u64, Vec<usize>>,
-        /// Running root over every entry, in claim order (zero while empty).
-        root: [u8; 32],
-    }
-    impl PaidLeaves {
-        /// Not a leaf index (indices are below `2^TREE_DEPTH`): the entry
-        /// that marks a tail dropped by a forfeit reset.
-        pub const DROPPED_TAIL: u64 = u64::MAX;
-        /// Whether exactly this leaf at `index` was paid.
-        pub fn contains(&self, index: u64, leaf: &[u8; 32]) -> bool {
-            index != Self::DROPPED_TAIL
-                && self.by_index.get(&index).is_some_and(|at| at.iter().any(|p| &self.entries[*p].1 == leaf))
-        }
-        /// Entries recorded, dropped-tail marks included.
-        pub fn len(&self) -> u64 {
-            self.entries.len() as u64
-        }
-        pub fn is_empty(&self) -> bool {
-            self.entries.is_empty()
-        }
-        pub fn root(&self) -> [u8; 32] {
-            self.root
-        }
-        fn fold(root: &[u8; 32], index: u64, leaf: &[u8; 32], l2_number: u64) -> [u8; 32] {
-            let mut h = Keccak256::new();
-            h.update(b"BLOCH:NATIVE:L2:PAID-LEAF:1");
-            h.update(root);
-            h.update(index.to_le_bytes());
-            h.update(leaf);
-            h.update(l2_number.to_le_bytes());
-            h.finalize().into()
-        }
-        pub(crate) fn record(&mut self, index: u64, leaf: [u8; 32], l2_number: u64) {
-            self.root = Self::fold(&self.root, index, &leaf, l2_number);
-            self.by_index.entry(index).or_default().push(self.entries.len());
-            self.entries.push((index, leaf, l2_number));
-        }
-        /// A forfeit reset dropped the tail above L2 block `number`: the
-        /// entries proven above it stay paid leaves and stop counting as
-        /// proven against a tail ([`Self::proven_above`]), because the
-        /// rebuilt chain uses those L2 numbers again.
-        pub(crate) fn record_dropped_tail(&mut self, number: u64) {
-            self.record(Self::DROPPED_TAIL, [0; 32], number);
-        }
-        /// Indices with a leaf paid against a record above L2 block `number`
-        /// that a forfeit reset has not dropped since, ascending.
-        pub fn proven_above(&self, number: u64) -> Vec<u64> {
-            // Newest first: `kept` is the lowest number any later forfeit
-            // reset kept, so an entry above it was proven against a tail that
-            // is gone.
-            let mut kept = u64::MAX;
-            let mut indices = std::collections::BTreeSet::new();
-            for (index, _, n) in self.entries.iter().rev() {
-                if *index == Self::DROPPED_TAIL {
-                    kept = kept.min(*n);
-                } else if *n > number && *n <= kept {
-                    indices.insert(*index);
-                }
-            }
-            indices.into_iter().collect()
-        }
-        pub(crate) fn encode(&self, out: &mut Vec<u8>) {
-            out.extend_from_slice(b"BLOCH:NATIVE:L2:PAID-LEAVES:1");
-            out.extend_from_slice(&self.len().to_le_bytes());
-            out.extend_from_slice(&self.root);
-        }
-        /// The index over deserialized entries (a cache restore).
-        #[cfg(feature = "local-state-cache")]
-        pub(crate) fn reindexed(mut self) -> Self {
-            self.by_index.clear();
-            for (at, (index, _, _)) in self.entries.iter().enumerate() {
-                self.by_index.entry(*index).or_default().push(at);
-            }
-            self
-        }
-        /// Whether the entries fold, in order, to the stored running root,
-        /// and the index covers them. The state root check that follows a
-        /// cache restore authenticates the length and that root, so an
-        /// altered, missing, added or reordered entry does not restore.
-        #[cfg(feature = "local-state-cache")]
-        pub(crate) fn consistent(&self) -> bool {
-            let folded = self.entries.iter().fold([0; 32], |root, (index, leaf, n)| Self::fold(&root, *index, leaf, *n));
-            folded == self.root
-                && (self.entries.is_empty()) == (self.root == [0; 32])
-                && self.by_index.values().map(Vec::len).sum::<usize>() == self.entries.len()
-                && self.by_index.iter().all(|(index, at)| at.iter().all(|p| self.entries.get(*p).is_some_and(|e| e.0 == *index)))
-        }
-    }
 }
 
-/// L1 forced inclusion of L2 transactions (CANDIDATE, inert: no L2 enables it
-/// while [`crate::params::L2_FORCED_INCLUSION_EPOCH`] is the sentinel).
+/// Settler authorization (AUDIT-L1L2-20261123 L2N-01, the L1 stop-gap).
 ///
-/// Why: settlement is open, so a third party that lands a rule-conforming block
-/// once per finality window keeps the sequencer from ever including a user
-/// transaction (agents 42 and 66), and the sequencer itself can censor. Nothing
-/// on L1 forced a settlement to carry any user transaction.
+/// The settlement statement binds neither the L2 block's `timestamp` nor its
+/// `prevrandao`, and settlement is permissionless, so one outside proof can
+/// leave an L2 head whose state nobody else can rebuild. Behind
+/// `params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH` an L2 that has a
+/// settler set installed accepts a settlement only with an
+/// [`Authorization`]: a signature of one registered settler key over that
+/// exact settlement. It removes the outsider; it keeps the single-sequencer
+/// trust the L2 already has (a registered key can still misbehave).
 ///
-/// What: an `L2ForcedTransaction` (wire 0x1C) publishes ONE signed L2 envelope
-/// on L1 and queues `(native height, L1 txid, keccak256(envelope), declared gas
-/// limit)`. The queue is frozen with the source, exactly like the deposit
-/// inbox, and every V3 settlement, whoever proves it, must consume everything
-/// queued at its anchor, at most [`MAX_PER_SETTLEMENT`], in queue order. There
-/// is no delay window and no sequencer identity: the rule is the same for the
-/// sequencer and for any other settler.
-///
-/// How L1 binds it without a new statement field: the guest executes the
-/// consumed envelopes right after the deposits, before the sequencer's
-/// transactions, skipping exactly those that are not valid at that point
-/// (decoding, chain, signature, gas limit above the declared one, nonce, funds,
-/// base fee), and publishes [`inbox_hash`] in the statement's `deposits_hash`
-/// slot. With nothing consumed, [`inbox_hash`] IS the deposits hash, so blocks
-/// without forced transactions keep their exact statement bytes. Skipped
-/// envelopes are consumed too, so an invalid envelope cannot block the queue.
-/// The envelopes are their own data availability: they are in the L1 block.
-///
-/// Shared format (pinned by `forced_hash_matches_the_l2_golden_vector` here and
-/// by `forced_inclusion_golden_vector` in bloch-l2-evm):
-///
-/// * record: `l1_height (u64 BE) || l1_txid (32) || keccak256(envelope) (32)
-///   || declared gas limit (u64 BE)`;
-/// * forced hash: `keccak256` of the concatenated records (`keccak256("")`
-///   when empty);
-/// * inbox hash: `keccak256("BLOCH:L2:INBOX:2" || deposits_hash || forced hash)`
-///   when at least one record is consumed, else `deposits_hash`.
-pub mod forced {
-    use sha3::{Digest, Keccak256};
+/// * Registration: the set (1 to [`MAX_KEYS`] hybrid keys: the settler's
+///   key and offline standby keys) is pinned in the release that arms the
+///   gate ([`super::mainnet::SETTLER_SET`]) and installed at the gate's
+///   first epoch boundary. No admin key and no on-chain vote.
+/// * Rotation: an authorized settlement may carry the next set; the
+///   signature covers it and the set is replaced when the settlement is
+///   accepted. Any registered key can rotate, so a standby key replaces a
+///   lost or exposed settler key with one (possibly empty) settlement.
+/// * Loss of every registered key: no settlement is valid until an L1
+///   release installs a new set at a new flag day. The L2 state stays
+///   reconstructible and deposits stay in escrow; nothing lapses to
+///   permissionless on a timer, because the timer would reopen the attack
+///   exactly when the settler is down.
+pub mod settler {
+    use crate::transition::funded::{ADMISSION_PQ_KEY_BYTES, ADMISSION_PQ_SIGNATURE_MAX};
+    use sha3::{Digest, Sha3_256};
 
-    /// Records one settlement consumes at most, from the front of the queue.
-    /// Separate from the deposit cap, so a full queue never slows deposits.
-    /// It never binds before the gas cap (16 x 21k > 300k); it stays a guard.
-    pub const MAX_PER_SETTLEMENT: u64 = 16;
-    /// Queue capacity in weight units: the queue's position ([`Queue::pending_weight`]),
-    /// which counts every settlement-sized group of the due rule ([`Packing`])
-    /// at no less than [`UNITS_PER_SETTLEMENT`]. A submission whose record would
-    /// end past it is refused ([`surcharge_sat`]).
-    ///
-    /// Latency bound (review 164 R3, decided 2026-11-02 22:30): each settlement
-    /// whose anchor follows a record consumes at least one whole group ahead of
-    /// it, and each group counts at least [`UNITS_PER_SETTLEMENT`] units, so a
-    /// record that ends at position `p` is consumed by the `ceil(p / 14)`-th
-    /// settlement anchored after it. At capacity that is [`MAX_DRAIN_SETTLEMENTS`]
-    /// = 19, whatever record sizes or mix a filler picks; on an empty queue it
-    /// is the first one (the second settlement after the submission, counting
-    /// the one in flight).
-    pub const MAX_PENDING_WEIGHT: u64 = 256;
-    /// Forced submissions per native block, like DA batches.
-    pub const MAX_PER_BLOCK: usize = 4;
-    /// One signed L2 envelope (EIP-2718) at most this long.
-    pub const MAX_ENVELOPE_BYTES: usize = 8 * 1024;
-    /// Declared gas limit bounds: at least an intrinsic transfer, at most this.
-    /// The guest skips an envelope whose own gas limit is above the declared
-    /// one, so the declared gas bounds what an envelope can execute.
-    pub const MIN_GAS: u64 = 21_000;
-    pub const MAX_GAS: u64 = 300_000;
-    /// Declared gas one settlement must consume at most: the due prefix stops
-    /// before the record that would cross it. Forced envelopes bypass the
-    /// sequencer's proving budget, so this is what bounds their proving work.
-    /// The worst measured EVM-gas-to-SP1-gas ratio is about 216 (a modexp,
-    /// agent 90), so 300k gas is at most about 65M SP1 gas on top of the block:
-    /// inside the proven range, with room for the sequencer's transactions.
-    /// To be re-measured on the final sparse guest before the gate is armed.
-    pub const MAX_GAS_PER_SETTLEMENT: u64 = 300_000;
-    const _: () = assert!(MAX_GAS <= MAX_GAS_PER_SETTLEMENT);
-    /// Weight units one settlement drains at least: one transfer is one unit,
-    /// and a settlement holds 14 of them.
-    pub const UNITS_PER_SETTLEMENT: u64 = MAX_GAS_PER_SETTLEMENT / MIN_GAS;
-    const _: () = assert!(UNITS_PER_SETTLEMENT == 14);
-    /// Settlements anchored after a record that consume it at the latest, at
-    /// capacity (see [`MAX_PENDING_WEIGHT`]).
-    pub const MAX_DRAIN_SETTLEMENTS: u64 = MAX_PENDING_WEIGHT.div_ceil(UNITS_PER_SETTLEMENT);
-    const _: () = assert!(MAX_DRAIN_SETTLEMENTS == 19);
-    /// Queue-depth price per weight unit, at the unit's own position `u`:
-    /// `BASE_SURCHARGE_SAT << (u / SURCHARGE_DOUBLING)` ([`unit_price_sat`]).
-    /// A record pays the sum over the positions it occupies, including the room
-    /// it leaves unused in the group it closes ([`surcharge_sat`], review 164 R5).
-    /// An empty queue costs the base per unit; the last units of a full queue
-    /// cost `2^10` times it.
-    ///
-    /// Doubling every 24 units (not 32) is the steeper ladder decided on review
-    /// 164 R6 (target about 10x the cost of keeping the queue full, 8 units x
-    /// 128_000 = 1_024_000 sat per settlement before). Holding the queue full
-    /// now means buying back, every settlement, the whole group the settlement
-    /// consumed, at least 14 units at the top of the queue. The cheapest full
-    /// hold is 150_001-gas records at position 246: positions 232..=245 each
-    /// settlement, `8 x 512_000 + 6 x 1_024_000 = 10_240_000` sat (0.1024
-    /// BLCH, 10.0x); with transfers it is positions 242..=255, `14 x 1_024_000
-    /// = 14_336_000` sat. Filling it from empty costs `24_000 x (2^10 - 1) + 16
-    /// x 1_024_000 = 40_936_000` sat (0.409 BLCH).
-    pub const BASE_SURCHARGE_SAT: u64 = 1_000;
-    pub const SURCHARGE_DOUBLING: u64 = 24;
-    const _: () = assert!(MAX_PENDING_WEIGHT / SURCHARGE_DOUBLING < 32);
-    /// The largest weight one record can be charged: up to 13 units of room it
-    /// leaves in the group it closes, plus its own (14 at [`MAX_GAS`]).
-    pub const MAX_CHARGED_WEIGHT: u64 = UNITS_PER_SETTLEMENT - 1 + weight(MAX_GAS);
-    pub const INBOX_DOMAIN: &[u8] = b"BLOCH:L2:INBOX:2";
-    /// Consumed records kept, with the L2 number of the settlement that
-    /// consumed them, so that a rollback head reset can queue them again
-    /// ([`Queue::requeue_after`]). At [`MAX_PER_SETTLEMENT`] per settlement
-    /// this covers at least 64 settlements; a plain reset deeper than the log
-    /// is refused rather than losing forced transactions, and a forfeit reset
-    /// queues again what the log still has ([`Queue::requeue_logged_after`]),
-    /// so that what a tail consumes cannot keep the head on it.
-    pub const CONSUMED_LOG: usize = 1_024;
+    /// Registered keys: the settler's and up to two standby keys.
+    pub const MAX_KEYS: usize = 3;
+    pub const AUTHORIZATION_DOMAIN: &[u8] = b"BLOCH:L2:SETTLER-AUTH:1";
+    pub const SET_DOMAIN: &[u8] = b"BLOCH:L2:SETTLER-SET:1";
+    /// Largest encoded [`Authorization`].
+    pub const MAX_AUTHORIZATION_BYTES: usize = 1 + 4 + ADMISSION_PQ_SIGNATURE_MAX + 1 + MAX_KEYS * ADMISSION_PQ_KEY_BYTES;
 
-    #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct Record {
-        /// Native height of the block that included the forced transaction.
-        pub height: u64,
-        /// Its L1 txid: where a rebuilder reads the envelope.
-        pub l1_txid: [u8; 32],
-        /// keccak256 of the envelope, which is its L2 transaction hash.
-        pub envelope_hash: [u8; 32],
-        /// Declared gas limit, in [`MIN_GAS`]..=[`MAX_GAS`].
-        pub gas_limit: u64,
-    }
-    impl Record {
-        pub fn encode(&self) -> [u8; 80] {
-            let mut out = [0u8; 80];
-            out[..8].copy_from_slice(&self.height.to_be_bytes());
-            out[8..40].copy_from_slice(&self.l1_txid);
-            out[40..72].copy_from_slice(&self.envelope_hash);
-            out[72..].copy_from_slice(&self.gas_limit.to_be_bytes());
-            out
-        }
+    /// The trailer of an authorized settlement transaction:
+    /// `signer (u8) || signature length (u32 LE) || signature ||
+    /// next-set key count (u8, 0 = keep the set) || keys`.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Authorization {
+        /// Index of the signing key in the registered set.
+        pub signer: u8,
+        pub signature: Vec<u8>,
+        /// The set that replaces the registered one when this settlement is
+        /// accepted; `None` keeps it.
+        pub next_set: Option<Vec<Vec<u8>>>,
     }
 
-    /// keccak256 of the concatenated records.
-    pub fn hash(records: &[Record]) -> [u8; 32] {
-        let mut h = Keccak256::new();
-        for r in records {
-            h.update(r.encode());
+    /// 1 to [`MAX_KEYS`] distinct keys of the enveloped hybrid size.
+    pub fn valid_set(keys: &[Vec<u8>]) -> bool {
+        !keys.is_empty()
+            && keys.len() <= MAX_KEYS
+            && keys.iter().all(|k| k.len() == ADMISSION_PQ_KEY_BYTES)
+            && keys.iter().enumerate().all(|(i, k)| !keys[..i].contains(k))
+    }
+
+    /// `SHA3-256(SET_DOMAIN || count || keys)`, in set order.
+    pub fn set_hash(keys: &[Vec<u8>]) -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        h.update(SET_DOMAIN);
+        h.update([keys.len() as u8]);
+        for key in keys {
+            h.update(key);
         }
         h.finalize().into()
     }
 
-    /// What a V3 statement's `deposits_hash` slot holds under forced inclusion.
-    pub fn inbox_hash(deposits_hash: [u8; 32], consumed: &[Record]) -> [u8; 32] {
-        if consumed.is_empty() {
-            return deposits_hash;
-        }
-        let mut h = Keccak256::new();
-        h.update(INBOX_DOMAIN);
-        h.update(deposits_hash);
-        h.update(hash(consumed));
+    /// What the settler signs: `SHA3-256(AUTHORIZATION_DOMAIN ||
+    /// network_domain || chain_id (u64 BE) || settlement commitment ||
+    /// next-set hash or 32 zero bytes)`. The commitment covers the proof
+    /// policy, the statement (hence the previous head and the source anchor:
+    /// it is valid at one head only) and the proof bytes, so nobody can
+    /// re-randomize an authorized proof.
+    pub fn digest(network_domain: &[u8; 32], chain_id: u64, commitment: &[u8; 32], next_set: Option<&[Vec<u8>]>) -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        h.update(AUTHORIZATION_DOMAIN);
+        h.update(network_domain);
+        h.update(chain_id.to_be_bytes());
+        h.update(commitment);
+        h.update(next_set.map_or([0; 32], set_hash));
         h.finalize().into()
     }
 
-    /// Weight units of a record declaring `gas`: its share of one settlement,
-    /// `ceil(gas * 14 / 300k)` (1 for a transfer, 8 at 150_001, 14 at [`MAX_GAS`]).
-    pub const fn weight(gas: u64) -> u64 {
-        gas.saturating_mul(UNITS_PER_SETTLEMENT).div_ceil(MAX_GAS_PER_SETTLEMENT)
-    }
-
-    /// The price of the weight unit at queue position `position`.
-    pub const fn unit_price_sat(position: u64) -> u64 {
-        BASE_SURCHARGE_SAT << (position / SURCHARGE_DOUBLING)
-    }
-
-    /// The surcharge of `weight` units occupying positions `pending..pending +
-    /// weight`, each priced at its own position, or `None` when they do not
-    /// fit (or `weight` is 0). At most two price tiers per record, summed in
-    /// closed form.
-    pub const fn surcharge_sat(pending: u64, weight: u64) -> Option<u64> {
-        if weight == 0 || pending.saturating_add(weight) > MAX_PENDING_WEIGHT {
-            return None;
-        }
-        let end = pending + weight;
-        let mut at = pending;
-        let mut total = 0u64;
-        while at < end {
-            let tier_end = (at / SURCHARGE_DOUBLING + 1) * SURCHARGE_DOUBLING;
-            let stop = if tier_end < end { tier_end } else { end };
-            total += unit_price_sat(at) * (stop - at);
-            at = stop;
-        }
-        Some(total)
-    }
-
-    /// The most a record declaring `gas` can be charged while the queue's
-    /// position is at most `pending`: what a wallet signs as its maximum
-    /// surcharge (`pending` = the position it read plus its headroom). Any
-    /// surplus over the charged surcharge is refunded to the sender, so the
-    /// ceiling only ties up funds for one block. `None` for a shape-invalid gas.
-    pub const fn surcharge_ceiling_sat(pending: u64, gas: u64) -> Option<u64> {
-        if gas < MIN_GAS || gas > MAX_GAS {
-            return None;
-        }
-        let span = UNITS_PER_SETTLEMENT - 1 + weight(gas);
-        let mut hi = pending.saturating_add(span);
-        if hi > MAX_PENDING_WEIGHT {
-            hi = MAX_PENDING_WEIGHT;
-        }
-        let lo = hi.saturating_sub(span);
-        surcharge_sat(lo, hi - lo)
-    }
-
-    /// Settlement-sized groups of the due rule, built front to back exactly as
-    /// successive settlements consume them ([`Queue::due`]: in order, at most
-    /// [`MAX_PER_SETTLEMENT`] records and [`MAX_GAS_PER_SETTLEMENT`] declared
-    /// gas). A group is closed by the first record that does not fit; a closed
-    /// group counts `max(UNITS_PER_SETTLEMENT, its weight)`, so the record that
-    /// closes it pays for the room it leaves unused. The open group counts its
-    /// weight. Removing whole groups from the front leaves the later groups as
-    /// they were, and removing part of the first one never adds a group (the
-    /// greedy rule stays ahead), so a record's group number only goes down.
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub struct Packing {
-        /// Units of the closed groups.
-        pub closed: u64,
-        /// Declared gas, records and weight of the open group.
-        pub gas: u64,
-        pub records: u64,
-        pub units: u64,
-    }
-    impl Packing {
-        pub const fn add(mut self, gas: u64) -> Self {
-            if self.records > 0
-                && (self.gas.saturating_add(gas) > MAX_GAS_PER_SETTLEMENT || self.records >= MAX_PER_SETTLEMENT)
-            {
-                let units = if self.units > UNITS_PER_SETTLEMENT { self.units } else { UNITS_PER_SETTLEMENT };
-                self.closed = self.closed.saturating_add(units);
-                self.gas = 0;
-                self.records = 0;
-                self.units = 0;
-            }
-            self.gas = self.gas.saturating_add(gas);
-            self.records += 1;
-            self.units += weight(gas);
-            self
-        }
-        /// The queue position: units of everything packed so far.
-        pub const fn position(&self) -> u64 {
-            self.closed.saturating_add(self.units)
-        }
-    }
-
-    /// The protocol treasury that receives every charged surcharge (decided
-    /// 2026-11-02 22:30: not burned, and not shared with the block producer).
-    /// `None` until the owner names it ([`super::mainnet::FORCED_INCLUSION_TREASURY`]);
-    /// forced inclusion is never enabled without it, and
-    /// `hard_forks::l2_forced_inclusion_may_arm` refuses to arm without it.
-    pub fn treasury() -> Option<[u8; 32]> {
-        #[cfg(test)]
-        {
-            treasury_test::get()
-        }
-        #[cfg(not(test))]
-        {
-            super::mainnet::FORCED_INCLUSION_TREASURY
-        }
-    }
-    /// Tests run with a throwaway treasury unless a test unsets it.
-    #[cfg(test)]
-    pub(crate) mod treasury_test {
-        use std::cell::Cell;
-        pub const TREASURY: [u8; 32] = [0x7e; 32];
-        thread_local! { static SET: Cell<bool> = const { Cell::new(true) }; }
-        pub fn get() -> Option<[u8; 32]> {
-            SET.with(Cell::get).then_some(TREASURY)
-        }
-        pub fn unset() -> impl Drop {
-            struct Restore(bool);
-            impl Drop for Restore {
-                fn drop(&mut self) {
-                    SET.with(|v| v.set(self.0));
-                }
-            }
-            let was = SET.with(|v| v.replace(false));
-            Restore(was)
-        }
-    }
-
-    /// The queue, present only on an L2 where forced inclusion is enabled.
-    #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
-    #[derive(Clone, Debug, Default, PartialEq, Eq)]
-    pub struct Queue {
-        /// Unconsumed records, oldest first. Consumed ones are dropped: the
-        /// running root keeps the history.
-        pub(crate) pending: Vec<Record>,
-        /// Records ever queued and ever consumed.
-        pub(crate) queued: u64,
-        pub(crate) consumed: u64,
-        /// Running root over every record ever queued.
-        pub(crate) root: [u8; 32],
-        /// Pending count frozen with the source anchor.
-        pub(crate) anchor: Option<u64>,
-        /// The newest consumed records, oldest first, each with the L2 number
-        /// of the settlement that consumed it; at most [`CONSUMED_LOG`].
-        pub(crate) log: Vec<(u64, Record)>,
-        /// Highest L2 number among records dropped from `log` (0: none).
-        pub(crate) log_floor: u64,
-    }
-    impl Queue {
-        pub(crate) fn new() -> Self {
-            Self { root: Keccak256::digest(b"BLOCH:NATIVE:L2:EMPTY-FORCED:1").into(), ..Self::default() }
-        }
-        pub fn pending(&self) -> &[Record] {
-            &self.pending
-        }
-        pub fn queued(&self) -> u64 {
-            self.queued
-        }
-        pub fn consumed(&self) -> u64 {
-            self.consumed
-        }
-        pub fn root(&self) -> [u8; 32] {
-            self.root
-        }
-        /// What the next settlement must consume: everything pending at the
-        /// anchor, in order, up to [`MAX_PER_SETTLEMENT`] records and
-        /// [`MAX_GAS_PER_SETTLEMENT`] declared gas. Before an anchor, what is
-        /// pending now, with the same caps.
-        pub fn due(&self) -> &[Record] {
-            let frozen = self.anchor.unwrap_or(self.pending.len() as u64);
-            let mut gas = 0u64;
-            let mut n = 0usize;
-            for r in self.pending.iter().take(frozen.min(MAX_PER_SETTLEMENT) as usize) {
-                gas = gas.saturating_add(r.gas_limit);
-                if gas > MAX_GAS_PER_SETTLEMENT {
-                    break;
-                }
-                n += 1;
-            }
-            &self.pending[..n]
-        }
-        fn packing(&self) -> Packing {
-            self.pending.iter().fold(Packing::default(), |p, r| p.add(r.gas_limit))
-        }
-        /// The queue position in weight units ([`Packing`]), at most
-        /// [`MAX_PENDING_WEIGHT`] (more only after a head reset re-queues).
-        pub fn pending_weight(&self) -> u64 {
-            self.packing().position()
-        }
-        /// Where a record declaring `gas` would start and how many units it
-        /// would be charged: its own weight plus the room it leaves unused in
-        /// the group it closes.
-        pub fn charged_weight(&self, gas: u64) -> (u64, u64) {
-            let before = self.packing();
-            let after = before.add(gas);
-            (before.position(), after.position() - before.position())
-        }
-        /// The surcharge a record declaring `gas` pays now, or `None` when it
-        /// does not fit.
-        pub fn surcharge_for(&self, gas: u64) -> Option<u64> {
-            let (at, units) = self.charged_weight(gas);
-            surcharge_sat(at, units)
-        }
-        pub(crate) fn push(&mut self, record: Record) -> Result<(), Refusal> {
-            if self.surcharge_for(record.gas_limit).is_none() {
-                return Err(Refusal::Full);
-            }
-            let mut h = Keccak256::new();
-            h.update(b"BLOCH:NATIVE:L2:FORCED:1");
-            h.update(self.root);
-            h.update(record.encode());
-            self.root = h.finalize().into();
-            self.pending.push(record);
-            self.queued += 1;
-            Ok(())
-        }
-        /// Consume the due records in the settlement of L2 block `l2_number`.
-        pub(crate) fn consume_due(&mut self, l2_number: u64) {
-            let n = self.due().len();
-            self.log.extend(self.pending.drain(..n).map(|r| (l2_number, r)));
-            self.consumed += n as u64;
-            self.anchor = None;
-            if self.log.len() > CONSUMED_LOG {
-                let excess = self.log.len() - CONSUMED_LOG;
-                for (number, _) in self.log.drain(..excess) {
-                    self.log_floor = self.log_floor.max(number);
+    impl Authorization {
+        pub fn encode(&self, out: &mut Vec<u8>) {
+            out.push(self.signer);
+            out.extend_from_slice(&(self.signature.len() as u32).to_le_bytes());
+            out.extend_from_slice(&self.signature);
+            match &self.next_set {
+                None => out.push(0),
+                Some(keys) => {
+                    out.push(keys.len() as u8);
+                    for key in keys {
+                        out.extend_from_slice(key);
+                    }
                 }
             }
         }
-        /// The consumed log.
-        pub fn consumed_log(&self) -> &[(u64, Record)] {
-            &self.log
+        pub fn encoded_len(&self) -> usize {
+            1 + 4 + self.signature.len() + 1 + self.next_set.as_ref().map_or(0, |keys| keys.iter().map(Vec::len).sum())
         }
-        /// Whether a head reset to L2 block `number` can queue again every
-        /// record a later settlement consumed.
-        pub fn covers_reset_to(&self, number: u64) -> bool {
-            self.log_floor <= number
-        }
-        /// Head reset to L2 block `number`: every record consumed by a later
-        /// settlement goes back to the front of the queue, in its original
-        /// order, as the deposit cursor goes back for deposits. The running
-        /// root is unchanged (nothing new is queued). A frozen anchor grows by
-        /// the records put back, which were queued before it. Returns the
-        /// number put back, or `None` (no change) when the log does not reach.
-        pub(crate) fn requeue_after(&mut self, number: u64) -> Option<u64> {
-            if !self.covers_reset_to(number) {
+        /// Exact decoding: every byte is consumed and every bound holds, so
+        /// one authorization has one encoding.
+        pub fn decode(bytes: &[u8]) -> Option<Self> {
+            let (&signer, rest) = bytes.split_first()?;
+            let len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+            if len == 0 || len > ADMISSION_PQ_SIGNATURE_MAX {
                 return None;
             }
-            Some(self.requeue_logged_after(number))
+            let rest = &rest[4..];
+            let signature = rest.get(..len)?.to_vec();
+            let (&count, rest) = rest[len..].split_first()?;
+            let count = usize::from(count);
+            if count > MAX_KEYS || rest.len() != count * ADMISSION_PQ_KEY_BYTES {
+                return None;
+            }
+            let next_set = (count != 0).then(|| rest.chunks(ADMISSION_PQ_KEY_BYTES).map(<[u8]>::to_vec).collect::<Vec<_>>());
+            if usize::from(signer) >= MAX_KEYS || next_set.as_ref().is_some_and(|keys| !valid_set(keys)) {
+                return None;
+            }
+            Some(Self { signer, signature, next_set })
         }
-        /// The same, whatever the log covers (a forfeit head reset): every
-        /// logged record consumed after L2 block `number` goes back; records
-        /// of later settlements that the log already dropped stay consumed
-        /// and are not executed by the new chain. The log then holds nothing
-        /// above `number`, and its floor is at most `number`. Returns the
-        /// number put back.
-        pub(crate) fn requeue_logged_after(&mut self, number: u64) -> u64 {
-            let keep = self.log.iter().position(|(n, _)| *n > number).unwrap_or(self.log.len());
-            let back: Vec<Record> = self.log.drain(keep..).map(|(_, r)| r).collect();
-            let count = back.len() as u64;
-            self.pending.splice(0..0, back);
-            self.consumed -= count;
-            if let Some(anchor) = self.anchor.as_mut() {
-                *anchor += count;
-            }
-            self.log_floor = self.log_floor.min(number);
-            count
-        }
-        pub(crate) fn encode(&self, out: &mut Vec<u8>) {
-            out.extend_from_slice(b"BLOCH:NATIVE:L2:FORCED-STATE:2");
-            out.extend_from_slice(&self.queued.to_le_bytes());
-            out.extend_from_slice(&self.consumed.to_le_bytes());
-            out.extend_from_slice(&self.root);
-            match self.anchor {
-                None => out.push(0),
-                Some(count) => {
-                    out.push(1);
-                    out.extend_from_slice(&count.to_le_bytes());
-                }
-            }
-            out.extend_from_slice(&(self.pending.len() as u64).to_le_bytes());
-            for r in &self.pending {
-                out.extend_from_slice(&r.encode());
-            }
-            out.extend_from_slice(&self.log_floor.to_le_bytes());
-            out.extend_from_slice(&(self.log.len() as u64).to_le_bytes());
-            for (number, r) in &self.log {
-                out.extend_from_slice(&number.to_le_bytes());
-                out.extend_from_slice(&r.encode());
-            }
-        }
-    }
-
-    /// Why the L2 state refused to queue a forced transaction.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Refusal {
-        /// Forced inclusion is not enabled on this L2.
-        NotActive,
-        /// The submission names another L2 chain.
-        Chain,
-        /// Declared gas outside [`MIN_GAS`]..=[`MAX_GAS`], or an empty or
-        /// oversized envelope.
-        Shape,
-        /// The record does not fit in [`MAX_PENDING_WEIGHT`].
-        Full,
     }
 }
 
 /// Records one settlement must consume, when pending: min(pending, this).
 pub const MAX_INBOX_PER_SETTLEMENT: u64 = 64;
+/// L2 deposits per native block once
+/// `params::L2_DEPOSIT_INFLOW_BOUND_ACTIVATION_EPOCH` binds (L1X-02). With one
+/// settlement per [`DEPOSIT_DRAIN_BLOCKS`] native blocks the inflow then
+/// does not exceed what a settlement consumes. Raise it together with
+/// [`MAX_INBOX_PER_SETTLEMENT`], never alone.
+pub const MAX_DEPOSITS_PER_BLOCK: usize = 2;
+/// Native blocks one settlement is assumed to take (one Groth16 proof on the
+/// mainnet prover: about 15 minutes of 30 s slots).
+pub const DEPOSIT_DRAIN_BLOCKS: u64 = 30;
+const _: () = assert!(MAX_DEPOSITS_PER_BLOCK as u64 * DEPOSIT_DRAIN_BLOCKS <= MAX_INBOX_PER_SETTLEMENT);
+/// Inbox records that may wait for a settlement once the same gate binds: a
+/// deposit is refused while this many are pending. The per-block cap assumes
+/// a prover speed; this bound does not. It also bounds what a stopped
+/// settler leaves in escrow, and the wait of an escrowed deposit to this
+/// many records, i.e. four settlements.
+pub const MAX_PENDING_DEPOSITS: u64 = 4 * MAX_INBOX_PER_SETTLEMENT;
 /// Exact L2 body framing tag (`bloch_l2_evm::node_primitives::NodeBodyV2`).
 const L2_BODY_TAG: &[u8] = b"BLOCH:EVM:BODY:2";
 
@@ -1551,18 +1060,51 @@ pub struct Transaction {
     pub proof_policy: [u8; 32],
     pub statement: Vec<u8>,
     pub proof: [u8; PROOF_BYTES],
+    /// Settler authorization (audit L2N-01), a trailer after the proof of a
+    /// V3 settlement. `None` is the wire form every settlement has had so
+    /// far. The consensus decoder yields `Some` only in a build that arms
+    /// `params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH` (see
+    /// [`decode_async`](Self::decode_async)), and consensus accepts it only
+    /// on an L2 with a settler set installed behind that gate.
+    pub authorization: Option<settler::Authorization>,
 }
 impl Transaction {
+    /// The consensus decoder of a synchronous settlement (block bodies,
+    /// mempool, RPC). See [`decode_async`](Self::decode_async) for the
+    /// trailer rule.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        Self::decode_tag(bytes, WIRE_TAG)
+        Self::decode_tag(bytes, WIRE_TAG, crate::params::l2_settler_trailer_decodable())
     }
+    /// The consensus decoder of an asynchronous settlement (block bodies,
+    /// mempool, RPC). The authorization trailer is part of the wire format
+    /// only in a build that arms
+    /// `params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH`: while that gate
+    /// is inert these bytes decode exactly as they did before the trailer
+    /// existed (the two exact settlement lengths and nothing else), so a
+    /// settlement with a trailer is not a transaction at all. In an armed
+    /// build the trailer decodes at every epoch and
+    /// `State::check_authorization` refuses it on an L2 without a settler
+    /// set; that refusal stays in an inert build too, as defence in depth
+    /// for a `Transaction` value built in memory.
     pub fn decode_async(bytes: &[u8]) -> Option<Self> {
-        Self::decode_tag(bytes, ASYNC_WIRE_TAG)
+        Self::decode_tag(bytes, ASYNC_WIRE_TAG, crate::params::l2_settler_trailer_decodable())
     }
-    fn decode_tag(bytes: &[u8], tag: u8) -> Option<Self> {
-        let statement_bytes = match bytes.len() {
-            TRANSACTION_BYTES => STATEMENT_BYTES,
-            TRANSACTION_V3_BYTES => STATEMENT_V3_BYTES,
+    /// TOOLING ONLY (`bloch-pos l2-settler`, test vectors, readers that
+    /// inspect an authorized settlement before the gate is armed): decodes an
+    /// asynchronous settlement with or without the authorization trailer,
+    /// whatever the gate. Never used to judge a block or a mempool
+    /// transaction.
+    pub fn decode_async_with_authorization(bytes: &[u8]) -> Option<Self> {
+        Self::decode_tag(bytes, ASYNC_WIRE_TAG, true)
+    }
+    fn decode_tag(bytes: &[u8], tag: u8, trailer_decodable: bool) -> Option<Self> {
+        let (statement_bytes, trailer) = match bytes.len() {
+            TRANSACTION_BYTES => (STATEMENT_BYTES, None),
+            TRANSACTION_V3_BYTES => (STATEMENT_V3_BYTES, None),
+            // A V3 settlement followed by a settler authorization.
+            n if trailer_decodable && n > TRANSACTION_V3_BYTES && n <= TRANSACTION_V3_BYTES + settler::MAX_AUTHORIZATION_BYTES => {
+                (STATEMENT_V3_BYTES, Some(&bytes[TRANSACTION_V3_BYTES..]))
+            }
             _ => return None,
         };
         if bytes[0] != tag {
@@ -1570,10 +1112,15 @@ impl Transaction {
         }
         let statement = &bytes[33..33 + statement_bytes];
         StatementVersion::of(statement)?;
+        let authorization = match trailer {
+            None => None,
+            Some(trailer) => Some(settler::Authorization::decode(trailer)?),
+        };
         Some(Self {
             proof_policy: bytes[1..33].try_into().ok()?,
             statement: statement.to_vec(),
-            proof: bytes[33 + statement_bytes..].try_into().ok()?,
+            proof: bytes[33 + statement_bytes..33 + statement_bytes + PROOF_BYTES].try_into().ok()?,
+            authorization,
         })
     }
     /// The statement version, or `None` for a malformed in-memory value.
@@ -1587,12 +1134,19 @@ impl Transaction {
         self.encode_tag(ASYNC_WIRE_TAG)
     }
     fn encode_tag(&self, tag: u8) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(1 + 32 + self.statement.len() + PROOF_BYTES);
+        let mut bytes = Vec::with_capacity(self.wire_len());
         bytes.push(tag);
         bytes.extend_from_slice(&self.proof_policy);
         bytes.extend_from_slice(&self.statement);
         bytes.extend_from_slice(&self.proof);
+        if let Some(authorization) = &self.authorization {
+            authorization.encode(&mut bytes);
+        }
         bytes
+    }
+    /// Length of the canonical encoding (tag included).
+    pub fn wire_len(&self) -> usize {
+        1 + 32 + self.statement.len() + PROOF_BYTES + self.authorization.as_ref().map_or(0, settler::Authorization::encoded_len)
     }
     // Preserve the existing L2 kernel's settlement-chain commitment: the native
     // wire discriminator is separate from the experimental kernel framing.
@@ -1618,6 +1172,127 @@ fn h(bytes: &[u8], offset: usize) -> [u8; 32] {
 }
 fn n(bytes: &[u8], offset: usize) -> u64 {
     u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+/// The settler set a network installs at the first epoch boundary behind
+/// `params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH` (audit L2N-01): the
+/// pinned mainnet set for the mainnet L2, nothing for any other policy.
+pub fn settler_set_for(policy: &Policy) -> Option<Vec<Vec<u8>>> {
+    #[cfg(test)]
+    if let Some(keys) = settler_rehearsal::keys() {
+        return Some(keys);
+    }
+    if policy.chain_id != MAINNET_CHAIN_ID {
+        return None;
+    }
+    mainnet::settler_keys(mainnet::SETTLER_SET?)
+}
+
+#[cfg(test)]
+pub(crate) mod settler_rehearsal {
+    use std::cell::RefCell;
+    thread_local! { static KEYS: RefCell<Option<Vec<Vec<u8>>>> = const { RefCell::new(None) }; }
+    pub fn keys() -> Option<Vec<Vec<u8>>> { KEYS.with(|k| k.borrow().clone()) }
+    pub fn set(keys: Vec<Vec<u8>>) -> impl Drop {
+        struct Restore(Option<Vec<Vec<u8>>>);
+        impl Drop for Restore { fn drop(&mut self) { KEYS.with(|k| *k.borrow_mut() = self.0.take()); } }
+        Restore(KEYS.with(|k| k.borrow_mut().replace(keys)))
+    }
+}
+
+/// Which quantity the L2 guest program caps at the L1 supply (bloch-l2-evm
+/// `ChainSpec::supply_cap`, audits L2N-02 and L1X-03). It decides which
+/// deposits the program can mint, so the L1 deposit rule behind
+/// `params::L2_CUMULATIVE_DEPOSIT_CAP_ACTIVATION_EPOCH` follows it
+/// ([`State::deposit_within_supply_cap`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SupplyCap {
+    /// Everything ever minted: withdrawals free no room. Every program
+    /// deployed so far (`ChainSpec::mainnet`, `testnet`, `testnet_v3`).
+    GrossMinted,
+    /// Minted minus withdrawn, which never exceeds the L1 escrow
+    /// (`ChainSpec::mainnet_outstanding_cap`).
+    Outstanding,
+}
+
+/// Indices of the program part of [`Policy::identities`]: L2 configuration
+/// commitment, guest ELF, KoalaBear key and BN254 key. A settlement
+/// statement names all four and its proof is verified under the last one.
+/// The network part (indices 0..3: native network, native genesis, L2
+/// domain) never changes.
+pub const PROGRAM_IDENTITIES: std::ops::Range<usize> = 3..7;
+/// The program part of a policy, in [`PROGRAM_IDENTITIES`] order.
+pub type ProgramIdentities = [[u8; 32]; 4];
+
+/// A pinned replacement of the settlement program (audit L2N-01, the L1
+/// half of the proper fix): at the first epoch boundary behind
+/// `params::L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH`, an installed L2
+/// whose policy names exactly `from` names exactly `to` instead
+/// ([`State::switch_program`]).
+///
+/// There is no overlap. In the last block before that boundary only a
+/// settlement of `from` is valid; from the boundary block on only one of
+/// `to`. A proof of `from` still pending at the boundary is refused and the
+/// same L2 block is proved again under `to` (honest blocks are identical
+/// under both programs, bloch-l2-evm `docs/MAINNET-PROGRAM.md`; about one
+/// proof time, 15 to 60 minutes, and it can be made ahead of the boundary).
+/// An overlap would keep the old program acceptable exactly when everybody
+/// knows it is about to be retired: one foreign settlement of `from` inside
+/// the window leaves a head the new program cannot extend either (its
+/// context rule needs the parent record under the settled state root), i.e.
+/// the Critical the switch exists to close, in exchange for saving one
+/// proof.
+///
+/// Unchanged by a switch: the network identities, the chain id, the L2
+/// genesis, the attestor set, the head, the inbox and the pinned source
+/// (its commitment covers identities 0..3 only), and the proof policy
+/// commitment (it commits to the SP1 circuit version, the Groth16 wrapper
+/// key and the statement tag, none of which a guest change touches).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgramSwitch {
+    pub from: ProgramIdentities,
+    pub to: ProgramIdentities,
+    /// The deposit cap `to` enforces.
+    pub supply_cap: SupplyCap,
+}
+impl ProgramSwitch {
+    /// `to` is a complete, different program: no zero identity, another ELF
+    /// and other keys. The configuration may stay (a program that changes
+    /// only the guest logic); with the same configuration the deposit cap
+    /// is the deployed one.
+    pub fn valid(&self) -> bool {
+        !self.to.contains(&[0; 32])
+            && (1..4).all(|i| self.to[i] != self.from[i])
+            && (self.to[0] != self.from[0] || self.supply_cap == SupplyCap::GrossMinted)
+    }
+}
+
+/// The program switch pinned for the L2 of `policy`, in either direction of
+/// time: the mainnet switch for the mainnet L2, none for any other policy.
+/// Whether it is still ahead or already taken is read off the policy
+/// ([`State::pending_program_switch`], [`State::program_switched`]).
+pub fn program_switch_for(policy: &Policy) -> Option<ProgramSwitch> {
+    #[cfg(test)]
+    if let Some(switch) = program_switch_rehearsal::get() {
+        return Some(switch).filter(ProgramSwitch::valid);
+    }
+    if policy.chain_id != MAINNET_CHAIN_ID {
+        return None;
+    }
+    mainnet::PROGRAM_SWITCH.filter(ProgramSwitch::valid)
+}
+
+#[cfg(test)]
+pub(crate) mod program_switch_rehearsal {
+    use super::ProgramSwitch;
+    use std::cell::Cell;
+    thread_local! { static SWITCH: Cell<Option<ProgramSwitch>> = const { Cell::new(None) }; }
+    pub fn get() -> Option<ProgramSwitch> { SWITCH.with(Cell::get) }
+    pub fn set(switch: ProgramSwitch) -> impl Drop {
+        struct Restore(Option<ProgramSwitch>);
+        impl Drop for Restore { fn drop(&mut self) { SWITCH.with(|s| s.set(self.0)); } }
+        Restore(SWITCH.with(|s| s.replace(Some(switch))))
+    }
 }
 
 /// What a running network installs at the L2 flag day
@@ -1667,7 +1342,7 @@ pub const MAINNET_CHAIN_ID: u64 = 700_770;
 /// no periodic signing and no admin key; a new set is a new policy (a new
 /// flag day).
 pub mod mainnet {
-    use super::{withdrawal, Activation, Policy, MAINNET_CHAIN_ID};
+    use super::{withdrawal, Activation, Policy, ProgramIdentities, ProgramSwitch, SupplyCap, MAINNET_CHAIN_ID};
     use crate::transition::funded::ADMISSION_PQ_KEY_BYTES;
 
     /// Settlement V3 over the asynchronous wire (deposits and claims need it).
@@ -1712,170 +1387,6 @@ pub mod mainnet {
     /// `1c06adbb7fef042f58d7efd11587689e324c036c3b467081a63b1cf79caccc4b`.
     pub const ATTESTOR_SET: Option<&str> = Some(include_str!("../l2-mainnet/attestors.set"));
 
-    /// CANDIDATE, not scheduled: the program that replaces [`PROGRAM`] at
-    /// [`crate::params::L2_NEXT_PROGRAM_EPOCH`]. Identities 0, 1 and 2, the
-    /// genesis pins, the attestor set and the limits stay as activated.
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub struct NextProgram {
-        /// Replaces identities 3 (configuration), 4 (ELF), 5 and 6 (keys).
-        pub identities: [[u8; 32]; 4],
-        pub proof_policy: [u8; 32],
-    }
-    /// `settlement_v3_mainnet_sparse` of bloch-l2-evm
-    /// `codex/forced-guest-r8-20261102` 595d914 (agent 115's sparse guest with
-    /// L1 forced inclusion, agent 137), built in its pinned container on two
-    /// hosts: the sparse witness under the next rules with the forced prefix,
-    /// guest ELF SHA-256 `81813124…b6d9`. Its configuration `27d6ce9f…2783`
-    /// (tag `BLOCH:EVM:CONFIG:4:CANCUN`) is the next rules plus forced
-    /// inclusion, and is listed in [`FORCED_INCLUSION_CONFIGURATIONS`].
-    /// The configuration carries the owner's fee-sweep recipient
-    /// `0x775a993F09Bd80aeCF8F8c2ADe0C84158E3a0544` (bloch-l2-evm
-    /// `MAINNET_FEE_SWEEP_RECIPIENT`); these values are candidates until
-    /// [`PROGRAM_NEXT_FINAL`] says otherwise.
-    pub const PROGRAM_NEXT: NextProgram = NextProgram {
-        identities: [
-            h32("27d6ce9f3ef204207ed089a4ba2593e4d45b9bc25242d3de32e2a3dea1a12783"),
-            h32("d6b33a99dc9329b2ca75aa0b4b7b3116e5334ee9edc9cb5e20491eaa926ceb74"),
-            h32("5dc306572d2df6a31f8c59c3114859500ba2af783ffaca8e473258c273d98584"),
-            h32("00bb860caeb4b7da8cfc62ce19148595017455ef0ffeb2a3a3992c6173d98584"),
-        ],
-        // The wrapper VK and the V3 tag are unchanged, so the policy is too.
-        proof_policy: h32("154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d"),
-    };
-    /// The program a rollback installs at [`crate::params::L2_PROGRAM_ROLLBACK_EPOCH`]:
-    /// `settlement_v3_mainnet` of the `integrations/sp1-execution/guest-fallback`
-    /// crate of bloch-l2-evm `codex/fallback-forced-r11-20261103` (agent 216),
-    /// built in the pinned container of the sparse guests
-    /// (`guest-fallback/build-container.sh`): the complete witness under the
-    /// same rules, L1 forced inclusion included, guest ELF SHA-256
-    /// `7528e26d…5b5303` (3 138 944 bytes). It replaces `3ad3a4f0…53b3`, which
-    /// did not run the forced rule.
-    ///
-    /// It proves the next rules, which the assert below pins: the swap to the
-    /// next rules is one-way on the L2, because blocks under them hold the vault
-    /// code, so [`PROGRAM`] cannot prove any successor of such a block. A
-    /// rollback changes which guest proves the rules, never the rules.
-    ///
-    /// Forced inclusion: this guest runs the forced records after the deposits
-    /// and publishes [`super::forced::inbox_hash`] exactly as [`PROGRAM_NEXT`]
-    /// does (bloch-l2-evm `src/forced_complete.rs`; the forced list is the
-    /// guest's fifth input), so its configuration is the forced next one
-    /// (`27d6ce9f…`, listed) and a rollback keeps forced inclusion working.
-    pub const PROGRAM_FALLBACK: NextProgram = NextProgram {
-        identities: [
-            h32("27d6ce9f3ef204207ed089a4ba2593e4d45b9bc25242d3de32e2a3dea1a12783"),
-            h32("b6d6d128b0585ec6b24cec3261ccca348ee8e7cbc3e15eb51ed5fd838ac9baf1"),
-            h32("020138086276433f0bfc354c43e493a50400999706ba3ca061ae34d4162f4765"),
-            h32("000402701189d90cfc5fe1aa643e493a50801332e1ae8f2830d71a6a162f4765"),
-        ],
-        proof_policy: h32("154869964f89b4a5536f169ad6a4b17d0455ecace0891521356c554e32e5747d"),
-    };
-    /// Whether the fee-sweep recipient is final and the two programs above are
-    /// the reproducible release guests. An armed gate refuses to compile until
-    /// this is true (`hard_forks::l2_program_may_arm`).
-    pub const PROGRAM_NEXT_FINAL: bool = false;
-    /// L2 configurations (identity 3) whose guest executes the forced records
-    /// of [`super::forced`] and publishes [`super::forced::inbox_hash`]: the
-    /// next configuration (`BLOCH:EVM:CONFIG:4:CANCUN`), which [`PROGRAM_NEXT`]
-    /// and [`PROGRAM_FALLBACK`] both carry. [`crate::params::L2_FORCED_INCLUSION_EPOCH`]
-    /// stays inert (`hard_forks::l2_forced_inclusion_may_arm`).
-    pub const FORCED_INCLUSION_CONFIGURATIONS: &[[u8; 32]] =
-        &[h32("27d6ce9f3ef204207ed089a4ba2593e4d45b9bc25242d3de32e2a3dea1a12783")];
-    /// TBD-owner: the script hash of the protocol treasury that receives every
-    /// charged forced-inclusion surcharge (`super::forced::treasury`). `None`
-    /// keeps forced inclusion from being enabled, and
-    /// `hard_forks::l2_forced_inclusion_may_arm` refuses to arm the gate while
-    /// it is unset. Revenue rule (2026-11-02 22:30): the treasury, never a burn.
-    /// Alias of `params::PROTOCOL_TREASURY_SCRIPT_HASH` (one treasury for every
-    /// L1 protocol revenue rule).
-    pub const FORCED_INCLUSION_TREASURY: Option<[u8; 32]> = crate::params::PROTOCOL_TREASURY_SCRIPT_HASH;
-
-    /// TBD-owner: the hash (`Sha3_256`) of the mainnet settler's DA funding
-    /// public key, which owns the reserved DA slot
-    /// (`params::L2_DA_RESERVED_SLOT_EPOCH`). Unset, so that gate cannot be
-    /// armed (`hard_forks::l2_da_reserved_slot_may_arm`). Losing or leaking
-    /// this key costs no funds: the slot then serves nobody, or the leaker,
-    /// and DA is back to the open auction of today.
-    pub const DA_RESERVED_KEY: Option<[u8; 32]> = None;
-
-    const fn same_hash(a: &[u8; 32], b: &[u8; 32]) -> bool {
-        let mut i = 0;
-        while i < 32 {
-            if a[i] != b[i] {
-                return false;
-            }
-            i += 1;
-        }
-        true
-    }
-    // The fallback proves exactly the next rules, forced inclusion included:
-    // the same configuration (agent 216 removed the earlier escape for a
-    // fallback on the next rules without forced inclusion).
-    const _: () = assert!(same_hash(&PROGRAM_NEXT.identities[0], &PROGRAM_FALLBACK.identities[0]));
-    const _: () = assert!(same_hash(&PROGRAM_NEXT.proof_policy, &PROGRAM_FALLBACK.proof_policy));
-    // Each program change, and the head reset compiled with it, runs once
-    // because the policy stops matching after the replacement: the replacing
-    // program must differ from the one it replaces (review R308-12).
-    const fn same_program(a: &[[u8; 32]; 4], b: &[[u8; 32]; 4]) -> bool {
-        same_hash(&a[0], &b[0]) && same_hash(&a[1], &b[1]) && same_hash(&a[2], &b[2]) && same_hash(&a[3], &b[3])
-    }
-    const _: () = assert!(!same_program(&PROGRAM_NEXT.identities, &PROGRAM_FALLBACK.identities));
-    const _: () = assert!(match &PROGRAM {
-        Some(pinned) => {
-            let [_, _, _, a, b, c, d] = &pinned.identities;
-            !same_program(&[*a, *b, *c, *d], &PROGRAM_NEXT.identities)
-        }
-        None => true,
-    });
-
-    /// OPTION, an owner decision, absent by default: a one-time reset of the
-    /// settled L2 head, applied by [`super::State::install_next_program`] in the
-    /// same transition as the swap. Without it the swap prevents an off-rule block
-    /// but cannot recover from one that landed before the gate: its state root is
-    /// unknown to everyone but its author, so nobody else can build on it.
-    ///
-    /// L1 cannot tell an off-rule block by itself (the statement carries neither
-    /// value), so the target is named by whoever writes the emergency release,
-    /// from what the attestors could not rebuild. There is no key and no runtime
-    /// input: it is a compiled constant that every validator must choose to run.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct HeadReset {
-        /// The last block to keep. Zero means the L2 genesis (no statement).
-        pub number: u64,
-        /// The accepted head's commitment at that block (zero for the genesis).
-        pub commitment: [u8; 32],
-        /// The accepted V3 statement of that block, as hex (`None` for the genesis).
-        pub statement: Option<&'static str>,
-        /// FORFEIT form (G2a, an attacker drained forged leaves before the gate).
-        /// `false`: the reset refuses, and the head stays, once any leaf the
-        /// target did not publish was claimed. `true`: the reset applies anyway,
-        /// and the claims of those leaves are forgotten, so the new chain's
-        /// withdrawals at the same indices can be paid. What they released stays
-        /// released: the escrow is short by exactly that amount (the forfeit),
-        /// and the forged roots stop paying at the gate. From the swap on the
-        /// leaves counted are those proven against a root above the target, at
-        /// any index, and a leaf that was paid is never paid again: the same
-        /// leaf at the same index on the kept root or on the rebuilt chain is
-        /// refused, another leaf there is paid. For claims older than the swap
-        /// (not recorded) the index alone decides, so that form is only for a
-        /// tail whose paid leaves are not re-published by the rebuild.
-        /// A forfeit reset that dropped recorded claims marks the paid-leaf
-        /// log ([`super::withdrawal::PaidLeaves::DROPPED_TAIL`]): those claims
-        /// stay paid leaves and are not counted against a later reset, whose
-        /// tail uses the same L2 numbers again.
-        /// A forfeit reset also applies when the tail consumed more forced
-        /// records than [`super::forced::CONSUMED_LOG`] holds: the records the
-        /// log still has are queued again and the older ones of the tail are
-        /// not (their envelopes stay on L1 by txid, to be submitted again).
-        pub forfeit: bool,
-    }
-    /// `None`: the release ships no reset and the swap changes the program only.
-    pub const HEAD_RESET: Option<HeadReset> = None;
-    /// The same option for the rollback, applied with it. Names the last block
-    /// before what the misbehaving guest settled; an emergency release fills it
-    /// only when that guest settled a block the rules do not give.
-    pub const ROLLBACK_HEAD_RESET: Option<HeadReset> = None;
-
     /// The L2 program and genesis the activation pins: the seven V2
     /// identities (Genesis-4 admission domain, native genesis, L2 domain,
     /// L2 configuration, guest ELF, KoalaBear key, BN254 key), the proof
@@ -1888,7 +1399,7 @@ pub mod mainnet {
         pub initial_l2_state: [u8; 32],
     }
     /// 64 hex characters as 32 bytes, at compile time (a typo fails the build).
-    pub(crate) const fn h32(text: &str) -> [u8; 32] {
+    const fn h32(text: &str) -> [u8; 32] {
         let b = text.as_bytes();
         assert!(b.len() == 64, "32-byte hex");
         let mut out = [0u8; 32];
@@ -1945,6 +1456,68 @@ pub mod mainnet {
         initial_l2_state: h32("2ad7e807ac2ea14e2f423572fcb9e0f168de4cb26b5bbbd2711caf34cb05c05d"),
     });
 
+    /// The settler set of the mainnet L2 (audit L2N-01), SET ONCE in the
+    /// release that arms `params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH`:
+    /// one enveloped hybrid public key in hex per line, 1 to
+    /// `settler::MAX_KEYS` lines, the settler's key first, standby keys
+    /// after it. `None` = UNSET: the gate cannot be armed
+    /// (`params` asserts it at compile time).
+    pub const SETTLER_SET: Option<&str> = None;
+
+    /// The program part of [`PROGRAM`] (all zero while it is unset).
+    pub const fn deployed_program() -> ProgramIdentities {
+        match &PROGRAM {
+            Some(program) => [program.identities[3], program.identities[4], program.identities[5], program.identities[6]],
+            None => [[0; 32]; 4],
+        }
+    }
+
+    /// The successor of [`PROGRAM`]'s program part: `settlement_v3_mainnet_bound`
+    /// (audit L2N-01: the block context is derived from L1 data inside the
+    /// guest; audit L2N-02: the deposit cap bounds the outstanding supply).
+    /// Installed by `params::L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH`
+    /// (INERT).
+    ///
+    /// **CANDIDATE VALUES, NOT FINAL** ([`PROGRAM_SWITCH_FINAL`] is `false`
+    /// and the gate cannot be armed while it is). They are the identities of
+    /// the candidate ELF built on 2026-11-23 from bloch-l2-evm
+    /// `codex/audit-fixes-l2-20261123` at `21ec80c` (ELF SHA-256
+    /// `ac2e1ca568fe28ffef7f2e55d4bc493d6348882b2e786bf3e5a10fefa9b38892`,
+    /// 3 101 968 bytes), derived with `bloch-evm-sp1-settlement-v3
+    /// --mainnet-bound identity`. Any change to the guest or to the L2 core
+    /// crate changes the ELF and both keys. The release that arms the gate
+    /// must replace all four values with those of the release ELF
+    /// (`build-reproducible.sh` at the release commit, `verify-reproducible.sh`
+    /// from two checkouts), add a real Groth16 proof of that program as a
+    /// native fixture (`mainnet_bound_program_real_groth16` in the
+    /// transition tests), and only then set [`PROGRAM_SWITCH_FINAL`]. See
+    /// `docs/L2-PROGRAM-SWITCH.md`.
+    pub const PROGRAM_SWITCH: Option<ProgramSwitch> = Some(ProgramSwitch {
+        from: deployed_program(),
+        to: [
+            // NOT FINAL. Execution configuration commitment
+            // (ChainSpec::mainnet_outstanding_cap, CONFIG:3:CANCUN).
+            h32("41ddb4dd4aae492e04f500d40be8471ac785e1264d32346dc0f1620d67cc928d"),
+            // NOT FINAL. settlement_v3_mainnet_bound ELF Keccak-256.
+            h32("c1dd6066941c83fc691f6b325b51ca771c680431df54d54d508c8593fcb6da6d"),
+            // NOT FINAL. SP1 KoalaBear verifying-key hash.
+            h32("72730d65162c55a9604a8d905e125a1f332bec342419058167520c455dea4112"),
+            // NOT FINAL. SP1 BN254 verifying-key hash (the Groth16 program key).
+            h32("00e4e61aca58b156a702546c85e125a1f6657d868906416073a90622ddea4112"),
+        ],
+        supply_cap: SupplyCap::Outstanding,
+    });
+    /// Whether [`PROGRAM_SWITCH`] holds release values: re-derived from a
+    /// reproducible release build and covered by a real Groth16 fixture.
+    /// `false` = placeholders; `params` refuses an armed gate at compile time.
+    pub const PROGRAM_SWITCH_FINAL: bool = false;
+
+    /// The keys of a settler set text, or `None` if it is not a valid set.
+    pub fn settler_keys(text: &str) -> Option<Vec<Vec<u8>>> {
+        let keys = text.lines().map(str::trim).filter(|l| !l.is_empty()).map(unhex).collect::<Option<Vec<_>>>()?;
+        super::settler::valid_set(&keys).then_some(keys)
+    }
+
     /// Why the mainnet activation cannot be built yet.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Incomplete {
@@ -1956,7 +1529,7 @@ pub mod mainnet {
         ProgramUnset,
     }
 
-    pub(super) fn unhex(text: &str) -> Option<Vec<u8>> {
+    fn unhex(text: &str) -> Option<Vec<u8>> {
         let digit = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
         let bytes = text.as_bytes();
         if bytes.len() % 2 != 0 {
@@ -2149,69 +1722,11 @@ impl Profile {
     }
 }
 
-/// Immutable network configuration, installed only by a new genesis constructor.
+/// Network configuration, installed only by a new genesis constructor.
 /// The first seven hashes follow the V2 statement: native network/genesis,
 /// L2 domain/configuration, guest ELF, KoalaBear key and BN254 key.
-/// Why a head reset ([`mainnet::HeadReset`]) does not apply to a state.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum HeadResetRefusal {
-    /// The settled head is not above the target: nothing to reset.
-    HeadNotAbove,
-    /// The target's statement is missing, malformed, of another block or of another network.
-    Statement,
-    /// The target's withdrawal tree contradicts the head's or a retained record.
-    Tree,
-    /// A plain reset, and a leaf the target did not publish may have been
-    /// paid: a claim at an index at or above the target's count, or claims
-    /// proven against a record above the target (their leaf indices). L1
-    /// cannot tell whether such a leaf is also the target's, so ONE claim
-    /// proven against a newer root, honest or not, refuses the plain form.
-    /// The forfeit form is not refused for this.
-    PaidBeyondTarget { at_or_above_count: bool, against_tail: Vec<u64> },
-    /// The target consumed more deposits than the inbox holds.
-    Inbox,
-    /// A plain reset, and the consumed forced log does not reach the target.
-    ForcedLog,
-}
-impl HeadResetRefusal {
-    /// A stable name for RPC and logs.
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::HeadNotAbove => "head_not_above_target",
-            Self::Statement => "statement",
-            Self::Tree => "withdrawal_tree",
-            Self::PaidBeyondTarget { .. } => "paid_beyond_target",
-            Self::Inbox => "inbox",
-            Self::ForcedLog => "forced_log",
-        }
-    }
-}
-/// A compiled head reset and what it does to one state (RPC and logs).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HeadResetReport {
-    /// [`Self::NEXT_PROGRAM`] or [`Self::ROLLBACK`]: the gate it runs with.
-    pub gate: &'static str,
-    /// The last L2 block it keeps.
-    pub number: u64,
-    pub forfeit: bool,
-    /// Whether its gate is still ahead of the state.
-    pub pending: bool,
-    /// `None`: it applies (or applied). Otherwise why not.
-    pub refusal: Option<HeadResetRefusal>,
-}
-impl HeadResetReport {
-    pub const NEXT_PROGRAM: &'static str = "next_program";
-    pub const ROLLBACK: &'static str = "rollback";
-}
-/// What [`State::reset_head`] installs once every check passed.
-struct HeadResetPlan {
-    head: Option<([u8; 32], Vec<u8>)>,
-    consumed: u64,
-    root: [u8; 32],
-    count: u64,
-    tail_paid: Vec<u64>,
-    paid_beyond: bool,
-}
+/// Immutable, with one gated exception: the program part
+/// ([`PROGRAM_IDENTITIES`]) is replaced once by a pinned [`ProgramSwitch`].
 #[cfg_attr(feature = "local-state-cache", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
@@ -2297,19 +1812,19 @@ pub struct State {
     /// cached bytes of this struct do not change.
     #[cfg_attr(feature = "local-state-cache", serde(skip))]
     checkpoint_roots: std::collections::BTreeMap<u64, [u8; 32]>,
-    /// L1 forced-inclusion queue ([`forced`]). `None` until
-    /// [`crate::params::L2_FORCED_INCLUSION_EPOCH`] enables it; committed
-    /// last and absent while `None`, so every earlier state keeps its bytes.
-    /// The local cache carries it in its own trailing section, like
-    /// `checkpoint_roots`, so the cached bytes of this struct do not change.
+    /// Registered settler keys (audit L2N-01; see [`settler`]). Empty until
+    /// installed behind `params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH`:
+    /// while empty, settlement is permissionless as before and the committed
+    /// bytes are unchanged. Committed (after the checkpoint roots, absent
+    /// while empty); the local cache carries it in its own trailing section.
     #[cfg_attr(feature = "local-state-cache", serde(skip))]
-    forced: Option<forced::Queue>,
-    /// Leaves paid under the next program ([`withdrawal::PaidLeaves`]).
-    /// Empty before the swap; committed after the claim section and absent
-    /// while empty, so every earlier state keeps its bytes. The local cache
-    /// carries it in its own trailing section, like `forced`.
+    settlers: Vec<Vec<u8>>,
+    /// Release accounting of the attested lane (audit L1X-01), written only
+    /// behind `params::L2_ATTESTED_RELEASE_LANE_ACTIVATION_EPOCH`. Committed
+    /// (last, absent until the lane's first claim); the local cache carries
+    /// it in its own trailing section.
     #[cfg_attr(feature = "local-state-cache", serde(skip))]
-    paid: withdrawal::PaidLeaves,
+    attested_release: withdrawal::ReleaseWindow,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
@@ -2336,10 +1851,10 @@ pub enum Reject {
     /// L1 data-availability record (same L2 block number) included in a
     /// strictly earlier native block and still retained.
     DataUnavailable,
-    /// Forced inclusion is enabled and the statement does not consume exactly
-    /// the forced records due at its anchor ([`forced::inbox_hash`]), or a V2
-    /// statement arrives while forced records are due.
-    Forced,
+    /// The settler rule (audit L2N-01): an authorization on an L2 without a
+    /// settler set, or, with one, a settlement without an authorization
+    /// signed by a registered key over this exact settlement.
+    Settler,
 }
 
 /// Whether an L2 from a development genesis manifest admits user
@@ -2369,8 +1884,8 @@ impl State {
             release_window: withdrawal::ReleaseWindow::default(),
             profile: Profile::development(),
             checkpoint_roots: std::collections::BTreeMap::new(),
-            forced: None,
-            paid: withdrawal::PaidLeaves::default(),
+            settlers: Vec::new(),
+            attested_release: withdrawal::ReleaseWindow::default(),
         })
     }
     pub(crate) fn genesis_async(policy: Policy) -> Result<Self, Reject> {
@@ -2388,6 +1903,61 @@ impl State {
         state.profile = Profile::activated(activation.limits);
         Ok(state)
     }
+    /// The registered settler keys; empty = settlement is permissionless.
+    pub fn settlers(&self) -> &[Vec<u8>] {
+        &self.settlers
+    }
+    /// Whether `key` is a registered settler key.
+    pub fn is_settler_key(&self, key: &[u8]) -> bool {
+        self.settlers.iter().any(|k| k.as_slice() == key)
+    }
+    /// Install the settler set at the flag day (the transition, once, while
+    /// none is installed). An invalid set installs nothing.
+    pub(crate) fn install_settlers(&mut self, keys: Vec<Vec<u8>>) {
+        if self.settlers.is_empty() && settler::valid_set(&keys) {
+            self.settlers = keys;
+        }
+    }
+    /// Local-cache restore only; the state root check that follows the
+    /// restore authenticates what is put back.
+    #[cfg(feature = "local-state-cache")]
+    pub(crate) fn restore_settlers(&mut self, keys: Vec<Vec<u8>>) {
+        self.settlers = keys;
+    }
+    /// The program identities in force: what a settlement must name and
+    /// the key its proof is verified under.
+    pub fn program(&self) -> ProgramIdentities {
+        let ids = &self.policy.identities;
+        [ids[3], ids[4], ids[5], ids[6]]
+    }
+    /// The pinned program switch this L2 has not taken yet: its policy still
+    /// names the switch's `from`.
+    pub fn pending_program_switch(&self) -> Option<ProgramSwitch> {
+        program_switch_for(&self.policy).filter(|switch| self.program() == switch.from)
+    }
+    /// The pinned program switch this L2 has taken: its policy names the
+    /// switch's `to`.
+    pub fn program_switched(&self) -> Option<ProgramSwitch> {
+        program_switch_for(&self.policy).filter(|switch| self.program() == switch.to)
+    }
+    /// The deposit cap of the program in force: the deployed lifetime cap
+    /// unless this L2 has switched to a program pinned with another one.
+    /// Anything unknown is judged by the deployed rule, the stricter one on
+    /// L1: a wrongly closed deposit window is recoverable, a deposit the
+    /// guest cannot mint is not.
+    pub fn supply_cap(&self) -> SupplyCap {
+        self.program_switched().map_or(SupplyCap::GrossMinted, |switch| switch.supply_cap)
+    }
+    /// Take the pinned program switch (the transition, at an epoch boundary
+    /// behind `params::L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH`).
+    /// Idempotent: nothing is pending once it is taken, or on an L2 whose
+    /// policy is not the switch's `from`. Returns whether the program
+    /// changed. Only the four program identities are written.
+    pub(crate) fn switch_program(&mut self) -> bool {
+        let Some(switch) = self.pending_program_switch() else { return false };
+        self.policy.identities[PROGRAM_IDENTITIES].copy_from_slice(&switch.to);
+        true
+    }
     pub fn asynchronous(&self) -> bool { self.asynchronous }
     pub fn profile(&self) -> &Profile { &self.profile }
     pub fn limits(&self) -> &withdrawal::Limits { &self.profile.limits }
@@ -2404,95 +1974,7 @@ impl State {
     pub(crate) fn prepare_source(&mut self, parent: [u8; 32], parent_slot: u64) {
         if self.asynchronous && self.source_anchor.is_none() && self.native_height > 0 {
             self.source_anchor = Some((parent, parent_slot, self.native_height, self.inbox.len() as u64, self.inbox_root));
-            // The forced queue freezes with the source: what a settlement on
-            // this anchor must consume cannot grow while it is being proved.
-            if let Some(queue) = self.forced.as_mut() {
-                queue.anchor = Some(queue.pending.len() as u64);
-            }
         }
-    }
-    /// The forced-inclusion queue, `None` while forced inclusion is not enabled.
-    pub fn forced_queue(&self) -> Option<&forced::Queue> {
-        self.forced.as_ref()
-    }
-    /// Whether this L2 runs rules whose guest implements forced inclusion.
-    /// It follows the committed configuration, like [`Self::next_program_active`]:
-    /// an L2 is enabled only if its configuration is listed in
-    /// [`mainnet::FORCED_INCLUSION_CONFIGURATIONS`] (empty: no program does).
-    pub fn forced_inclusion_program(&self) -> bool {
-        mainnet::FORCED_INCLUSION_CONFIGURATIONS.contains(&self.policy.identities[3])
-    }
-    /// Enable forced inclusion at [`crate::params::L2_FORCED_INCLUSION_EPOCH`].
-    /// Only on an L2 that admits user transactions, settles asynchronously and
-    /// runs a program that implements it; once.
-    pub(crate) fn enable_forced_inclusion(&mut self) -> bool {
-        self.enable_forced_inclusion_if(self.forced_inclusion_program())
-    }
-    fn enable_forced_inclusion_if(&mut self, program: bool) -> bool {
-        if self.forced.is_some()
-            || !program
-            || !self.profile.user_transactions
-            || !self.asynchronous
-            || forced::treasury().is_none()
-        {
-            return false;
-        }
-        let mut queue = forced::Queue::new();
-        // Enabled between an anchor and its settlement: nothing is due yet.
-        if self.source_anchor.is_some() {
-            queue.anchor = Some(0);
-        }
-        self.forced = Some(queue);
-        true
-    }
-    /// Test hook (review 164): consume what is due now, as a settlement would.
-    #[cfg(test)]
-    pub(crate) fn forced_consume_due_for_review(&mut self) {
-        let number = self.settled_number().saturating_add(1);
-        if let Some(queue) = self.forced.as_mut() {
-            queue.consume_due(number);
-        }
-    }
-    /// Test hook: enable forced inclusion whatever the configuration.
-    #[cfg(test)]
-    pub(crate) fn enable_forced_inclusion_for_test(&mut self) -> bool {
-        self.enable_forced_inclusion_if(true)
-    }
-    /// Test hook: the queue, mutable.
-    #[cfg(test)]
-    pub(crate) fn forced_queue_mut_for_test(&mut self) -> Option<&mut forced::Queue> {
-        self.forced.as_mut()
-    }
-    /// Queue a forced L2 transaction published at the next native height.
-    /// The caller has already charged and authorized the L1 transaction.
-    pub(crate) fn queue_forced(
-        &mut self,
-        chain_id: u64,
-        l1_txid: [u8; 32],
-        envelope: &[u8],
-        gas_limit: u64,
-    ) -> Result<(), forced::Refusal> {
-        use forced::Refusal as R;
-        let height = self.native_height.checked_add(1).ok_or(R::Full)?;
-        // A rollback to a fallback guest that does not implement the rule takes
-        // no new record (review 164 R1). `hard_forks::l2_forced_inclusion_may_arm`
-        // already refuses to arm forced inclusion with an unlisted fallback;
-        // this keeps the L2 from owing what its guest cannot prove anyway.
-        if self.policy.identities[3..7] == mainnet::PROGRAM_FALLBACK.identities && !self.forced_inclusion_program() {
-            return Err(R::NotActive);
-        }
-        let queue = self.forced.as_mut().ok_or(R::NotActive)?;
-        if chain_id != self.policy.chain_id {
-            return Err(R::Chain);
-        }
-        if envelope.is_empty()
-            || envelope.len() > forced::MAX_ENVELOPE_BYTES
-            || !(forced::MIN_GAS..=forced::MAX_GAS).contains(&gas_limit)
-        {
-            return Err(R::Shape);
-        }
-        let envelope_hash: [u8; 32] = Keccak256::digest(envelope).into();
-        queue.push(forced::Record { height, l1_txid, envelope_hash, gas_limit })
     }
     /// Whether [`Self::append_deposit`] would accept a record of `sats`
     /// (its two refusals, without mutating). Mempool preflight.
@@ -2521,6 +2003,16 @@ impl State {
     }
     pub fn consumed(&self) -> u64 {
         self.consumed
+    }
+    /// Inbox records no settlement has consumed yet.
+    pub fn pending_deposits(&self) -> u64 {
+        (self.inbox.len() as u64).saturating_sub(self.consumed)
+    }
+    /// Whether [`MAX_PENDING_DEPOSITS`] records are already waiting (L1X-02;
+    /// binds only behind `params::L2_DEPOSIT_INFLOW_BOUND_ACTIVATION_EPOCH`,
+    /// which the caller judges: this state does not know the epoch).
+    pub fn deposit_backlog_full(&self) -> bool {
+        self.pending_deposits() >= MAX_PENDING_DEPOSITS
     }
     pub fn escrow_sat(&self) -> u128 {
         self.escrow_sat
@@ -2554,307 +2046,38 @@ impl State {
     pub fn attestation_required(&self, sats: u64) -> bool {
         self.policy.attestor_set != [0; 32] && sats >= self.profile.limits.large_claim_sat
     }
-    /// Replace the program at the compiled gate. The state keeps its head, inbox,
-    /// claims and window, and `source_at` binds only identities 0 to 2, so the
-    /// frozen source survives. A statement of the old program gets
-    /// [`Reject::Policy`] from here on and must be proved again. Acts only on the
-    /// exact policy the activation pinned, so it runs once and on no other L2.
-    /// Blocks before the gate replay unchanged, because nothing here runs for them.
-    pub(crate) fn install_next_program(&mut self) {
-        let Some(pinned) = mainnet::PROGRAM else { return };
-        // Identities 0 and 1 name the network, so a private rehearsal of the
-        // mainnet program holds other values there (`rehearsal_activation`).
-        if self.policy.identities[2..] == pinned.identities[2..] && self.policy.proof_policy == pinned.proof_policy {
-            self.replace_program(&mainnet::PROGRAM_NEXT);
-            if let Some(reset) = mainnet::HEAD_RESET.as_ref() {
-                self.reset_head(reset);
-            }
-        }
-    }
-    /// Roll the program back at the compiled gate: from [`mainnet::PROGRAM_NEXT`]
-    /// to [`mainnet::PROGRAM_FALLBACK`], which proves the same rules. Head, inbox,
-    /// frozen source, claims and window stay, and a proof of the replaced guest
-    /// gets [`Reject::Policy`], as at the swap. Acts only on the exact policy the
-    /// swap installed, so it runs once, after the swap, and on no other L2.
-    pub(crate) fn install_fallback_program(&mut self) {
-        self.install_fallback_with(mainnet::ROLLBACK_HEAD_RESET.as_ref());
-    }
-    /// A refused `reset` leaves the head where it is. The program still moves:
-    /// the guest is replaced because it misbehaved, whatever the head can do.
-    /// Not silently: [`Self::head_reset_reports`] says before the gate whether
-    /// the compiled reset would apply, and the node logs the outcome at the
-    /// gate ([`Self::head_reset_at_program_change`]).
-    fn install_fallback_with(&mut self, reset: Option<&mainnet::HeadReset>) {
-        let Some(pinned) = mainnet::PROGRAM else { return };
-        if self.policy.identities[2] == pinned.identities[2]
-            && self.policy.identities[3..7] == mainnet::PROGRAM_NEXT.identities
-            && self.policy.proof_policy == mainnet::PROGRAM_NEXT.proof_policy
-        {
-            self.replace_program(&mainnet::PROGRAM_FALLBACK);
-            if let Some(reset) = reset {
-                self.reset_head(reset);
-            }
-        }
-    }
-    /// The program changes this L2 will see, in order, as `(epoch, program)`.
-    /// Empty while the gates are inert and on any other L2. A settler reads it to
-    /// stop starting proofs that cannot land before the gate. Not a consensus input.
-    pub fn program_schedule(&self) -> Vec<(u64, mainnet::NextProgram)> {
-        self.program_schedule_from(crate::params::L2_NEXT_PROGRAM_EPOCH, crate::params::L2_PROGRAM_ROLLBACK_EPOCH)
-    }
-    fn program_schedule_from(&self, next: u64, rollback: u64) -> Vec<(u64, mainnet::NextProgram)> {
-        let Some(pinned) = mainnet::PROGRAM else { return Vec::new() };
-        if self.policy.identities[2] != pinned.identities[2] || self.policy.proof_policy != pinned.proof_policy {
-            return Vec::new();
-        }
-        let activated = self.policy.identities[3..7] == pinned.identities[3..7];
-        let swapped = self.policy.identities[3..7] == mainnet::PROGRAM_NEXT.identities;
-        let mut schedule = Vec::new();
-        if activated && next != u64::MAX {
-            schedule.push((next, mainnet::PROGRAM_NEXT));
-        }
-        if (activated || swapped) && rollback != u64::MAX {
-            schedule.push((rollback, mainnet::PROGRAM_FALLBACK));
-        }
-        schedule
-    }
-    /// Whether `tx` proves another program than the one this L2 holds. It can
-    /// never settle here. No proof is checked, so this costs next to nothing.
-    pub fn names_another_program(&self, tx: &Transaction) -> bool {
-        tx.proof_policy != self.policy.proof_policy
-            || tx.statement.len() < S + 7 * 32
-            || (3..7).any(|i| h(&tx.statement, S + i * 32) != self.policy.identities[i])
-    }
-    /// Move the settled head back to `reset`: the inbox cursor returns to what
-    /// that block had consumed, so its deposits mint again on the new chain, and
-    /// withdrawal roots of later blocks are forgotten. Escrow, deposits, claims
-    /// and the release window stay. The target's own withdrawal root stays
-    /// claimable: if retention already pruned its record (a reset days after the
-    /// tail, whose newer records displaced it), it is recorded again at the
-    /// current height, so honest leaves wait one delay and do not wait for the
-    /// next settlement. Returns whether it applied.
-    ///
-    /// It does nothing when the head is not above the target, when the
-    /// statement is malformed, or when its withdrawal tree contradicts the
-    /// retained records or the head's tree. When a leaf the target did not publish was already
-    /// paid, the rollback would credit on L2 what already left the escrow: a
-    /// plain reset then does nothing, and a FORFEIT reset applies and forgets
-    /// those claims ([`mainnet::HeadReset::forfeit`]). Such a claim is one at
-    /// an index at or above the target's count, or one proven against a
-    /// record above the target ([`withdrawal::PaidLeaves`]; L1 cannot tell
-    /// whether its leaf is also the target's, so a plain reset refuses on
-    /// any). A plain reset is also refused when the consumed forced log does
-    /// not reach the target; a forfeit reset never is.
-    pub(crate) fn reset_head(&mut self, reset: &mainnet::HeadReset) -> bool {
-        let Ok(plan) = self.plan_head_reset(reset) else { return false };
-        if let Some(queue) = self.forced.as_mut() {
-            queue.requeue_logged_after(reset.number);
-        }
-        self.head = plan.head;
-        self.consumed = plan.consumed;
-        self.withdrawals.retain(|r| r.l2_number <= reset.number);
-        // Records are added only when the count grows, so the target's tree is
-        // the newest retained record exactly when retention did not prune it.
-        if plan.count > 0 && self.withdrawals.last().map(|r| (r.root, r.count)) != Some((plan.root, plan.count)) {
-            self.withdrawals.push(withdrawal::Record { l2_number: reset.number, root: plan.root, count: plan.count, height: self.native_height });
-        }
-        if plan.paid_beyond {
-            self.claimed.forget_at_or_above(plan.count);
-            // Below the target's count as well: the index is claimable again,
-            // by any leaf but the ones already paid ([`Self::check_claim`]).
-            for index in &plan.tail_paid {
-                self.claimed.forget(*index);
-            }
-            // The dropped tail's entries stay paid leaves, and stop counting
-            // as proven against a tail: the rebuilt chain uses their L2
-            // numbers again, and a later plain reset must not refuse on them
-            // (review R308-2P-5).
-            if !plan.tail_paid.is_empty() {
-                self.paid.record_dropped_tail(reset.number);
-            }
-        }
-        true
-    }
-    /// Why `reset` would not apply to this state now; `None` when it would.
-    /// Read-only: the same checks [`Self::reset_head`] runs (RPC, logs, tools).
-    pub fn head_reset_refusal(&self, reset: &mainnet::HeadReset) -> Option<HeadResetRefusal> {
-        self.plan_head_reset(reset).err()
-    }
-    /// Every check of [`Self::reset_head`], without touching the state.
-    fn plan_head_reset(&self, reset: &mainnet::HeadReset) -> Result<HeadResetPlan, HeadResetRefusal> {
-        use HeadResetRefusal as R;
-        if self.settled_number() <= reset.number {
-            return Err(R::HeadNotAbove);
-        }
-        let (head, consumed) = match reset.statement {
-            None if reset.number == 0 => (None, 0),
-            Some(text) => {
-                let Some(statement) = mainnet::unhex(text.trim()) else { return Err(R::Statement) };
-                if StatementVersion::of(&statement) != Some(StatementVersion::V3)
-                    || n(&statement, S + 264) != reset.number
-                    || (0..3).any(|i| h(&statement, S + i * 32) != self.policy.identities[i])
-                {
-                    return Err(R::Statement);
-                }
-                let consumed = n(&statement, S + 528);
-                (Some((reset.commitment, statement)), consumed)
-            }
-            None => return Err(R::Statement),
-        };
-        let (root, count) = withdrawal::tree_after(head.as_ref().map(|(_, s): &([u8; 32], Vec<u8>)| s.as_slice()));
-        // The target's tree is recorded again by the reset, so it must not contradict
-        // what L1 accepted: the tail only extends it, and a retained record at or
-        // below the target never has more leaves, nor another root at the same count.
-        if count > self.withdrawal_head().1
-            || self.withdrawals.iter().any(|r| r.l2_number <= reset.number && (r.count > count || (r.count == count && r.root != root)))
-        {
-            return Err(R::Tree);
-        }
-        // A claim may have paid a leaf the target did not publish: at an
-        // index the target does not have, or (from the swap on, where the
-        // paid leaves are recorded) proven against a root of the tail, which
-        // nothing ties to the target's tree at any index.
-        let tail_paid = self.paid.proven_above(reset.number);
-        let at_or_above_count = self.claimed.any_at_or_above(count);
-        let paid_beyond = at_or_above_count || !tail_paid.is_empty();
-        if paid_beyond && !reset.forfeit {
-            return Err(R::PaidBeyondTarget { at_or_above_count, against_tail: tail_paid });
-        }
-        if consumed > self.inbox.len() as u64 {
-            return Err(R::Inbox);
-        }
-        // Forced records consumed after the target go back into the queue, as
-        // the deposit cursor goes back. A plain reset the consumed log cannot
-        // cover is refused, so that no forced transaction is silently dropped.
-        // A forfeit reset is not bounded by what the tail consumed: it puts
-        // back what the log still has (review R308-8).
-        if !reset.forfeit && self.forced.as_ref().is_some_and(|q| !q.covers_reset_to(reset.number)) {
-            return Err(R::ForcedLog);
-        }
-        Ok(HeadResetPlan { head, consumed, root, count, tail_paid, paid_beyond })
-    }
-    /// The compiled head resets of this L2 ([`mainnet::HEAD_RESET`] with the
-    /// swap, [`mainnet::ROLLBACK_HEAD_RESET`] with the rollback) and whether
-    /// each would apply to this state now. Empty when the release ships no
-    /// reset and on any other L2. Not a consensus input: an operator reads it
-    /// before the gate, because a refused reset leaves the head where it is
-    /// while the program still moves (review R308-2P-3, R308-2P-4).
-    pub fn head_reset_reports(&self) -> Vec<HeadResetReport> {
-        self.head_reset_reports_with(mainnet::HEAD_RESET.as_ref(), mainnet::ROLLBACK_HEAD_RESET.as_ref())
-    }
-    fn head_reset_reports_with(&self, swap: Option<&mainnet::HeadReset>, rollback: Option<&mainnet::HeadReset>) -> Vec<HeadResetReport> {
-        let Some(pinned) = mainnet::PROGRAM else { return Vec::new() };
-        if self.policy.identities[2] != pinned.identities[2] {
-            return Vec::new();
-        }
-        let activated = self.policy.identities[3..7] == pinned.identities[3..7] && self.policy.proof_policy == pinned.proof_policy;
-        let swapped = self.policy.identities[3..7] == mainnet::PROGRAM_NEXT.identities
-            && self.policy.proof_policy == mainnet::PROGRAM_NEXT.proof_policy;
-        let report = |gate, pending, reset: &mainnet::HeadReset| HeadResetReport {
-            gate,
-            number: reset.number,
-            forfeit: reset.forfeit,
-            pending,
-            refusal: self.head_reset_refusal(reset),
-        };
-        swap.map(|reset| report(HeadResetReport::NEXT_PROGRAM, activated, reset))
-            .into_iter()
-            .chain(rollback.map(|reset| report(HeadResetReport::ROLLBACK, activated || swapped, reset)))
-            .collect()
-    }
-    /// The compiled head reset that ran when the program moved from the one
-    /// `before` holds to the one `self` holds, with why it was refused (if it
-    /// was): `before` is the state the gate found. `None` when the program
-    /// did not move or the release ships no reset for that gate. For the
-    /// node's log at the gate; not a consensus input.
-    pub fn head_reset_at_program_change(&self, before: &State) -> Option<HeadResetReport> {
-        self.head_reset_at_program_change_with(before, mainnet::HEAD_RESET.as_ref(), mainnet::ROLLBACK_HEAD_RESET.as_ref())
-    }
-    fn head_reset_at_program_change_with(
-        &self,
-        before: &State,
-        swap: Option<&mainnet::HeadReset>,
-        rollback: Option<&mainnet::HeadReset>,
-    ) -> Option<HeadResetReport> {
-        let (was, now) = (&before.policy.identities[3..7], &self.policy.identities[3..7]);
-        if was == now {
-            return None;
-        }
-        // The rollback's gate is never before the swap's, so a state that
-        // holds the fallback program after one transition ran the swap's
-        // reset first only if it held the pinned program before.
-        let (gate, reset) = if now == mainnet::PROGRAM_NEXT.identities {
-            (HeadResetReport::NEXT_PROGRAM, swap?)
-        } else if now == mainnet::PROGRAM_FALLBACK.identities && was == mainnet::PROGRAM_NEXT.identities {
-            (HeadResetReport::ROLLBACK, rollback?)
-        } else {
-            return None;
-        };
-        Some(HeadResetReport { gate, number: reset.number, forfeit: reset.forfeit, pending: false, refusal: before.head_reset_refusal(reset) })
-    }
-    fn replace_program(&mut self, next: &mainnet::NextProgram) {
-        self.policy.identities[3..7].copy_from_slice(&next.identities);
-        self.policy.proof_policy = next.proof_policy;
-    }
-    /// Test hook: the rollback with a reset other than the compiled one.
-    #[cfg(test)]
-    pub(crate) fn install_fallback_with_for_test(&mut self, reset: &mainnet::HeadReset) {
-        self.install_fallback_with(Some(reset));
-    }
-    /// Test hook: the reports with resets other than the compiled ones.
-    #[cfg(test)]
-    pub(crate) fn head_reset_reports_for_test(&self, swap: Option<&mainnet::HeadReset>, rollback: Option<&mainnet::HeadReset>) -> Vec<HeadResetReport> {
-        self.head_reset_reports_with(swap, rollback)
-    }
-    /// Test hook: the report at a program change with resets other than the compiled ones.
-    #[cfg(test)]
-    pub(crate) fn head_reset_at_program_change_for_test(
-        &self,
-        before: &State,
-        swap: Option<&mainnet::HeadReset>,
-        rollback: Option<&mainnet::HeadReset>,
-    ) -> Option<HeadResetReport> {
-        self.head_reset_at_program_change_with(before, swap, rollback)
-    }
-    /// Test hook: the schedule under gates other than the compiled ones.
-    #[cfg(test)]
-    pub(crate) fn program_schedule_for_test(&self, next: u64, rollback: u64) -> Vec<(u64, mainnet::NextProgram)> {
-        self.program_schedule_from(next, rollback)
-    }
-    /// Test hook: mark a leaf as claimed without a claim.
-    #[cfg(test)]
-    pub(crate) fn claimed_insert_for_test(&mut self, index: u64) {
-        self.claimed.insert(index);
-    }
-    /// Test hook: release `sats` of escrow without a claim (conservation kept).
-    #[cfg(test)]
-    pub(crate) fn released_for_test(&mut self, sats: u64) {
-        self.escrow_sat -= u128::from(sats);
-        self.released_sat += u128::from(sats);
-    }
-    /// Test hook: install an accepted head without a settlement.
-    #[cfg(test)]
-    pub(crate) fn set_head_for_test(&mut self, digest: [u8; 32], statement: Vec<u8>, consumed: u64) {
-        self.head = Some((digest, statement));
-        self.consumed = consumed;
-    }
-    /// Test hook: move any L2 to `next`, for settlement checks across the swap.
-    #[cfg(test)]
-    pub(crate) fn replace_program_for_test(&mut self, next: &mainnet::NextProgram) {
-        self.replace_program(next);
-    }
-    /// Whether the next rules hold, and with them the next release rule. It
-    /// follows from the committed configuration, so it adds no state bytes and
-    /// survives a rollback, which changes the guest and not the rules (the
-    /// fallback's configuration is the next one, or the next one without forced
-    /// inclusion).
-    pub fn next_program_active(&self) -> bool {
-        self.policy.identities[3] == mainnet::PROGRAM_NEXT.identities[0]
-            || self.policy.identities[3] == mainnet::PROGRAM_FALLBACK.identities[0]
-    }
     /// The release window a claim in the next native block sees.
     pub fn release_window(&self) -> withdrawal::ReleaseWindow {
         self.release_window.at(&self.profile.limits, self.native_height.saturating_add(1), self.escrow_sat)
+    }
+    /// The attested lane a claim in the next native block sees (audit
+    /// L1X-01; meaningful only behind its gate).
+    pub fn attested_release_window(&self) -> withdrawal::ReleaseWindow {
+        self.attested_release.at_bps(
+            &self.profile.limits,
+            self.native_height.saturating_add(1),
+            self.escrow_sat,
+            withdrawal::ATTESTED_RELEASE_WINDOW_BPS,
+        )
+    }
+    /// What the release window admits in the next native block under `rules`.
+    pub fn release_budget(&self, rules: withdrawal::ReleaseRules) -> withdrawal::ReleaseBudget {
+        withdrawal::ReleaseBudget {
+            open: self.release_window(),
+            attested: self.attested_release_window(),
+            attestors: self.policy.attestor_set != [0; 32],
+            rules,
+        }
+    }
+    /// Local-cache restore only; the state root check that follows the
+    /// restore authenticates what is put back.
+    #[cfg(feature = "local-state-cache")]
+    pub(crate) fn restore_attested_release(&mut self, window: withdrawal::ReleaseWindow) {
+        self.attested_release = window;
+    }
+    /// The stored attested-lane accounting (default until its first claim).
+    pub fn attested_release(&self) -> &withdrawal::ReleaseWindow {
+        &self.attested_release
     }
     /// Record `root` as this chain's checkpoint of `epoch` (the epoch the
     /// boundary opens), with `finalized_epoch` the finalized checkpoint after
@@ -2881,11 +2104,6 @@ impl State {
     pub(crate) fn restore_checkpoint_roots(&mut self, roots: std::collections::BTreeMap<u64, [u8; 32]>) {
         self.checkpoint_roots = roots;
     }
-    /// Local-cache restore only, like [`Self::restore_checkpoint_roots`].
-    #[cfg(feature = "local-state-cache")]
-    pub(crate) fn restore_forced_queue(&mut self, queue: forced::Queue) {
-        self.forced = Some(queue);
-    }
     /// Leaves `0..matured_count` are claimable in the next native block.
     pub fn matured_count(&self) -> u64 {
         self.matured_withdrawals().map_or(0, |r| r.count)
@@ -2894,15 +2112,6 @@ impl State {
     pub fn claimed(&self) -> &withdrawal::ClaimBitmap {
         &self.claimed
     }
-    /// Leaves paid under the next program, with the record each was proven against.
-    pub fn paid_leaves(&self) -> &withdrawal::PaidLeaves {
-        &self.paid
-    }
-    /// Local-cache restore only, like [`Self::restore_checkpoint_roots`].
-    #[cfg(feature = "local-state-cache")]
-    pub(crate) fn restore_paid_leaves(&mut self, paid: withdrawal::PaidLeaves) {
-        self.paid = paid.reindexed();
-    }
     /// Satoshis released from escrow by claims.
     pub fn released_sat(&self) -> u128 {
         self.released_sat
@@ -2910,6 +2119,43 @@ impl State {
     /// Satoshis ever escrowed by deposits (the inbox is never pruned).
     pub fn deposited_sat(&self) -> u128 {
         self.inbox.iter().map(|r| u128::from(r.sats)).sum()
+    }
+    /// Satoshis ever escrowed by deposits, in O(1): what is in escrow plus
+    /// what claims released (equal to [`Self::deposited_sat`] by the
+    /// conservation invariant). This is the figure the L2's cumulative mint
+    /// counter converges to as the inbox is consumed.
+    pub fn cumulative_deposited_sat(&self) -> u128 {
+        self.escrow_sat.saturating_add(self.released_sat)
+    }
+    /// Whether a deposit of `sats` keeps the lifetime deposit total within
+    /// `cap_sat` (audit L1X-03; binds only behind
+    /// `params::L2_CUMULATIVE_DEPOSIT_CAP_ACTIVATION_EPOCH`, which the
+    /// caller judges).
+    pub fn deposit_within_mint_cap(&self, sats: u64, cap_sat: u128) -> bool {
+        self.cumulative_deposited_sat().checked_add(u128::from(sats)).is_some_and(|total| total <= cap_sat)
+    }
+    /// Whether the program in force can mint a deposit of `sats` under its
+    /// supply cap `cap_sat` (audits L1X-03 and L2N-02; binds only behind
+    /// `params::L2_CUMULATIVE_DEPOSIT_CAP_ACTIVATION_EPOCH`, which the caller
+    /// judges). The L1 rule mirrors the guest in force, never the other one:
+    ///
+    /// * [`SupplyCap::GrossMinted`]: the lifetime deposit total stays within
+    ///   the cap ([`Self::deposit_within_mint_cap`]). Past it deposits are
+    ///   closed for good under this program.
+    /// * [`SupplyCap::Outstanding`]: the escrow stays within the cap. The
+    ///   guest bounds minted minus withdrawn, which is at most the escrow at
+    ///   the time of the deposit (minted <= deposited, withdrawn on L2 >=
+    ///   claimed on L1), so a deposit admitted here is always mintable. On an
+    ///   L1 that conserves its supply the escrow cannot pass the cap, so
+    ///   this never closes deposits; it only keeps an L1 accounting fault
+    ///   from becoming an unmintable inbox record.
+    pub fn deposit_within_supply_cap(&self, sats: u64, cap_sat: u128) -> bool {
+        match self.supply_cap() {
+            SupplyCap::GrossMinted => self.deposit_within_mint_cap(sats, cap_sat),
+            SupplyCap::Outstanding => {
+                self.escrow_sat.checked_add(u128::from(sats)).is_some_and(|escrow| escrow <= cap_sat)
+            }
+        }
     }
     /// The bridge conservation invariant: escrow equals deposits minus claims.
     pub fn escrow_conserved(&self) -> bool {
@@ -2937,6 +2183,21 @@ impl State {
         attested: bool,
         exempt_after_earlier_claims: bool,
     ) -> Result<withdrawal::Record, withdrawal::ClaimRefusal> {
+        let rules = withdrawal::ReleaseRules { exempt_after_earlier_claims, attested_lane: false };
+        self.check_claim_under(chain_id, index, l1_recipient, sats, siblings, attested, rules)
+    }
+    /// [`Self::check_claim`] under every gated release rule (`rules` is
+    /// [`withdrawal::ReleaseRules::at`] the claim's epoch).
+    pub fn check_claim_under(
+        &self,
+        chain_id: u64,
+        index: u64,
+        l1_recipient: &[u8; 32],
+        sats: u64,
+        siblings: &[[u8; 32]; withdrawal::TREE_DEPTH],
+        attested: bool,
+        rules: withdrawal::ReleaseRules,
+    ) -> Result<withdrawal::Record, withdrawal::ClaimRefusal> {
         use withdrawal::ClaimRefusal as R;
         if !self.profile.user_transactions || !self.asynchronous {
             return Err(R::NotActive);
@@ -2946,16 +2207,13 @@ impl State {
         }
         let at = self.native_height.checked_add(1).ok_or(R::NotActive)?;
         let record = *withdrawal::matured_proof(&self.profile.limits, &self.withdrawals, at, chain_id, index, l1_recipient, sats, siblings)?;
-        // A leaf that was paid stays paid when a forfeit reset forgets its
-        // index, so that only another leaf can be claimed there.
-        if self.claimed.contains(index) || self.paid.contains(index, &withdrawal::leaf(chain_id, index, l1_recipient, sats)) {
+        if self.claimed.contains(index) {
             return Err(R::Claimed);
         }
         if self.escrow_sat < u128::from(sats) {
             return Err(R::Escrow);
         }
-        let after_earlier_claims = exempt_after_earlier_claims || self.next_program_active();
-        if !self.release_window().admits(sats, self.window_exempt(attested), after_earlier_claims) {
+        if !self.release_budget(rules).admits(sats, attested) {
             return Err(R::RateLimited);
         }
         Ok(record)
@@ -2973,21 +2231,38 @@ impl State {
         attested: bool,
         exempt_after_earlier_claims: bool,
     ) -> Result<(), withdrawal::ClaimRefusal> {
-        let record =
-            self.check_claim(chain_id, index, l1_recipient, sats, siblings, attested, exempt_after_earlier_claims)?;
+        let rules = withdrawal::ReleaseRules { exempt_after_earlier_claims, attested_lane: false };
+        self.release_withdrawal_under(chain_id, index, l1_recipient, sats, siblings, attested, rules)
+    }
+    /// [`Self::release_withdrawal`] under every gated release rule.
+    pub(crate) fn release_withdrawal_under(
+        &mut self,
+        chain_id: u64,
+        index: u64,
+        l1_recipient: &[u8; 32],
+        sats: u64,
+        siblings: &[[u8; 32]; withdrawal::TREE_DEPTH],
+        attested: bool,
+        rules: withdrawal::ReleaseRules,
+    ) -> Result<(), withdrawal::ClaimRefusal> {
+        self.check_claim_under(chain_id, index, l1_recipient, sats, siblings, attested, rules)?;
         let released = self.released_sat.checked_add(u128::from(sats)).ok_or(withdrawal::ClaimRefusal::Escrow)?;
-        let mut window = self.release_window();
-        window.released = window.released.saturating_add(u128::from(sats));
+        let before = self.release_budget(rules);
+        let mut budget = before;
+        let taken = budget.take(sats, attested);
+        debug_assert!(taken, "checked just above");
         // No fallible step below: nullifier, escrow, total and window move together.
         let fresh = self.claimed.insert(index);
         debug_assert!(fresh);
-        // From the swap on, which leaf was paid and against which record.
-        if self.next_program_active() {
-            self.paid.record(index, withdrawal::leaf(chain_id, index, l1_recipient, sats), record.l2_number);
-        }
         self.escrow_sat -= u128::from(sats);
         self.released_sat = released;
-        self.release_window = window;
+        // Exactly one of the two accountings moved; only that one is stored,
+        // so the ordinary window's committed bytes are what they always were.
+        if budget.attested != before.attested {
+            self.attested_release = budget.attested;
+        } else {
+            self.release_window = budget.open;
+        }
         Ok(())
     }
     /// `(root, count)` of the withdrawal tree after the accepted head: the
@@ -3038,6 +2313,11 @@ impl State {
             return Err(R::Full);
         }
         self.native_height.checked_add(1).ok_or(R::Full)
+    }
+    /// Test hook: move the inbox cursor without a settlement.
+    #[cfg(test)]
+    pub(crate) fn mark_consumed_for_test(&mut self, records: u64) {
+        self.consumed = (self.consumed + records).min(self.inbox.len() as u64);
     }
     /// Test hook: configure the attestor set after genesis.
     #[cfg(test)]
@@ -3159,21 +2439,13 @@ impl State {
             }
         }
         // Absent until the first claim, so states without claims keep their bytes.
-        // A forfeit reset can forget every claim while releases stay, so the
-        // section also stays while anything was released (before a forfeit the
-        // two conditions are the same: every release is a claim).
-        if self.claimed.claims() != 0 || self.released_sat != 0 {
+        if self.claimed.claims() != 0 {
             out.extend_from_slice(b"BLOCH:NATIVE:L2:CLAIM-STATE:1");
             out.extend_from_slice(&self.released_sat.to_le_bytes());
             self.claimed.encode(&mut out);
             out.extend_from_slice(&self.release_window.window.to_le_bytes());
             out.extend_from_slice(&self.release_window.released.to_le_bytes());
             out.extend_from_slice(&self.release_window.cap.to_le_bytes());
-        }
-        // Absent until the first claim under the next program, so every state
-        // below `L2_NEXT_PROGRAM_EPOCH` keeps its bytes.
-        if !self.paid.is_empty() {
-            self.paid.encode(&mut out);
         }
         // Absent while empty, so states without DA keep their bytes.
         if !self.da.is_empty() {
@@ -3196,10 +2468,24 @@ impl State {
                 out.extend_from_slice(root);
             }
         }
-        // Absent until forced inclusion is enabled, so every state below
-        // L2_FORCED_INCLUSION_EPOCH keeps its bytes.
-        if let Some(queue) = &self.forced {
-            queue.encode(&mut out);
+        // Absent while empty: no set exists below
+        // L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH, so earlier states keep
+        // their bytes. The keys have a fixed length.
+        if !self.settlers.is_empty() {
+            out.extend_from_slice(b"BLOCH:NATIVE:L2:SETTLERS:1");
+            out.push(self.settlers.len() as u8);
+            for key in &self.settlers {
+                out.extend_from_slice(key);
+            }
+        }
+        // Absent until the first attested claim behind
+        // L2_ATTESTED_RELEASE_LANE_ACTIVATION_EPOCH, so earlier states keep
+        // their bytes.
+        if self.attested_release != withdrawal::ReleaseWindow::default() {
+            out.extend_from_slice(b"BLOCH:NATIVE:L2:ATTESTED-RELEASE:1");
+            out.extend_from_slice(&self.attested_release.window.to_le_bytes());
+            out.extend_from_slice(&self.attested_release.released.to_le_bytes());
+            out.extend_from_slice(&self.attested_release.cap.to_le_bytes());
         }
         out
     }
@@ -3214,6 +2500,8 @@ impl State {
         verifier: &dyn crate::attestation::SignatureVerifier,
     ) -> Result<(), Reject> {
         let (end, number, new_withdrawals) = self.check_before_proof(tx, parent, slot, asynchronous)?;
+        // Before the proof: an outsider cannot make this node verify one.
+        let next_settlers = self.check_authorization(tx, Some(verifier))?;
         let s = tx.statement.as_slice();
         if !verifier.verify_l2_settlement(
             &self.policy.proof_policy,
@@ -3232,8 +2520,8 @@ impl State {
         self.head = Some((tx.commitment(), s.to_vec()));
         self.source_anchor = None;
         self.consumed = end;
-        if let Some(queue) = self.forced.as_mut() {
-            queue.consume_due(number);
+        if let Some(keys) = next_settlers {
+            self.settlers = keys;
         }
         // Records for settled blocks can never be used again.
         self.da.retain(|r| r.l2_number > number);
@@ -3337,9 +2625,6 @@ impl State {
                 if self.profile.deposits && h(s, S + 536) != expected_body_commitment(consumed) {
                     return Err(Reject::Deposits);
                 }
-                if self.forced.as_ref().is_some_and(|q| !q.due().is_empty()) {
-                    return Err(Reject::Forced);
-                }
             }
             // V3: user transactions allowed; the minted deposits must be
             // exactly the consumed inbox records, in order.
@@ -3348,11 +2633,8 @@ impl State {
                 if users != 0 && !self.profile.user_transactions {
                     return Err(Reject::UserTransactions);
                 }
-                // Under forced inclusion the slot also binds the forced records
-                // due at the anchor; with none due it is the deposits hash.
-                let due = self.forced.as_ref().map_or(&[][..], |q| q.due());
-                if h(s, S + v3::DEPOSITS_HASH) != forced::inbox_hash(deposits_hash(consumed), due) {
-                    return Err(if due.is_empty() { Reject::Deposits } else { Reject::Forced });
+                if h(s, S + v3::DEPOSITS_HASH) != deposits_hash(consumed) {
+                    return Err(Reject::Deposits);
                 }
                 let da_commitment = h(s, S + v3::DA_COMMITMENT);
                 if h(s, S + v3::TRANSACTIONS_ROOT) == [0; 32]
@@ -3388,6 +2670,41 @@ impl State {
         Ok((end, number, new_withdrawals))
     }
 
+    /// The settler rule (audit L2N-01). Without a registered set a
+    /// settlement carries no authorization (the rule is not in force; a
+    /// trailer is refused, as a node that cannot decode it refuses it). With
+    /// one, the settlement must carry an authorization signed by a
+    /// registered key over this exact settlement and its next set, if any.
+    /// `verifier: None` checks everything but the signature (retention of a
+    /// settlement admission already verified). Returns the set to install.
+    fn check_authorization(
+        &self,
+        tx: &Transaction,
+        verifier: Option<&dyn crate::attestation::SignatureVerifier>,
+    ) -> Result<Option<Vec<Vec<u8>>>, Reject> {
+        let authorization = match (&tx.authorization, self.settlers.is_empty()) {
+            (None, true) => return Ok(None),
+            (Some(_), true) | (None, false) => return Err(Reject::Settler),
+            (Some(authorization), false) => authorization,
+        };
+        let key = self.settlers.get(usize::from(authorization.signer)).ok_or(Reject::Settler)?;
+        if authorization.next_set.as_ref().is_some_and(|keys| !settler::valid_set(keys)) {
+            return Err(Reject::Settler);
+        }
+        if let Some(verifier) = verifier {
+            let digest = settler::digest(
+                &self.policy.identities[0],
+                self.policy.chain_id,
+                &tx.commitment(),
+                authorization.next_set.as_deref(),
+            );
+            if !verifier.verify_with_key(key, &digest, &authorization.signature) {
+                return Err(Reject::Settler);
+            }
+        }
+        Ok(authorization.next_set.clone())
+    }
+
     /// Whether an asynchronous settlement could still apply in the block
     /// after `head` (this state's head block, at `head_slot`): every check
     /// of [`Self::apply`] that needs no proof, the record limit included.
@@ -3404,6 +2721,7 @@ impl State {
         crate::isolation::contain_refusal(Reject::Height, || {
             match self.check_against_source(tx, head, head_slot, true) {
                 Err(why) => Some(why),
+                Ok(_) if self.check_authorization(tx, None).is_err() => Some(Reject::Settler),
                 Ok((_, _, Some(_))) if self.withdrawals.len() >= self.profile.limits.max_records() => Some(Reject::Limit),
                 Ok(_) => None,
             }
@@ -3431,6 +2749,7 @@ impl State {
         if new_withdrawals.is_some() && self.withdrawals.len() >= self.profile.limits.max_records() {
             return Err(Reject::Limit);
         }
+        self.check_authorization(tx, Some(verifier))?;
         if !verifier.verify_l2_settlement(
             &self.policy.proof_policy,
             &self.policy.identities[6],
@@ -3468,23 +2787,8 @@ impl State {
         if self.consumed > self.inbox.len() as u64 {
             return Err("cached L2 inbox cursor is past the inbox".into());
         }
-        if let Some(q) = &self.forced {
-            let pending = q.pending.len() as u64;
-            if q.queued.checked_sub(q.consumed) != Some(pending)
-                // A head reset can queue consumed records again past the
-                // submission capacity: bounded by the consumed log. Every
-                // record weighs at least one unit, so at most this many are
-                // pending, and each group (at least one record) counts at most
-                // its records' weight or a settlement's units.
-                || pending > forced::MAX_PENDING_WEIGHT + forced::CONSUMED_LOG as u64
-                || q.pending_weight() > pending * forced::UNITS_PER_SETTLEMENT
-                || q.log.len() > forced::CONSUMED_LOG
-                || q.log.windows(2).any(|w| w[0].0 > w[1].0)
-                || q.log.first().is_some_and(|(n, _)| *n < q.log_floor)
-                || q.anchor.is_some_and(|a| a > pending)
-            {
-                return Err("cached L2 forced queue is inconsistent".into());
-            }
+        if !self.settlers.is_empty() && !settler::valid_set(&self.settlers) {
+            return Err("cached L2 settler set is not a valid set".into());
         }
         if deposited.checked_sub(self.released_sat) != Some(self.escrow_sat) {
             return Err("cached L2 escrow does not match deposits and releases".into());
@@ -3497,9 +2801,6 @@ impl State {
             || full.checked_add(stored) != Some(self.claimed.claims())
         {
             return Err("cached L2 claim set is inconsistent".into());
-        }
-        if !self.paid.consistent() {
-            return Err("cached L2 paid-leaf log is inconsistent".into());
         }
         Ok(self)
     }
@@ -3615,118 +2916,5 @@ mod inbox_tests {
         bitmap["claims"] = serde_json::json!(3);
         claims.claimed = serde_json::from_value(bitmap).unwrap();
         assert!(claims.from_local_cache().is_err(), "the claim count matches the bitmap");
-    }
-}
-
-/// Agent 382 (round 18), requested by reviewer 384 for finding F382-2: the two
-/// invariants the hardened-clippy argument rests on, stated as properties over
-/// long deterministic sequences of the mutating calls, instead of argued from
-/// the code only. (1) `ClaimBitmap::claims` is the number of claimed indices
-/// across `insert`, `forget` and `forget_at_or_above`, including the floor's
-/// fully claimed words that the forget calls store again (so `claims -= ...`
-/// never underflows), and the set equals a plain model. (2) The forced queue
-/// keeps `queued == consumed + pending.len()` and `consumed >= log.len()`
-/// across `push`, `consume_due`, anchors and `requeue_logged_after` (so
-/// `consumed -= count` never underflows), and the log stays bounded.
-#[cfg(test)]
-mod r18_invariant_tests {
-    use super::*;
-    use std::collections::BTreeSet;
-
-    /// A small deterministic generator (64-bit LCG, high bits).
-    struct Lcg(u64);
-    impl Lcg {
-        fn next(&mut self, bound: u64) -> u64 {
-            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-            (self.0 >> 33) % bound
-        }
-    }
-
-    #[test]
-    fn claim_bitmap_count_is_the_number_of_claimed_indices() {
-        const SPAN: u64 = 8 * 256;
-        for seed in 1..=6u64 {
-            let mut rng = Lcg(seed);
-            let mut set = withdrawal::ClaimBitmap::default();
-            let mut model = BTreeSet::new();
-            for step in 0..6_000 {
-                match rng.next(10) {
-                    // Mostly inserts, often in order, so whole words fill and the floor moves.
-                    0..=3 => {
-                        let i = rng.next(SPAN);
-                        assert_eq!(set.insert(i), model.insert(i), "seed {seed} step {step} insert {i}");
-                    }
-                    4..=5 => {
-                        let start = rng.next(SPAN / 256) * 256;
-                        for i in start..start + 256 {
-                            assert_eq!(set.insert(i), model.insert(i));
-                        }
-                    }
-                    6..=7 => {
-                        let i = rng.next(SPAN);
-                        assert_eq!(set.forget(i), model.remove(&i), "seed {seed} step {step} forget {i}");
-                    }
-                    _ => {
-                        let i = rng.next(SPAN + 1);
-                        let gone = model.split_off(&i).len() as u64;
-                        assert_eq!(set.forget_at_or_above(i), gone, "seed {seed} step {step} forget >= {i}");
-                    }
-                }
-                assert_eq!(set.claims(), model.len() as u64, "seed {seed} step {step}: claims is the count");
-                if step % 97 == 0 {
-                    let present = (0..SPAN + 256).filter(|&i| set.contains(i)).count() as u64;
-                    assert_eq!(present, set.claims(), "seed {seed} step {step}: claims is the popcount");
-                    assert!((0..SPAN + 256).all(|i| set.contains(i) == model.contains(&i)));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn forced_queue_counts_balance_across_consume_and_requeue() {
-        use forced::{Queue, Record, CONSUMED_LOG, MAX_GAS, MIN_GAS};
-        for seed in 1..=6u64 {
-            let mut rng = Lcg(seed);
-            let mut q = Queue::new();
-            let mut number = 0u64;
-            let mut consumed_by_calls = 0u64;
-            for step in 0..8_000u64 {
-                match rng.next(10) {
-                    0..=4 => {
-                        let record = Record {
-                            height: step,
-                            l1_txid: [(step % 251) as u8; 32],
-                            envelope_hash: [(step % 241) as u8; 32],
-                            gas_limit: MIN_GAS + rng.next(MAX_GAS - MIN_GAS + 1),
-                        };
-                        let before = q.queued;
-                        let pushed = q.push(record).is_ok();
-                        assert_eq!(q.queued, before + u64::from(pushed));
-                    }
-                    5..=7 => {
-                        number += 1;
-                        let due = q.due().len() as u64;
-                        q.consume_due(number);
-                        consumed_by_calls += due;
-                    }
-                    8 => {
-                        q.anchor = Some(rng.next(q.pending.len() as u64 + 1));
-                    }
-                    _ => {
-                        let to = number.saturating_sub(rng.next(8));
-                        let back = q.requeue_logged_after(to);
-                        consumed_by_calls -= back;
-                        number = to;
-                    }
-                }
-                assert_eq!(q.queued, q.consumed + q.pending.len() as u64, "seed {seed} step {step}: queued = consumed + pending");
-                assert!(q.consumed >= q.log.len() as u64, "seed {seed} step {step}: consumed >= log");
-                assert!(q.log.len() <= CONSUMED_LOG);
-                assert_eq!(q.consumed, consumed_by_calls);
-                if let Some(anchor) = q.anchor {
-                    assert!(anchor <= q.pending.len() as u64 + CONSUMED_LOG as u64);
-                }
-            }
-        }
     }
 }

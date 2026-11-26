@@ -2062,10 +2062,16 @@ pub const FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS: u64 = SLOTS_PER_EPOCH;
 ///   `canonical_bytes().len()` plus one `HYBRID_VERIFY_GAS` term per hybrid
 ///   signature the arm actually verifies (reusing `TxClass::Eutxo{ inputs }`
 ///   for the shape, since `fee_market` has no dedicated staking class and
-///   the cost SHAPE — flat + bytes + N verifications — is identical) — at
-///   the block's base fee like a transfer's gas component (no priority
-///   fee: nothing here names a tip, and none of these messages spend an
-///   eUTXO input to draw one from). Both existing per-block caps
+///   the cost SHAPE — flat + bytes + N verifications — is identical). The
+///   charge is CAPACITY ONLY: gas and bytes against the block limits, no
+///   base fee and no priority fee in money, on every path
+///   (`CommittedState::staking_tx_charge` returns `base_fee_sat: 0`;
+///   none of these messages names a tip or spends an eUTXO input to draw a
+///   fee from). An earlier version of this text said "at the block's base
+///   fee"; the code never charged it (audit L1S-02). The same capacity
+///   metering is already in force from `WITHDRAWAL_ACTIVATION_EPOCH`, so
+///   arming this gate adds only the transaction-count bound below; it does
+///   not make any staking message pay. Both existing per-block caps
 ///   (`BlockGasLimitExceeded`, `BlockByteLimitExceeded`) already sum every
 ///   transaction's charge (step 10b), so making this charge non-zero is
 ///   what makes them bind on a staking-only body; no new cap is needed for
@@ -2241,8 +2247,8 @@ pub const SIGHASH_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
 /// Arming it is a coordinated upgrade, not a wallet flag day: every shipped
 /// signer already produces FIPS 204 reference signatures, so no signer
 /// changes anything. [`SIG_CANONICAL_ACTIVATION_EPOCH`] implies it (its
-/// policies always use the pinned verifier). Ships INERT at `u64::MAX`;
-/// `mldsa_pin_gate_is_inert` pins the value.
+/// policies always use the pinned verifier). ARMED at 7270 (it shipped inert
+/// at `u64::MAX`); the test `mldsa_pin_gate_is_inert` pins the armed value.
 ///
 /// # GO criterion: full-history replay, byte-identical, x86_64 AND aarch64
 ///
@@ -2329,7 +2335,8 @@ pub fn mldsa_pin_active(epoch: u64) -> bool {
 /// Every validator signer (attestations, proposals, KES leaves) must sign v2
 /// for messages of this epoch onward; the whole fleet must run a binary that
 /// carries the v2 verifier first. Wallets and exchanges are NOT affected.
-/// Ships INERT at `u64::MAX`; `sig_canonical_gate_is_inert` pins the value.
+/// ARMED at 7270 (it shipped inert at `u64::MAX`); the test
+/// `sig_canonical_gate_is_inert` pins the armed value.
 /// The judged epoch is the signed message's own epoch, never a clock.
 pub const SIG_CANONICAL_ACTIVATION_EPOCH: u64 = 7270;
 
@@ -2383,7 +2390,80 @@ pub fn sig_canonical_active(epoch: u64) -> bool {
     epoch_gate_active(epoch, SIG_CANONICAL_ACTIVATION_EPOCH)
 }
 
+/// Flag day for **network-bound static-key duty signatures** (review B2).
+///
+/// # The hole this closes
+///
+/// A KES leaf signs `kes::leaf_message`, which carries the network domain, so
+/// a KES signature is a statement about one network. The static key does not:
+/// it signs the bare consensus root. After KES binds, a validator that never
+/// registered a KES key still signs with its static key (the fallback of
+/// `KES_RESCUE_DELAY_PERIODS`' docs, kept so such validators cannot halt
+/// finality), and before KES binds on a network every validator does. A
+/// header or vote signed that way on ANY network that shares the validator
+/// index and key (a testnet, a fork cloned from this genesis) is a valid
+/// signature here, and two of them for one slot are valid equivocation
+/// evidence: the validator is slashed on this network for what it signed on
+/// another.
+///
+/// # What the gate switches at one epoch
+///
+/// - **below**: the static key signs and verifies the bare consensus root,
+///   byte for byte the chain as it stands;
+/// - **at and above**: the static key signs and verifies
+///   `kes::static_message` (network domain ‖ validator ‖ root under its own
+///   tag). KES signatures are untouched: they are bound already.
+///
+/// Every consensus verification of a proposal or a vote goes through
+/// `kes::verify_validator` (the transition, attestation admission, gossip,
+/// slashing evidence, the node's doors, the finality-certificate verifier),
+/// so the rule has one definition. The judged epoch is the signed message's
+/// own epoch, never a clock.
+///
+/// # ARMING THIS IS A FOUNDER DECISION AND A VALIDATOR-FACING FLAG DAY
+///
+/// Every static-key signer must sign the bound message for duties of this
+/// epoch onward, so the whole fleet must run a binary that carries this rule
+/// first. Any verifier outside this repository that checks static-key duty
+/// signatures (light-client guests, bridges) must carry it too. Wallets and
+/// exchanges are not affected. Ships INERT at `u64::MAX`;
+/// `static_key_network_binding_gate_is_inert` pins the value.
+pub const STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+#[cfg(test)]
+thread_local! {
+    static STATIC_KEY_NETWORK_BINDING_GATE_AT_TL: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: arm [`STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH`] at `epoch`
+/// for this thread until the guard drops (including on unwind). Production
+/// has no override.
+#[cfg(test)]
+pub(crate) fn static_key_network_binding_gate_at_guard(epoch: u64) -> impl Drop {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            STATIC_KEY_NETWORK_BINDING_GATE_AT_TL.with(|c| c.set(self.0));
+        }
+    }
+    Restore(STATIC_KEY_NETWORK_BINDING_GATE_AT_TL.with(|c| c.replace(Some(epoch))))
+}
+
+/// Is the network-bound static-key signature rule active in `epoch`?
+pub fn static_key_network_binding_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if let Some(at) = STATIC_KEY_NETWORK_BINDING_GATE_AT_TL.with(|c| c.get()) {
+        return epoch >= at;
+    }
+    epoch_gate_active(epoch, STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH)
+}
+
 /// Candidate flag day for genesis-bound validator duty signatures.
+///
+/// Superseded for static-key duty signatures by
+/// [`STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH`], which binds them at the
+/// authority layer (`kes::verify_validator`) instead of per message type. The
+/// per-message candidate roots below remain fixtures only.
 ///
 /// This remains deliberately unarmed. Attestation and proposal candidate roots
 /// are available for interoperability fixtures, but production signing,
@@ -2887,6 +2967,53 @@ pub(crate) mod commission_update_limit_rehearsal {
     }
 }
 
+/// AUDIT-L1L2-20261123 L1S-01: delegated stake that is past its nominal
+/// cool-down but still draining stays slashable. `u64::MAX` means INERT.
+///
+/// A deactivated funded position releases its activated stake at the
+/// network churn rate. `Registry::state_of` calls it `Inactive` as soon as
+/// `COOLDOWN_EPOCHS` (32) have passed, whatever is still activated, and the
+/// slashing exposure view masked every `Inactive` position as ineligible.
+/// When more than 32 epochs of churn budget are queued, the position still
+/// adds its activated amount to the validator's weight and still earns
+/// issuance and fees, yet loses nothing when the validator is slashed.
+///
+/// Once armed the mask is dropped: the penalty is priced on the activated
+/// amount (R1 M6), which is zero for a position that has drained or was
+/// withdrawn, so those stay unaffected. No state is added.
+///
+/// It changes the outcome of a slashing transaction, so arming needs a
+/// historical replay, mixed-fleet qualification and a coordinated epoch. It
+/// cannot precede funded delegation.
+/// `l1s01_fix_draining_stake_stays_slashable_until_it_has_drained` pins the
+/// inert value.
+pub const SLASH_DRAINING_STAKE_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    SLASH_DRAINING_STAKE_ACTIVATION_EPOCH,
+    FUNDED_DELEGATION_ACTIVATION_EPOCH
+));
+
+pub(crate) fn slash_draining_stake_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if slash_draining_stake_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, SLASH_DRAINING_STAKE_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod slash_draining_stake_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// Security review round 2, EXE-4: the L2 release window's over-cap
 /// exemption no longer depends on being the window's first claim.
 /// `u64::MAX` means INERT.
@@ -2936,6 +3063,114 @@ pub(crate) mod l2_release_exemption_rehearsal {
     }
 }
 
+/// AUDIT-L1L2-20261123 L1X-01: attested claims are released from their own
+/// lane of the release window. `u64::MAX` means INERT.
+///
+/// One window serves every claim, first come first served. A dust claim
+/// (today), a claim just under the attestation threshold, or one attested
+/// claim just over the cap (once `L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH` is
+/// armed) therefore closes it for every other withdrawal, window after
+/// window. The window exists to slow a forged proof, which cannot produce
+/// the attestors' signatures.
+///
+/// Once armed, on a policy with an attestor set, a claim that carries the
+/// attestation is neither counted against nor limited by the ordinary
+/// window. It draws on a second accounting of the same window length whose
+/// budget is `l2_settlement::withdrawal::ATTESTED_RELEASE_WINDOW_BPS` (50%)
+/// of the escrow at the lane's first claim (same floor): attested claims are
+/// admitted while the lane has released no more than its budget, and the
+/// claim that crosses it is paid in full and closes the lane until the next
+/// window. Unattested claims keep the ordinary cap, alone. Per window the
+/// escrow then releases at most `cap` to unattested claims (a forged proof
+/// without attestor keys is bounded exactly as before) plus the lane budget
+/// and one attested claim.
+///
+/// This is the middle ground between today's rule (attested claims compete
+/// for the one window) and taking attested claims out of the window
+/// altogether (no per-window bound if the proof system and three attestor
+/// keys fail together). It adds committed state (the lane's accounting,
+/// absent until the first attested claim under the gate) and one optional
+/// local-cache section. It is independent of
+/// `L2_RELEASE_EXEMPTION_ACTIVATION_EPOCH`, which keeps governing policies
+/// without attestors.
+///
+/// It changes which claims are valid, so arming needs a historical replay,
+/// mixed-fleet qualification and a coordinated epoch. It cannot precede the
+/// L2 itself. `l1x01_the_attested_lane_gate_is_inert` pins the inert value.
+pub const L2_ATTESTED_RELEASE_LANE_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    L2_ATTESTED_RELEASE_LANE_ACTIVATION_EPOCH,
+    L2_SETTLEMENT_ACTIVATION_EPOCH
+));
+
+pub fn l2_attested_release_lane_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_attested_release_lane_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_ATTESTED_RELEASE_LANE_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_attested_release_lane_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
+/// AUDIT-L1L2-20261123 L1X-03: the L1 refuses a deposit that would take the
+/// lifetime deposit total above the L2's cumulative mint cap. `u64::MAX`
+/// means INERT.
+///
+/// The L2 keeps a counter of everything it ever minted and refuses a deposit
+/// mint that would take it above `ChainSpec::max_l1_sats`
+/// (`transition::l2_deposit::MAX_L2_DEPOSIT_SAT` here); withdrawals free no
+/// room under it. The L1 bounded each deposit but not their sum, and every
+/// settlement must consume the next pending inbox records, so the first
+/// deposit past the cap could never be settled and nothing after it either:
+/// the L2 would stop for good. Once armed, such a deposit is refused on L1
+/// (`L2DepositReject::Inbox`, nothing escrowed): deposits close when the
+/// lifetime volume reaches the cap, and the L2 keeps settling and paying
+/// withdrawals. Lifting the lifetime limit itself needs the L2 to count net
+/// supply, i.e. a new guest program and proof policy.
+///
+/// It changes which transactions are valid, so arming needs a historical
+/// replay, mixed-fleet qualification and a coordinated epoch. It cannot
+/// precede the L2 itself. `l1x03_the_cumulative_cap_gate_is_inert` pins the
+/// inert value.
+pub const L2_CUMULATIVE_DEPOSIT_CAP_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    L2_CUMULATIVE_DEPOSIT_CAP_ACTIVATION_EPOCH,
+    L2_SETTLEMENT_ACTIVATION_EPOCH
+));
+
+pub fn l2_cumulative_deposit_cap_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_cumulative_deposit_cap_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_CUMULATIVE_DEPOSIT_CAP_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_cumulative_deposit_cap_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// Fault isolation of the L2 / bridge / settlement handlers inside the block
 /// transition ([`crate::isolation`]). `u64::MAX` means INERT.
 ///
@@ -2971,6 +3206,254 @@ pub fn l2_fault_isolation_active(epoch: u64) -> bool {
 
 #[cfg(test)]
 pub(crate) mod l2_fault_isolation_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
+/// AUDIT-L1L2-20261123 L1X-02: the L2 deposit inflow is bounded by what
+/// settlements drain. `u64::MAX` means INERT.
+///
+/// One settlement consumes at most `l2_settlement::MAX_INBOX_PER_SETTLEMENT`
+/// (64) inbox records, in strict order, and needs one proof (about 30 native
+/// blocks on the mainnet prover), while a native block fits 61 minimum
+/// deposits. A cheap flood of minimum deposits therefore delays every honest
+/// deposit behind it by days, with its coins already escrowed. Once armed:
+///
+/// * a block carrying more than `l2_settlement::MAX_DEPOSITS_PER_BLOCK` L2
+///   deposits is invalid, like a block with more than `da::MAX_PER_BLOCK` DA
+///   batches;
+/// * a deposit is refused while `l2_settlement::MAX_PENDING_DEPOSITS` records
+///   are already waiting for a settlement, whatever the prover's speed.
+///
+/// A deposit that does not fit is not escrowed: it stays in the sender's
+/// hands and competes by tip. The worst wait of an escrowed deposit is then
+/// `MAX_PENDING_DEPOSITS / MAX_INBOX_PER_SETTLEMENT` settlements, and a
+/// stopped settler holds at most `MAX_PENDING_DEPOSITS` records in escrow.
+///
+/// It changes which blocks are valid, so arming needs a historical replay,
+/// mixed-fleet qualification and a coordinated epoch; there is no runtime
+/// override. It cannot precede the L2 settlement itself.
+/// `l1x02_the_deposit_inflow_gate_is_inert` pins the inert value.
+pub const L2_DEPOSIT_INFLOW_BOUND_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    L2_DEPOSIT_INFLOW_BOUND_ACTIVATION_EPOCH,
+    L2_SETTLEMENT_ACTIVATION_EPOCH
+));
+
+pub fn l2_deposit_inflow_bound_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_deposit_inflow_bound_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_DEPOSIT_INFLOW_BOUND_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_deposit_inflow_bound_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
+/// AUDIT-L1L2-20261123 L2N-01 (and L2N-02), the L1 half of the proper fix:
+/// the settlement program switch. `u64::MAX` means INERT.
+///
+/// The deployed guest program accepts a prover-chosen block context
+/// (L2N-01) and caps the lifetime mint (L2N-02); the fix is a new guest
+/// program, and the L1 pins the program a settlement must name and the key
+/// its proof is verified under. At the first epoch boundary whose new epoch
+/// is `>=` this value, an installed L2 whose policy names the program part
+/// of `l2_settlement::mainnet::PROGRAM` names the pinned successor instead
+/// (`l2_settlement::mainnet::PROGRAM_SWITCH`, applied by
+/// `l2_settlement::State::switch_program`): configuration commitment, guest
+/// ELF, KoalaBear key and BN254 key. The proof policy commitment, the
+/// network identities, the L2 genesis and the pinned source do not change.
+///
+/// No overlap: up to the last block before that boundary only a proof of
+/// the old program settles, from the boundary block on only a proof of the
+/// new one (`l2_settlement::ProgramSwitch` says why). A pending proof of
+/// the old program is refused and the block is proved again.
+///
+/// The deposit rule of `L2_CUMULATIVE_DEPOSIT_CAP_ACTIVATION_EPOCH`
+/// (L1X-03) follows the program in force, so the two gates may be armed in
+/// either order: lifetime total under the old program, escrow under the new
+/// one (`l2_settlement::State::deposit_within_supply_cap`).
+///
+/// Arming needs: the successor re-pinned from the reproducible release ELF
+/// with a real Groth16 fixture (`PROGRAM_SWITCH_FINAL`, asserted below), the
+/// L2 release (prover, settler, followers) that knows both programs and this
+/// epoch on every operator host, a historical replay, mixed-fleet
+/// qualification, the indexer rebuilt, and a coordinated epoch. It cannot
+/// precede the L2 itself. `l2n01_the_program_switch_gate_is_inert_and_not_final`
+/// pins the inert value.
+pub const L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH,
+    L2_SETTLEMENT_ACTIVATION_EPOCH
+));
+// An armed gate must switch to release values, never to the candidate
+// placeholders: a program nobody can prove would stop the L2 at the boundary.
+const _: () = assert!(
+    L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH == u64::MAX
+        || (crate::l2_settlement::mainnet::PROGRAM_SWITCH.is_some()
+            && crate::l2_settlement::mainnet::PROGRAM_SWITCH_FINAL)
+);
+
+pub fn l2_settlement_program_switch_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if let Some(armed) = l2_settlement_program_switch_rehearsal::armed() {
+        return epoch >= armed;
+    }
+    epoch_gate_active(epoch, L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH)
+}
+
+/// Test seam: the gate armed at a chosen epoch (the other rehearsal seams
+/// open a gate for every epoch; the switch tests need the epochs before it).
+#[cfg(test)]
+pub(crate) mod l2_settlement_program_switch_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ARMED: Cell<Option<u64>> = const { Cell::new(None) }; }
+    pub fn armed() -> Option<u64> { ARMED.with(Cell::get) }
+    pub fn arm(epoch: u64) -> impl Drop {
+        struct Restore(Option<u64>);
+        impl Drop for Restore { fn drop(&mut self) { ARMED.with(|v| v.set(self.0)); } }
+        Restore(ARMED.with(|v| v.replace(Some(epoch))))
+    }
+}
+
+/// AUDIT-L1L2-20261123 L2N-01, the L1 stop-gap: L2 settlements only from a
+/// registered settler key. `u64::MAX` means INERT.
+///
+/// The settlement statement binds neither the L2 block's `timestamp` nor
+/// its `prevrandao`, nothing publishes them, and settlement is
+/// permissionless: one outside proof leaves an L2 head whose state nobody
+/// else can rebuild or extend. The proper fix is a new guest program and
+/// proof policy that derive both values from L1 data; until it ships, this
+/// gate removes the outsider.
+///
+/// At the first epoch boundary whose new epoch is `>=` this value an
+/// installed L2 with no settler set installs
+/// `l2_settlement::settler_set_for` (the set pinned in
+/// `l2_settlement::mainnet::SETTLER_SET`). From then on a settlement is
+/// valid only with an `l2_settlement::settler::Authorization` signed by a
+/// registered key; see that module for registration, rotation and what the
+/// loss of every key means. Before the set is installed nothing changes,
+/// and a settlement carrying an authorization is refused.
+///
+/// Trade-off, for the owner: liveness of the L2 then depends on the settler
+/// keys. Arming cannot precede the L2 itself and needs the set pinned
+/// (asserted below), the settler software signing its settlements, a
+/// historical replay, mixed-fleet qualification and a coordinated epoch.
+/// `l2n01_the_settler_gate_is_inert_and_unset` pins the inert value.
+pub const L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH,
+    L2_SETTLEMENT_ACTIVATION_EPOCH
+));
+// An armed gate without a pinned set would install nothing and protect
+// nothing.
+const _: () = assert!(
+    L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH == u64::MAX || crate::l2_settlement::mainnet::SETTLER_SET.is_some()
+);
+
+pub(crate) fn l2_settler_authorization_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_settler_authorization_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH)
+}
+
+/// Whether the consensus settlement decoder parses the settler
+/// authorization trailer (audit L2N-01; review item C1). A property of the
+/// BUILD, not of an epoch: false while the gate is inert, so the decoder of
+/// an inert build is the decoder of the releases before the trailer existed.
+/// The decoder has no epoch to read; in a build that arms the gate the
+/// trailer decodes at every epoch and the transition refuses it until the
+/// set is installed, which is the verdict an older node reaches at its
+/// decoder.
+pub(crate) fn l2_settler_trailer_decodable() -> bool {
+    #[cfg(test)]
+    if l2_settler_authorization_rehearsal::enabled() || l2_settler_trailer_rehearsal::enabled() {
+        return true;
+    }
+    L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH != u64::MAX
+}
+
+/// Test-only: the decoder of a build that arms the settler gate, without
+/// opening the gate itself (no set is installed by it).
+#[cfg(test)]
+pub(crate) mod l2_settler_trailer_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod l2_settler_authorization_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
+/// AUDIT-L1L2-20261123 L1X-04: one data-availability place per native block
+/// is reserved for the registered settler. `u64::MAX` means INERT.
+///
+/// Consensus admits `l2_settlement::da::MAX_PER_BLOCK` (4) DA batches per
+/// block from any funded key, for any payload, and the proposer fills them
+/// by tip: four junk batches per block keep the sequencer's batch, and with
+/// it every L2 block that carries user transactions, off L1 for the price of
+/// their fees. Once armed, on an L2 with a settler set installed
+/// (`L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH`), a block may carry at most
+/// `MAX_PER_BLOCK - da::RESERVED_FOR_SETTLER` (3) DA batches whose funding
+/// key is not a registered settler key. The total stays 4, so the bound on
+/// stored records does not move. Without a settler set the rule does not
+/// bind: it needs the set to know whose batch to protect.
+///
+/// It changes which blocks are valid, so arming needs a historical replay,
+/// mixed-fleet qualification and a coordinated epoch. It cannot precede the
+/// L2 itself. `l1x04_the_da_slot_gate_is_inert` pins the inert value.
+pub const L2_DA_SETTLER_SLOT_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    L2_DA_SETTLER_SLOT_ACTIVATION_EPOCH,
+    L2_SETTLEMENT_ACTIVATION_EPOCH
+));
+
+pub fn l2_da_settler_slot_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if l2_da_settler_slot_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, L2_DA_SETTLER_SLOT_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod l2_da_settler_slot_rehearsal {
     use std::cell::Cell;
     thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
     pub fn enabled() -> bool { ENABLED.with(Cell::get) }
@@ -3126,194 +3609,6 @@ pub(crate) fn native_claim_finality_active(epoch: u64) -> bool {
         return true;
     }
     epoch_gate_active(epoch, HF1_CLAIM_FINALITY_EPOCH)
-}
-
-/// CANDIDATE, not scheduled: the epoch boundary that replaces the mainnet L2
-/// program with `l2_settlement::mainnet::PROGRAM_NEXT` (sparse witness,
-/// timestamp and prevrandao bound in the guest, fee-vault sweep, and the release
-/// rule of `ReleaseWindow::admits`). `u64::MAX` means INERT. No epoch has been
-/// chosen. Its ordering rule is `hard_forks::l2_program_schedule_coherent`.
-pub const L2_NEXT_PROGRAM_EPOCH: u64 = u64::MAX;
-/// The boundary that rolls that program back to
-/// `l2_settlement::mainnet::PROGRAM_FALLBACK`, the same rules under the complete
-/// witness. `u64::MAX` means INERT, and a release that swaps the program ships it
-/// so. Only an emergency release moves it: L1 cannot tell a misbehaving guest by
-/// itself, and there is no key and no runtime input.
-pub const L2_PROGRAM_ROLLBACK_EPOCH: u64 = u64::MAX;
-
-/// CANDIDATE, not scheduled: the epoch boundary that enables L1 forced
-/// inclusion of L2 transactions (`l2_settlement::forced`, wire 0x1C) on an L2
-/// whose program implements it. `u64::MAX` means INERT. It cannot be armed while
-/// `l2_settlement::mainnet::FORCED_INCLUSION_CONFIGURATIONS` is empty, nor
-/// before `L2_NEXT_PROGRAM_EPOCH` (`hard_forks::l2_forced_inclusion_may_arm`).
-/// It rides with the program swap: the guest that implements it is the next
-/// program, so the two gates are one boundary (the swap runs first in
-/// `close_epoch`). A rehearsal forced build may still set a literal epoch.
-pub const L2_FORCED_INCLUSION_EPOCH: u64 = L2_NEXT_PROGRAM_EPOCH;
-
-pub(crate) fn l2_forced_inclusion_active(epoch: u64) -> bool {
-    #[cfg(test)]
-    if l2_forced_inclusion_test::forced() {
-        return true;
-    }
-    epoch_gate_active(epoch, L2_FORCED_INCLUSION_EPOCH)
-}
-
-/// CANDIDATE, not scheduled: the epoch from which L1 charges the L2 protocol
-/// fee (`l2_revenue`): a fee on every L2 deposit (0x14), paid from the
-/// depositor's inputs, and a fee on every withdrawal claim (0x16), taken from
-/// the release. Both go to one compiled treasury output; nothing is burned.
-/// `u64::MAX` means INERT. It cannot be armed while
-/// `l2_revenue::TREASURY_SCRIPT_HASH` is `None`, nor at or before the first KES
-/// period (`hard_forks::l2_revenue_may_arm`). It changes no L2 rule.
-///
-/// It rides with the program swap (coordinator, round 11): the fee starts at
-/// the same boundary as the next L2 rules, so it is an alias of
-/// [`L2_NEXT_PROGRAM_EPOCH`] and stays inert while that gate is inert.
-pub const L2_REVENUE_EPOCH: u64 = L2_NEXT_PROGRAM_EPOCH;
-
-/// The script hash of the one L1 protocol treasury (owner input of
-/// 2026-11-16: `bloch1qe986db5149cff7499b282a048272a09aff0af4ff84242073`). It
-/// receives every charged forced-inclusion surcharge
-/// (`l2_settlement::mainnet::FORCED_INCLUSION_TREASURY`) and every L2
-/// crossing fee (`l2_revenue::TREASURY_SCRIPT_HASH`); both names are aliases
-/// of this constant, so the two revenue streams cannot be configured apart.
-/// `None` keeps both rules off: `hard_forks::l2_forced_inclusion_may_arm` and
-/// `hard_forks::l2_revenue_may_arm` refuse to arm their gates while it is
-/// unset or the zero hash (compile time). Revenue rule (2026-11-02): a real
-/// treasury, never a burn.
-///
-/// The address is a 20-byte key hash (`SHA3-256(pubkey)[..20]`, checksum
-/// `84242073` verified), so the script hash is its **carried** form: the 20
-/// bytes, then twelve zero bytes, which `transition::owns` opens for the
-/// holder of that key exactly as it opens a carried Genesis-3 balance (160
-/// bits of preimage resistance, the security of every carried output). It is
-/// the address of `tokenomics_v4::FOUNDER_WITHDRAWAL_H160`. Setting it arms
-/// nothing: both revenue gates stay at `u64::MAX` until the fork epoch is set.
-pub const PROTOCOL_TREASURY_SCRIPT_HASH: Option<[u8; 32]> = Some([
-    0xe9, 0x86, 0xdb, 0x51, 0x49, 0xcf, 0xf7, 0x49, 0x9b, 0x28, 0x2a, 0x04, 0x82, 0x72, 0xa0, 0x9a, 0xff, 0x0a, 0xf4, 0xff,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-]);
-
-pub(crate) fn l2_revenue_active(epoch: u64) -> bool {
-    #[cfg(test)]
-    if l2_revenue_test::forced() {
-        return true;
-    }
-    epoch_gate_active(epoch, L2_REVENUE_EPOCH)
-}
-
-/// Public view for tooling (the offline CLIs): whether a block in `epoch`
-/// charges the L2 protocol fee on this build.
-pub fn l2_revenue_active_at(epoch: u64) -> bool {
-    l2_revenue_active(epoch)
-}
-
-#[cfg(test)]
-pub(crate) mod l2_revenue_test {
-    use std::cell::Cell;
-    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
-    pub fn forced() -> bool { ENABLED.with(Cell::get) }
-    pub fn open() -> impl Drop {
-        struct Restore(bool);
-        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
-        Restore(ENABLED.with(|v| v.replace(true)))
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod l2_forced_inclusion_test {
-    use std::cell::Cell;
-    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
-    pub fn forced() -> bool { ENABLED.with(Cell::get) }
-    pub fn open() -> impl Drop {
-        struct Restore(bool);
-        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
-        Restore(ENABLED.with(|v| v.replace(true)))
-    }
-}
-
-pub(crate) fn l2_next_program_active(epoch: u64) -> bool {
-    #[cfg(test)]
-    if l2_next_program_test::forced() {
-        return true;
-    }
-    epoch_gate_active(epoch, L2_NEXT_PROGRAM_EPOCH)
-}
-
-pub(crate) fn l2_program_rollback_active(epoch: u64) -> bool {
-    #[cfg(test)]
-    if l2_next_program_test::rollback_forced() {
-        return true;
-    }
-    epoch_gate_active(epoch, L2_PROGRAM_ROLLBACK_EPOCH)
-}
-
-#[cfg(test)]
-pub(crate) mod l2_next_program_test {
-    use std::cell::Cell;
-    thread_local! {
-        static ENABLED: Cell<bool> = const { Cell::new(false) };
-        static ROLLBACK: Cell<bool> = const { Cell::new(false) };
-    }
-    pub fn forced() -> bool { ENABLED.with(Cell::get) }
-    pub fn rollback_forced() -> bool { ROLLBACK.with(Cell::get) }
-    pub fn open() -> impl Drop {
-        struct Restore(bool);
-        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
-        Restore(ENABLED.with(|v| v.replace(true)))
-    }
-    pub fn open_rollback() -> impl Drop {
-        struct Restore(bool);
-        impl Drop for Restore { fn drop(&mut self) { ROLLBACK.with(|v| v.set(self.0)); } }
-        Restore(ROLLBACK.with(|v| v.replace(true)))
-    }
-}
-
-/// CANDIDATE, not scheduled: the epoch from which one of the
-/// `l2_settlement::da::MAX_PER_BLOCK` DA slots of every block is reserved
-/// for the L2's registered DA funding key (`l2_settlement::da::reserved_key`).
-/// `u64::MAX` means INERT. No epoch has been chosen.
-///
-/// From the first block of this epoch, a block may carry at most
-/// `da::OPEN_PER_BLOCK` (3) DA transactions funded by any other key; the
-/// total cap of `da::MAX_PER_BLOCK` (4) is unchanged. Without it, four
-/// third-party DA transactions per block at tip 0 take every slot for about
-/// 0.012 BLCH an hour (the tip tie-break is the canonical bytes, which start
-/// with the funding key), and no user-transaction block can settle while
-/// they do. The rule only refuses blocks the old rule accepted, so it is a
-/// soft fork: no committed byte changes at the gate, and history replays
-/// unchanged. Arming needs the registered key (`hard_forks`).
-pub const L2_DA_RESERVED_SLOT_EPOCH: u64 = u64::MAX;
-
-pub(crate) fn l2_da_reserved_slot_active(epoch: u64) -> bool {
-    #[cfg(test)]
-    if l2_da_reserved_slot_test::forced() {
-        return true;
-    }
-    epoch_gate_active(epoch, L2_DA_RESERVED_SLOT_EPOCH)
-}
-
-#[cfg(test)]
-pub(crate) mod l2_da_reserved_slot_test {
-    use std::cell::Cell;
-    thread_local! {
-        static ENABLED: Cell<bool> = const { Cell::new(false) };
-        static KEY: Cell<Option<[u8; 32]>> = const { Cell::new(None) };
-    }
-    pub fn forced() -> bool { ENABLED.with(Cell::get) }
-    pub fn key() -> Option<[u8; 32]> { KEY.with(Cell::get) }
-    /// Arms the gate and registers `key` (a funding-key hash) on this thread.
-    pub fn open(key: Option<[u8; 32]>) -> impl Drop {
-        struct Restore(bool, Option<[u8; 32]>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                ENABLED.with(|v| v.set(self.0));
-                KEY.with(|v| v.set(self.1));
-            }
-        }
-        Restore(ENABLED.with(|v| v.replace(true)), KEY.with(|v| v.replace(key)))
-    }
 }
 
 #[cfg(test)]
@@ -3838,6 +4133,96 @@ pub(crate) mod pq_migration_rehearsal {
     }
 }
 
+/// AUDIT-L1L2-20261123 L1S-02: only usage that paid a fee moves the base
+/// fee. `u64::MAX` means INERT.
+///
+/// Before this gate the gas and bytes of zero-fee protocol transactions
+/// (lifecycle messages, credential rotation, L2 settlement) are committed as
+/// the block's usage and feed `fee_market::next_base_fee`, so whoever can
+/// place free transactions can raise the price everyone else pays. Once
+/// armed, the committed usage (`BaseFeeRecord`) counts only transactions
+/// that were charged a base or priority fee; the per-block gas and byte
+/// LIMITS still count every transaction.
+///
+/// L2 settlement blocks are NEUTRAL under the gate. A settlement pays no fee
+/// and takes its whole block, so before the gate it reads as a full block
+/// (+12.5%, review EXE-5) and counted as plain free usage it would read as an
+/// empty one (-12.5%), which would let whoever settles push the price down.
+/// The block commits exactly the gas target and no bytes instead: the next
+/// base fee equals the settlement block's own.
+///
+/// It changes a committed leaf and the next block's base fee, so arming needs
+/// a historical replay, mixed-fleet qualification and a coordinated epoch.
+/// `l1s02_fee_gates_are_inert` pins the inert value.
+pub const FEE_CONTROLLER_PAID_USAGE_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+pub(crate) fn fee_controller_paid_usage_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if fee_controller_paid_usage_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, FEE_CONTROLLER_PAID_USAGE_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod fee_controller_paid_usage_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
+/// AUDIT-L1L2-20261123 L1S-02: at most one `WithdrawalCredentialRotation`
+/// per validator per epoch. `u64::MAX` means INERT.
+///
+/// The rotation pays no fee and its only replay protection is "the new
+/// credential differs from the current one" inside the signed epoch, so a
+/// holder of two keys can rotate A -> B -> A without limit: an unlimited
+/// supply of valid zero-fee transactions of 2.5M gas each. Once armed, an
+/// accepted rotation records its epoch for the validator
+/// (`CommittedState::credential_rotation_epochs`) and a further rotation of
+/// the same validator in the same epoch is refused
+/// (`PqMigrationReject::AlreadyRotated`). The record is committed state
+/// exactly like the commission-update record (DET-3): one leaf per validator
+/// under the validator component with a key no validator index can produce,
+/// emptied at every epoch boundary, and one optional local-cache section.
+/// Below the gate nothing is recorded, so every state root and every cache
+/// keeps its bytes.
+///
+/// It changes which transactions are valid and it changes committed state,
+/// so arming needs a historical replay, mixed-fleet qualification and a
+/// coordinated epoch. It cannot precede the rotation itself.
+pub const CREDENTIAL_ROTATION_LIMIT_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    CREDENTIAL_ROTATION_LIMIT_ACTIVATION_EPOCH,
+    HF3_PQ_MIGRATION_EPOCH
+));
+
+pub(crate) fn credential_rotation_limit_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if credential_rotation_limit_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, CREDENTIAL_ROTATION_LIMIT_ACTIVATION_EPOCH)
+}
+
+#[cfg(test)]
+pub(crate) mod credential_rotation_limit_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
+    }
+}
+
 /// MAX is always an unarmed sentinel, including on synthetic boundary inputs.
 pub const fn epoch_gate_active(epoch: u64, activation: u64) -> bool {
     activation != u64::MAX && epoch >= activation
@@ -4233,6 +4618,95 @@ pub(crate) mod kes_register_binding_rehearsal {
             fn drop(&mut self) { ACTIVATION.with(|c| c.set(self.0)); }
         }
         Restore(ACTIVATION.with(|c| c.replace(Some(activation))))
+    }
+}
+
+/// AUDIT-L1L2-20261123 L1C-61: one static-key CORRECTION of a registered KES
+/// tree while KES is not bound. `u64::MAX` means INERT.
+///
+/// Registration (wire 0x17) is once-only. A validator whose registered tree
+/// is not the one its node holds (a `validator.kes` restored from an older
+/// backup, a data directory copied from another unit, an abandoned
+/// registration that somebody else broadcast later) signs with its static
+/// key until the bind and cannot sign at all from it on; the static key may
+/// replace the tree only after it EXPIRES (the rescue rule), which for the
+/// default depth is about eleven years. The only way out is exit and
+/// re-join. That stake is nevertheless part of the 90 % that fires the bind.
+///
+/// Once armed, a `KesRegister` for a validator that already has a tree is
+/// admitted as a correction when ALL of these hold:
+///
+/// * KES is not bound and the bind is not yet decided
+///   (`kes_enforced_from` is unset): no KES leaf has been required of anyone,
+///   so the replaced tree has never signed anything consensus accepts;
+/// * the registered tree is the validator's first and uncorrected one
+///   (start period 0, no successor, no history) and the chain is at global
+///   period [`KES_CORRECTED_START_PERIOD`] or later. The corrected tree
+///   starts at [`KES_CORRECTED_START_PERIOD`], which is also what marks it:
+///   a tree with that start is never corrected again, so the correction is
+///   ONCE per validator without a new state field (the transaction is free,
+///   so an unbounded rule would be free block space);
+/// * the new tree differs from the registered one and covers the current
+///   period;
+/// * the static key signed `kes::correct_signing_root`: its own domain tag,
+///   the inclusion epoch (valid in that epoch only, like `ExitV2`) and the
+///   tree being replaced, so a correction can be neither replayed later nor
+///   taken for a first registration, and an old first registration can never
+///   be replayed as a correction.
+///
+/// The corrected entry holds the new tree alone; the wire encoding does not
+/// change. After the bind decision nothing changes: once-only, rescue after
+/// expiry, renewal by `KesRotate`.
+///
+/// What it costs: before the bind a static key was already the whole
+/// identity, so a stolen static key gains only this: it can spend the one
+/// correction, after which the owner is where a wrong registration leaves
+/// them today (exit and re-join). Alternatives the owner can choose instead
+/// are listed in the audit finding (keep once-only and rely on the node's
+/// mismatch warnings; allow corrections without a count; a post-bind rescue
+/// for a tree that never signed).
+///
+/// A hard fork (it changes which 0x17 transactions are valid): arming needs
+/// a historical replay, mixed-fleet qualification and a coordinated FUTURE
+/// epoch; arm it before the registrations that would fire the bind, or it
+/// protects nobody. `hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY` carries
+/// the guard; `the_kes_prebind_correction_gate_is_inert` pins the value.
+pub const KES_PREBIND_CORRECTION_ACTIVATION_EPOCH: u64 = u64::MAX;
+
+const _: () = assert!(gate_is_inert_or_not_before(
+    KES_PREBIND_CORRECTION_ACTIVATION_EPOCH,
+    KES_REGISTRATION_EPOCH
+));
+
+/// Start period of a corrected KES tree
+/// ([`KES_PREBIND_CORRECTION_ACTIVATION_EPOCH`]). A first registration before
+/// the bind starts at period 0, so this value also records that the one
+/// correction has been used.
+pub const KES_CORRECTED_START_PERIOD: u64 = 1;
+
+/// Is the pre-bind KES correction rule in force at `epoch`
+/// ([`KES_PREBIND_CORRECTION_ACTIVATION_EPOCH`])? A pure function of the
+/// epoch and the build.
+pub fn kes_prebind_correction_active(epoch: u64) -> bool {
+    #[cfg(test)]
+    if kes_prebind_correction_rehearsal::enabled() {
+        return true;
+    }
+    epoch_gate_active(epoch, KES_PREBIND_CORRECTION_ACTIVATION_EPOCH)
+}
+
+/// Thread-local rehearsal switch for
+/// [`KES_PREBIND_CORRECTION_ACTIVATION_EPOCH`]. `cfg(test)` only.
+#[cfg(test)]
+pub(crate) mod kes_prebind_correction_rehearsal {
+    use std::cell::Cell;
+    thread_local! { static ENABLED: Cell<bool> = const { Cell::new(false) }; }
+    pub fn enabled() -> bool { ENABLED.with(Cell::get) }
+    /// Open the rule on this thread until the guard drops (also on unwind).
+    pub fn open() -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore { fn drop(&mut self) { ENABLED.with(|v| v.set(self.0)); } }
+        Restore(ENABLED.with(|v| v.replace(true)))
     }
 }
 

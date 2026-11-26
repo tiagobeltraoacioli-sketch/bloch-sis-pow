@@ -58,7 +58,7 @@ pub(super) fn settlement(node: &Engine, proof: [u8; 356]) -> Transaction {
     }
     statement[S + 432..S + 440].copy_from_slice(&source.slot.to_be_bytes());
     statement[S + 440..S + 448].copy_from_slice(&source.height.to_be_bytes());
-    Transaction { proof_policy: l2.policy().proof_policy, statement, proof }
+    Transaction { proof_policy: l2.policy().proof_policy, statement, proof, authorization: None }
 }
 
 pub(super) fn wire(tx: Transaction) -> PosTransaction {

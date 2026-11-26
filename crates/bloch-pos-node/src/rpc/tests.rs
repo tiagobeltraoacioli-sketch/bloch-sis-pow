@@ -2584,112 +2584,6 @@ fn rpc2_trusted_proxy_connections_are_limited_per_forwarded_client() {
     drop(held);
 }
 
-/// `getl2settlement.forced` (candidate): the queue's fields, the due records
-/// and the next surcharge. The field is absent while the gate is inert, so
-/// `l2_settlement_json` keeps its exact keys on every network today.
-#[test]
-fn l2_forced_json_reports_the_queue_and_the_next_surcharge() {
-    use bloch_pos_committee::l2_settlement::forced;
-    let queue = forced::Queue::default();
-    let Json::Obj(fields) = l2_forced_json(&queue) else { panic!("not an object") };
-    let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
-    assert_eq!(
-        keys,
-        [
-            "queued", "consumed", "pending", "pending_weight", "max_pending_weight", "root", "due", "due_hash",
-            "next_surcharge_sat", "transfer_surcharge_sat", "max_gas_surcharge_sat", "drain_settlements", "treasury",
-        ]
-    );
-    let get = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
-    assert_eq!(get("due"), Json::Arr(vec![]));
-    assert_eq!(get("due_hash"), Json::hex(&forced::hash(&[])));
-    assert_eq!(get("next_surcharge_sat"), Json::sat(1_000));
-    assert_eq!(get("transfer_surcharge_sat"), Json::sat(1_000));
-    assert_eq!(get("max_gas_surcharge_sat"), Json::sat(14_000));
-    assert_eq!(get("drain_settlements"), Json::u(0));
-    // The treasury is compiled (owner input of 2026-11-16); the gate is still inert.
-    let treasury = bloch_pos_committee::l2_settlement::mainnet::FORCED_INCLUSION_TREASURY.expect("named");
-    assert_eq!(get("treasury"), Json::hex(&treasury));
-    assert_eq!(bloch_pos_committee::params::L2_FORCED_INCLUSION_EPOCH, u64::MAX);
-}
-
-/// Each due record carries its L2 envelope, read from its L1 block, in the
-/// exact shape producers and settlers consume; bytes that do not hash to the
-/// record, or an unreadable block, give `null`.
-#[test]
-fn l2_forced_due_records_carry_their_envelope() {
-    use bloch_pos_committee::l2_settlement::forced;
-    use sha3::{Digest, Keccak256};
-    let envelope = vec![0x02, 0xf8, 0x6c, 0x01];
-    let record = forced::Record {
-        height: 9,
-        l1_txid: [0x1c; 32],
-        envelope_hash: Keccak256::digest(&envelope).into(),
-        gas_limit: 21_000,
-    };
-    let lookup = |height: u64, txid: &[u8; 32]| (height == 9 && *txid == [0x1c; 32]).then(|| envelope.clone());
-    let json = l2_forced_record_json(&record, &lookup);
-    let Json::Obj(fields) = &json else { panic!("not an object") };
-    let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
-    assert_eq!(keys, ["height", "l1_txid", "envelope_hash", "gas_limit", "envelope"]);
-    let get = |k: &str| fields.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
-    assert_eq!(get("height"), Json::u(9));
-    assert_eq!(get("envelope"), Json::s("02f86c01".to_string()));
-    // Not found, or bytes of another envelope: null.
-    let missing = l2_forced_record_json(&record, &|_, _| None);
-    let wrong = l2_forced_record_json(&record, &|_, _| Some(vec![0x02]));
-    for json in [missing, wrong] {
-        let Json::Obj(fields) = json else { panic!("not an object") };
-        assert_eq!(fields.iter().find(|(n, _)| n == "envelope").map(|(_, v)| v.clone()), Some(Json::Null));
-    }
-}
-
-/// `getl2settlement.head_resets` (review R308-2P-3, R308-2P-4): a compiled
-/// head reset that would not apply says so, with the reason and the leaf
-/// indices behind it, and the node's line at the gate tells a refused reset
-/// from an applied one.
-#[test]
-fn head_reset_json_and_log_line_name_a_refused_reset() {
-    use bloch_pos_committee::l2_settlement::{HeadResetRefusal, HeadResetReport};
-    let field = |json: &Json, key: &str| json.get(key).cloned().unwrap_or_else(|| panic!("no {key}"));
-    let refused = HeadResetReport {
-        gate: HeadResetReport::NEXT_PROGRAM,
-        number: 41,
-        forfeit: false,
-        pending: true,
-        refusal: Some(HeadResetRefusal::PaidBeyondTarget { at_or_above_count: false, against_tail: vec![7, 9] }),
-    };
-    let json = head_reset_json(&refused);
-    let Json::Obj(fields) = &json else { panic!("not an object") };
-    let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
-    assert_eq!(keys, ["gate", "number", "forfeit", "pending", "would_apply", "refusal",
-        "claimed_at_or_above_target_count", "paid_against_tail_count", "paid_against_tail"]);
-    assert_eq!(field(&json, "gate"), Json::s("next_program"));
-    assert_eq!(field(&json, "number"), Json::u(41));
-    assert_eq!(field(&json, "pending"), Json::Bool(true));
-    assert_eq!(field(&json, "would_apply"), Json::Bool(false));
-    assert_eq!(field(&json, "refusal"), Json::s("paid_beyond_target"));
-    assert_eq!(field(&json, "paid_against_tail_count"), Json::u(2));
-    assert_eq!(field(&json, "paid_against_tail"), Json::Arr(vec![Json::u(7), Json::u(9)]));
-    let line = head_reset_log_line(&refused, 1_234);
-    assert!(line.starts_with("CRITICAL: L2 head reset REFUSED at slot 1234"), "{line}");
-    assert!(line.contains("did NOT move back to L2 block 41 (plain form)") && line.contains("reason: paid_beyond_target"), "{line}");
-    assert!(line.contains("leaves paid against the tail: 2 (first indices [7, 9])"), "{line}");
-
-    // Applied: no refusal, no alarm.
-    let applied = HeadResetReport { gate: HeadResetReport::ROLLBACK, number: 41, forfeit: true, pending: false, refusal: None };
-    let json = head_reset_json(&applied);
-    assert_eq!(field(&json, "would_apply"), Json::Bool(true));
-    assert_eq!(field(&json, "refusal"), Json::Null);
-    assert_eq!(field(&json, "paid_against_tail"), Json::Arr(Vec::new()));
-    let line = head_reset_log_line(&applied, 9);
-    assert!(line.starts_with("L2 head reset APPLIED at slot 9 with the rollback program change") && !line.contains("CRITICAL"), "{line}");
-    // Another reason carries no leaf detail.
-    let other = HeadResetReport { refusal: Some(HeadResetRefusal::ForcedLog), ..refused };
-    assert_eq!(field(&head_reset_json(&other), "refusal"), Json::s("forced_log"));
-    assert!(head_reset_log_line(&other, 1).ends_with("reason: forced_log"));
-}
-
 /// Review RC-05: `getsecuritystatus` is answered only to a DIRECT loopback
 /// caller. A request carrying any forwarding header, or arriving from a
 /// declared trusted proxy, is refused with the plain "method not found" even
@@ -2712,15 +2606,15 @@ fn a_status_request_through_any_proxy_is_refused() {
     let not_found = envelope(Json::Num("1".into()), Err(RpcError::method_not_found("getsecuritystatus")));
     let local = test_sentinel(Config { status: true, ..Default::default() });
     with_test_sentinel(local, || {
-        let direct = handle_body_from(body, &backend, Some((loopback, &|| false, false)));
+        let direct = handle_body_from(body, &backend, Some((loopback, &|| false, false)), false);
         assert!(direct.contains("\"result\""), "a direct loopback caller is answered: {direct}");
-        let relayed = handle_body_from(body, &backend, Some((loopback, &|| false, true)));
+        let relayed = handle_body_from(body, &backend, Some((loopback, &|| false, true)), false);
         assert_eq!(relayed, not_found, "a relayed loopback caller is not");
         assert_eq!(security_status_for_relayed(), Err(RpcError::method_not_found("getsecuritystatus")));
     });
     let remote = test_sentinel(Config { status: true, allow_remote_status: true, ..Default::default() });
     with_test_sentinel(remote, || {
-        let relayed = handle_body_from(body, &backend, Some((loopback, &|| false, true)));
+        let relayed = handle_body_from(body, &backend, Some((loopback, &|| false, true)), false);
         assert!(relayed.contains("\"result\""), "the operator opted in: {relayed}");
     });
     // Sentinel off: the same answer as a node that never had it.
@@ -2749,7 +2643,7 @@ fn the_request_head_reports_forwarding_headers() {
         let hosts = HostPolicy::with_extra("127.0.0.1", None);
         let mut seen = None;
         let deadline = Instant::now() + Duration::from_secs(5);
-        let out = read_request_attributed(&mut sock, &hosts, deadline, &mut |_, relayed| {
+        let out = read_request_attributed(&mut sock, &hosts, deadline, &mut |_, relayed, _| {
             seen = Some(relayed);
             Ok(())
         });
@@ -2761,4 +2655,234 @@ fn the_request_head_reports_forwarding_headers() {
     assert!(read("Via: 1.1 proxy\r\n"));
     assert!(read("Forwarded: for=127.0.0.1\r\n"));
     assert!(read("X-Forwarded-For: 127.0.0.1\r\n"));
+}
+
+/// Audit L2N-01: `getl2settlement.program` names the program set in force
+/// and the pinned switch. On the mainnet L2 as installed today: the deployed
+/// program ("initial"), the lifetime deposit cap, and a switch that is
+/// pinned but neither armed nor final. The "switched" side of the report is
+/// covered where the switch can be taken, in the consensus crate's tests
+/// (`State::program_switched`, `State::supply_cap`).
+#[test]
+fn getl2settlement_reports_the_program_set_in_force() {
+    use bloch_pos_committee::l2_settlement::{mainnet, State};
+    let l2 = State::activated(mainnet::activation().expect("the mainnet activation is pinned")).unwrap();
+    let json = l2_program_json(&l2);
+    let text = |json: &Json, key: &str| json.get(key).and_then(Json::as_str).map(str::to_owned);
+    let program = mainnet::PROGRAM.unwrap();
+    assert_eq!(text(&json, "set").as_deref(), Some("initial"));
+    assert_eq!(text(&json, "configuration"), Some(crate::codec::hex32(&program.identities[3])));
+    assert_eq!(text(&json, "elf"), Some(crate::codec::hex32(&program.identities[4])));
+    assert_eq!(text(&json, "vkey_koalabear"), Some(crate::codec::hex32(&program.identities[5])));
+    assert_eq!(text(&json, "vkey_bn254"), Some(crate::codec::hex32(&program.identities[6])));
+    assert_eq!(text(&json, "proof_policy"), Some(crate::codec::hex32(&program.proof_policy)));
+    assert_eq!(text(&json, "supply_cap").as_deref(), Some("gross-minted"));
+    let switch = json.get("switch").expect("the mainnet L2 has a pinned switch");
+    assert_eq!(switch.get("activation_epoch"), Some(&Json::Null), "the gate is inert");
+    assert_eq!(switch.get("taken"), Some(&Json::Bool(false)));
+    assert_eq!(switch.get("final"), Some(&Json::Bool(false)), "candidate identities, not release values");
+    let to = switch.get("to").unwrap();
+    let pinned = mainnet::PROGRAM_SWITCH.unwrap();
+    assert_eq!(text(to, "vkey_bn254"), Some(crate::codec::hex32(&pinned.to[3])));
+    assert_eq!(text(to, "configuration"), Some(crate::codec::hex32(&pinned.to[0])));
+    assert_eq!(text(to, "supply_cap").as_deref(), Some("outstanding"));
+}
+
+/// Audit L2N-01 (stop-gap): `getl2settlement.settler` reports the settler
+/// set registered on the L2. On the mainnet L2 as installed today no set is
+/// registered and the gate is inert; with a set, the report carries the hash
+/// a rotation signs and the keys in signer order, and it follows the state
+/// it is given (a rotated set reports the new hash).
+#[test]
+fn getl2settlement_reports_the_registered_settler_set() {
+    use bloch_pos_committee::l2_settlement::{mainnet, settler, State};
+    use bloch_pos_committee::transition::funded::ADMISSION_PQ_KEY_BYTES;
+    use sha3::{Digest, Sha3_256};
+
+    // Mainnet as installed: no set, inert gate, and the field is present in
+    // the full report.
+    let l2 = State::activated(mainnet::activation().expect("the mainnet activation is pinned")).unwrap();
+    assert!(l2.settlers().is_empty(), "no settler set is installed by this build");
+    let none = l2_settler_json(l2.settlers());
+    assert_eq!(none.get("activation_epoch"), Some(&Json::Null), "the gate is inert");
+    assert_eq!(none.get("registered"), Some(&Json::Bool(false)));
+    assert_eq!(none.get("set_hash"), Some(&Json::Null));
+    assert_eq!(none.get("max_keys").and_then(Json::as_u64), Some(settler::MAX_KEYS as u64));
+    assert!(matches!(none.get("keys"), Some(Json::Arr(keys)) if keys.is_empty()));
+
+    // A registered set of two keys, in signer order.
+    let key = |tag: u8| vec![tag; ADMISSION_PQ_KEY_BYTES];
+    let set = vec![key(7), key(9)];
+    assert!(settler::valid_set(&set));
+    let json = l2_settler_json(&set);
+    let text = |json: &Json, key: &str| json.get(key).and_then(Json::as_str).map(str::to_owned);
+    assert_eq!(json.get("registered"), Some(&Json::Bool(true)));
+    assert_eq!(text(&json, "set_hash"), Some(crate::codec::hex32(&settler::set_hash(&set))));
+    let Some(Json::Arr(keys)) = json.get("keys") else { panic!("keys is an array") };
+    assert_eq!(keys.len(), 2);
+    for (i, entry) in keys.iter().enumerate() {
+        assert_eq!(entry.get("index").and_then(Json::as_u64), Some(i as u64));
+        assert_eq!(text(entry, "key"), Some(crate::codec::hex(&set[i])));
+        assert_eq!(text(entry, "sha3"), Some(crate::codec::hex32(&Sha3_256::digest(&set[i]).into())));
+    }
+    // What the report prints is a set file `bloch-pos l2-settler` accepts:
+    // the keys, one per line, parse back to the same set and the same hash.
+    let file: String = keys.iter().map(|entry| text(entry, "key").unwrap() + "\n").collect();
+    assert_eq!(mainnet::settler_keys(&file), Some(set.clone()));
+
+    // Order is part of the set, and a rotation is a different report.
+    let rotated = vec![key(9), key(7)];
+    let after = l2_settler_json(&rotated);
+    assert_ne!(text(&after, "set_hash"), text(&json, "set_hash"));
+    assert_eq!(text(&after, "set_hash"), Some(crate::codec::hex32(&settler::set_hash(&rotated))));
+}
+
+// ─── Access policy: read-only, API key, rate limit ─────────────────────────
+
+fn keyed_post(method: &str, key_lines: &[&str]) -> String {
+    let body = request(method, "[]");
+    let keys: String = key_lines.iter().map(|k| format!("X-API-Key: {k}\r\n")).collect();
+    format!(
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         {keys}Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+const TEST_API_KEY: &str = "0123456789abcdef0123456789abcdef";
+
+fn access_with(read_only: bool, key: Option<&str>, rate: Option<u32>) -> Access {
+    Access {
+        read_only,
+        api_key: key.map(Access::key_digest),
+        rate: rate.map(RateLimit::new),
+    }
+}
+
+/// The default policy is no policy: a request with no key, and one carrying a
+/// stray key, are both served, and a write is routed as before.
+#[test]
+fn access_default_changes_nothing() {
+    let spy = Spy::new();
+    let addr = serve_with("127.0.0.1", 0, spy.clone(), TrustedProxies::default(), Access::default()).unwrap();
+    assert!(http(addr, &keyed_post("getchaininfo", &[])).starts_with("HTTP/1.1 200 OK"));
+    assert!(http(addr, &keyed_post("getchaininfo", &["whatever"])).starts_with("HTTP/1.1 200 OK"));
+    assert!(Access::default().summary().is_empty());
+    let reply = post(addr, &request("sendrawtransaction", r#"["00"]"#));
+    assert!(!reply.contains(&WRITES_DISABLED.to_string()), "{reply}");
+}
+
+/// Read-only refuses the write by name, before decoding it, with its own
+/// code; reads are untouched and nothing reaches the backend for the write.
+#[test]
+fn access_read_only_refuses_sendrawtransaction_only() {
+    let spy = Spy::new();
+    let addr = serve_with(
+        "127.0.0.1", 0, spy.clone(), TrustedProxies::default(), access_with(true, None, None),
+    ).unwrap();
+    for params in [r#"["00"]"#, r#"["not hex at all"]"#, "[]"] {
+        let reply = post(addr, &request("sendrawtransaction", params));
+        assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+        let body = reply.split_once("\r\n\r\n").expect("a body").1;
+        assert_eq!(error_code(&parse_json(body).unwrap()), Some(WRITES_DISABLED), "{reply}");
+    }
+    let reply = post(addr, &request("getchaininfo", "[]"));
+    assert!(reply.starts_with("HTTP/1.1 200 OK") && !reply.contains("\"error\""), "{reply}");
+    // The in-process dispatcher has no listener policy and is unchanged.
+    let direct = call(spy.as_ref(), &request("sendrawtransaction", r#"["00"]"#));
+    assert_ne!(error_code(&direct), Some(WRITES_DISABLED));
+}
+
+/// With a key configured: absent, wrong, prefix, extended and duplicated keys
+/// are all 401/400 and never reach the backend; the exact key is served.
+#[test]
+fn access_api_key_is_required_and_exact() {
+    let gate = Gate::new();
+    gate.release();
+    let addr = serve_with(
+        "127.0.0.1", 0, gate.clone(), TrustedProxies::default(), access_with(false, Some(TEST_API_KEY), None),
+    ).unwrap();
+    let longer = format!("{TEST_API_KEY}0");
+    for wrong in [&[][..], &[""], &["wrong"], &[&TEST_API_KEY[..31]], &[longer.as_str()], &[&TEST_API_KEY.to_uppercase()]] {
+        let reply = http(addr, &keyed_post("getchaininfo", wrong));
+        assert!(reply.starts_with("HTTP/1.1 401 Unauthorized\r\n"), "{wrong:?}: {reply}");
+    }
+    let reply = http(addr, &keyed_post("getchaininfo", &[TEST_API_KEY, TEST_API_KEY]));
+    assert!(reply.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{reply}");
+    assert_eq!(gate.last_source(), None, "a refused request reached the backend");
+
+    let reply = http(addr, &keyed_post("getchaininfo", &[TEST_API_KEY]));
+    assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+    assert!(gate.last_source().is_some());
+}
+
+#[test]
+fn access_api_key_file_contents_are_bounded() {
+    assert_eq!(Access::parse_api_key(&format!("  {TEST_API_KEY}\n")), Ok(TEST_API_KEY));
+    assert!(Access::parse_api_key("").is_err());
+    assert!(Access::parse_api_key("short-key").is_err());
+    assert!(Access::parse_api_key(&"k".repeat(API_KEY_MAX_LEN + 1)).is_err());
+    assert!(Access::parse_api_key("0123456789abcdef 0123456789abcdef").is_err());
+    assert!(Access::parse_api_key("0123456789abcdef\u{e9}0123456789abcdef").is_err());
+    for bad in ["", "0", "-1", "1.5", "10001", "ten"] {
+        assert!(Access::parse_rate(bad).is_err(), "{bad}");
+    }
+    assert_eq!(Access::parse_rate("1"), Ok(1));
+    assert_eq!(Access::parse_rate("10000"), Ok(10_000));
+}
+
+/// The bucket: a burst of 2n, then n per second, per source; an IPv6 /64 is
+/// one source; a full table refuses a new source instead of waving it through.
+#[test]
+fn access_rate_limit_bucket_arithmetic() {
+    let limit = RateLimit::new(5);
+    let start = Instant::now();
+    let a: IpAddr = "192.0.2.1".parse().unwrap();
+    let b: IpAddr = "192.0.2.2".parse().unwrap();
+    for i in 0..10 {
+        assert!(limit.take(a, start), "burst request {i}");
+    }
+    assert!(!limit.take(a, start), "the 11th request in the same instant");
+    assert!(limit.take(b, start), "another source has its own bucket");
+    // 200 ms at 5/s is exactly one request.
+    let later = start + Duration::from_millis(200);
+    assert!(limit.take(a, later));
+    assert!(!limit.take(a, later));
+    // A long idle period refills to the burst and no further.
+    let much_later = start + Duration::from_secs(3_600);
+    for _ in 0..10 {
+        assert!(limit.take(a, much_later));
+    }
+    assert!(!limit.take(a, much_later));
+
+    let v6a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+    let v6b: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+    let one = RateLimit::new(1);
+    assert!(one.take(v6a, start) && one.take(v6b, start));
+    assert!(!one.take(v6a, start), "the same /64 shares one bucket");
+
+    let full = RateLimit::new(1);
+    for i in 0..RATE_TABLE_MAX {
+        let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000u32 + i as u32));
+        assert!(full.take(ip, start));
+    }
+    let newcomer: IpAddr = "198.51.100.77".parse().unwrap();
+    assert!(!full.take(newcomer, start), "a full table of active sources admits no new one");
+    assert!(full.take(newcomer, start + Duration::from_secs(10)), "refilled sources are forgotten");
+}
+
+/// End to end: past the burst the listener answers 429, and a wrong key is
+/// metered too (the rate is charged before the key is judged).
+#[test]
+fn access_rate_limit_answers_429() {
+    let spy = Spy::new();
+    let addr = serve_with(
+        "127.0.0.1", 0, spy.clone(), TrustedProxies::default(), access_with(false, Some(TEST_API_KEY), Some(1)),
+    ).unwrap();
+    let first = http(addr, &keyed_post("getchaininfo", &["wrong"]));
+    assert!(first.starts_with("HTTP/1.1 401 Unauthorized\r\n"), "{first}");
+    let second = http(addr, &keyed_post("getchaininfo", &[TEST_API_KEY]));
+    assert!(second.starts_with("HTTP/1.1 200 OK"), "{second}");
+    let third = http(addr, &keyed_post("getchaininfo", &[TEST_API_KEY]));
+    assert!(third.starts_with("HTTP/1.1 429 Too Many Requests\r\n"), "{third}");
 }

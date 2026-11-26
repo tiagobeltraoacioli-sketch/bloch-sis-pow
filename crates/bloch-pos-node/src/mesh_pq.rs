@@ -571,6 +571,38 @@ impl MeshSecurity {
         out
     }
 
+    /// What an operator must be told when the mesh listens on `listen_addr`
+    /// in a mode that does not authenticate (review B1/P2). `plain` and
+    /// `offer` are legitimate on loopback and during a migration; on a
+    /// routable bind they are an open door, and until now the node said
+    /// nothing about it. A warning, never a refusal: the fleet's unit files
+    /// were written against these defaults.
+    pub fn exposure_warning(&self, listen_addr: &str) -> Option<String> {
+        let loopback = listen_addr.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+        if loopback {
+            return None;
+        }
+        match (&self.identity, self.mode) {
+            (_, Mode::Require) => None,
+            (Some(_), Mode::Offer) => Some(format!(
+                "THE MESH ON {listen_addr} IS NOT LOOPBACK AND `--mesh-security offer` GUARANTEES \
+                 NOTHING AGAINST AN ACTIVE ATTACKER: a peer that does not offer the handshake is \
+                 served in plain, so anyone on the path can force plain and read or inject \
+                 frames. Blocks and votes stay signature-checked; delivery, privacy and peer \
+                 identity do not. Move to `--mesh-security require` with pinned peers or \
+                 --mesh-allow (docs/operations/MESH-SECURITY-REQUIRE-MIGRATION.md)."
+            )),
+            _ => Some(format!(
+                "THE MESH ON {listen_addr} IS NOT LOOPBACK AND IS PLAIN: no authentication and \
+                 no encryption. Anything that can reach the port is a peer: it can read every \
+                 block, vote and transaction, inject frames up to the per-source budgets, and \
+                 hold inbound slots. Firewall the port to the fleet, or move to \
+                 `--mesh-security offer` and then `require` \
+                 (docs/operations/MESH-SECURITY-REQUIRE-MIGRATION.md)."
+            )),
+        }
+    }
+
     pub fn mode(&self) -> Mode {
         self.mode
     }
@@ -912,8 +944,11 @@ impl Opener {
         if exact_plain.is_some_and(|plain| len != plain + TAG_LEN) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "mesh: bad authentication record length"));
         }
-        let mut buf = vec![0u8; len];
-        crate::net::read_exact_until(sock, &mut buf, deadline)?;
+        // Audit L1N-04: grown as the bytes arrive, not allocated from the
+        // announced length (`net::AnnouncedFrame`). The authentication
+        // record above is exact and small; every other record may announce
+        // up to the general bound before anything about it is authentic.
+        let mut buf = crate::net::read_announced_until(sock, len, deadline)?;
         if self.counter == u64::MAX {
             return Err(io::Error::other("mesh: receive counter exhausted"));
         }
@@ -1185,6 +1220,32 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::Arc;
 
+    /// B1/P2: `plain` and `offer` on a routable bind are said out loud;
+    /// loopback and `require` are not, and `warnings()` is unchanged.
+    #[test]
+    fn exposure_warning_names_plain_and_offer_on_a_routable_bind() {
+        let plain = MeshSecurity::plain();
+        for loopback in ["127.0.0.1", "127.8.8.8", "::1"] {
+            assert_eq!(plain.exposure_warning(loopback), None, "{loopback}");
+        }
+        for routable in ["0.0.0.0", "::", "10.8.0.4", "203.0.113.7", "not-an-ip"] {
+            let warning = plain.exposure_warning(routable).expect(routable);
+            assert!(warning.contains("PLAIN") && warning.contains(routable), "{warning}");
+        }
+        assert!(plain.warnings().is_empty());
+
+        let dir = std::env::temp_dir().join(format!("mesh-exposure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let offer = MeshSecurity::load(Mode::Offer, [7u8; 32], &dir, None, &[], &[], false).unwrap();
+        assert_eq!(offer.exposure_warning("127.0.0.1"), None);
+        let warning = offer.exposure_warning("0.0.0.0").expect("offer on a routable bind");
+        assert!(warning.contains("offer") && warning.contains("force plain"), "{warning}");
+        let require = MeshSecurity::load(Mode::Require, [7u8; 32], &dir, None, &[], &[], false).unwrap();
+        assert_eq!(require.exposure_warning("0.0.0.0"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     const NET: [u8; 32] = [7; 32];
 
     fn pair(
@@ -1234,6 +1295,34 @@ mod tests {
         ss.write_record(&mut ssock, &[b"\x01block2"]).unwrap();
         assert_eq!(co.read_record(&mut csock, far()).unwrap(), b"\x01block");
         assert_eq!(co.read_record(&mut csock, far()).unwrap(), b"\x01block2");
+    }
+
+    /// Audit L1N-04: a sealed record larger than one read step is opened
+    /// unchanged by the reader that grows its buffer as the bytes arrive.
+    #[test]
+    fn a_sealed_record_spanning_read_steps_is_opened_unchanged() {
+        let a = Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, None));
+        let b = Arc::new(MeshSecurity::ephemeral(Mode::Require, NET, None));
+        let (cli, srv) = pair(a, b);
+        let (Session::Sealed { sealer: mut cs, .. }, mut csock) = cli.unwrap() else { panic!("client not sealed") };
+        let (Session::Sealed { opener: mut so, .. }, mut ssock) = srv.unwrap() else { panic!("server not sealed") };
+        let step = crate::net::FRAME_READ_STEP;
+        let frames: Vec<Vec<u8>> = [step - TAG_LEN, step - TAG_LEN + 1, 3 * step + 17]
+            .iter()
+            .map(|len| (0..*len).map(|i| (i.wrapping_mul(31) ^ (i >> 8)) as u8).collect())
+            .collect();
+        let sent = frames.clone();
+        let writer = std::thread::spawn(move || {
+            for frame in &sent {
+                cs.write_record(&mut csock, &[frame]).unwrap();
+            }
+            csock
+        });
+        for (n, frame) in frames.iter().enumerate() {
+            let read = so.read_record(&mut ssock, Instant::now() + Duration::from_secs(20)).unwrap();
+            assert!(read == *frame, "record {n} ({} bytes) differs", frame.len());
+        }
+        drop(writer.join().unwrap());
     }
 
     #[test]

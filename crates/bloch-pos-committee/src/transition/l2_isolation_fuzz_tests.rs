@@ -58,7 +58,6 @@ fn l2_family(tx: &PosTransaction) -> bool {
             | PosTransaction::L2Deposit(_)
             | PosTransaction::L2DataAvailability(_)
             | PosTransaction::L2WithdrawClaim(_)
-            | PosTransaction::L2ForcedTransaction(_)
     )
 }
 

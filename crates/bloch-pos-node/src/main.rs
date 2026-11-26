@@ -48,10 +48,9 @@ mod codec;
 mod connection_limit;
 mod devnet_tools;
 mod l2_da_cli;
-mod l2_brake;
+mod l2_settler_cli;
 mod l2_claim_cli;
 mod l2_deposit_cli;
-mod l2_forced_cli;
 mod engine;
 mod equivocation_watch;
 mod genesis;
@@ -375,27 +374,21 @@ fn main() {
                 exit(2);
             }
         }
-        Some("l2-forced") => {
-            if let Err(error) = l2_forced_cli::run(&args[1..]) {
-                eprintln!("l2-forced: {error}");
-                exit(2);
-            }
-        }
         Some("l2-da") => {
             if let Err(error) = l2_da_cli::run(&args[1..]) {
                 eprintln!("l2-da: {error}");
                 exit(2);
             }
         }
-        Some("kes") => {
-            if let Err(error) = kes_cli::run(&args[1..]) {
-                eprintln!("kes: {error}");
+        Some("l2-settler") => {
+            if let Err(error) = l2_settler_cli::run(&args[1..]) {
+                eprintln!("l2-settler: {error}");
                 exit(2);
             }
         }
-        Some("l2-brake") => {
-            if let Err(error) = l2_brake::run(&args[1..]) {
-                eprintln!("l2-brake: {error}");
+        Some("kes") => {
+            if let Err(error) = kes_cli::run(&args[1..]) {
+                eprintln!("kes: {error}");
                 exit(2);
             }
         }
@@ -741,15 +734,12 @@ fn print_help() {
                manifest commits to none and the flag is then refused.\n\
                          [--rpc-bind <ip>] [--rpc-port <n>|off]\n\
                          [--rpc-trusted-proxy <ip[,ip...]>]\n\
+                         [--rpc-read-only] [--rpc-api-key-file <path>]\n\
+                         [--rpc-rate-limit <requests-per-second>]\n\
                          [--metrics-bind <ip>] [--metrics-port <n>] [--allow-public-metrics]\n\
-                         [--l2-brake-key <pk file>]\n\
+                         [--metrics-token-file <path>]\n\
                Run a validator node. <dir> must hold validator.key; chain\n\
                data persists in <dir>; a compatible local state cache skips its replay prefix.\n\
-               \n\
-               Node-local L2 brake (`--l2-brake-key`, off by default; not consensus):\n\
-               a <dir>/l2-brake.json signed by that key (`bloch-pos l2-brake sign`)\n\
-               makes this node leave held L2 claims/settlements out of its blocks\n\
-               and refuse them at its mempool as retry-later. See `bloch-pos l2-brake`.\n\
                \n\
                JSON-RPC 2.0 over HTTP is served on --rpc-bind:--rpc-port,\n\
                default 127.0.0.1:16310 (`--rpc-port off` disables it). It\n\
@@ -765,6 +755,10 @@ fn print_help() {
                unauthenticated. A non-loopback bind is refused unless\n\
                --allow-public-metrics explicitly acknowledges the exposure;\n\
                that flag adds no authentication, so firewall it like RPC.\n\
+               --metrics-token-file <path> (24 to 256 printable characters\n\
+               in the file) makes both endpoints require\n\
+               `Authorization: Bearer <token>`, else 401; it is what a\n\
+               Prometheus bearer_token_file sends. Plain HTTP still.\n\
                Requests must carry a Host naming loopback, the bound\n\
                address (on 0.0.0.0/::, the IP the scraper connected to) or\n\
                a name in BLOCH_RPC_HOST_ALLOWLIST; others get 403.\n\
@@ -803,6 +797,17 @@ fn print_help() {
                entry that is not itself a listed proxy). Default: none, and\n\
                forwarded headers are ignored. List only addresses from\n\
                which nothing but your proxy can connect.\n\
+               \n\
+               Three opt-in restrictions, all off by default:\n\
+               --rpc-read-only refuses sendrawtransaction, so a node behind\n\
+               a public read gateway cannot be used to submit;\n\
+               --rpc-api-key-file <path> requires every request to carry\n\
+               the key in that file (24 to 256 printable characters) in an\n\
+               X-API-Key header, else 401; --rpc-rate-limit <n> allows n\n\
+               requests per second per source address (burst 2n), else\n\
+               429. None of them encrypts anything: the RPC is still plain\n\
+               HTTP, so send the key only over loopback or through a\n\
+               TLS-terminating proxy.\n\
                A node started with an EMPTY data dir syncs from genesis: it\n\
                downloads every block from peers and validates each one\n\
                itself. No datadir is ever donated. While the chain is\n\
@@ -1131,6 +1136,7 @@ const RUN_SWITCHES: &[&str] = &[
     "--acknowledge-missing-slashing-protection",
     "--replay-from-genesis",
     "--require-state-cache",
+    "--rpc-read-only",
     "--security-status",
     "--security-status-remote",
 ];
@@ -1797,15 +1803,14 @@ pub(crate) struct TransportPlan {
 /// nothing else — no clock, no filesystem, no environment, no `exit`, no
 /// print — so every posture and every refusal below is a unit test.
 ///
-/// # The default is Dual (flipped, deliberately)
+/// # The default is Devnet (and a flip to Dual was reverted)
 ///
-/// `None => Dual`. The earlier default was `Devnet`, kept there because a node
-/// that quietly came up on libp2p ALONE would find no peers and fork off. Dual
-/// removes that hazard while opening the network: it runs the devnet TCP mesh
-/// (so a node restarting with an unchanged unit file still finds the fleet) AND
-/// binds a libp2p swarm (so an unaffiliated third party can dial in). Explicit
-/// `--transport devnet` still selects devnet-only for anyone who wants it. This
-/// flip is a fleet-wide decision and was made deliberately, not as cleanup.
+/// `None => Devnet`: no `--transport` selects the devnet TCP mesh alone, the
+/// same as an explicit `--transport devnet`. A revision briefly mapped `None`
+/// to `Dual`; it was reverted (audit round 3, H-2; see the comment on the
+/// match arm below) because every rebuilt node then opened a libp2p listener
+/// nobody had asked for. Moving a node to `dual` or `libp2p` is an explicit
+/// flag in its unit file, never a compiled-in default.
 ///
 /// # What is new is that the decision is stated, and contradictions refuse
 ///
@@ -1904,6 +1909,18 @@ pub(crate) fn decide_transport(args: &[String]) -> Result<TransportPlan, String>
     }
 
     let mut warnings = Vec::new();
+    if runs_libp2p {
+        // Review P3: said once per boot, so nobody reads "encrypted" as
+        // "post-quantum". The libp2p handshake is Noise over X25519; the
+        // hybrid ML-KEM-768 + X25519 handshake is on the TCP mesh.
+        warnings.push(
+            "libp2p sessions are encrypted with Noise over X25519 only, which is NOT post-quantum: \
+             traffic recorded today can be decrypted by a future quantum adversary. Blocks and votes \
+             stay protected by their own hybrid signatures. The post-quantum transport is the TCP mesh \
+             with --mesh-security require (ML-KEM-768 + X25519, ML-DSA-65 identities)"
+                .to_string(),
+        );
+    }
     if !runs_libp2p {
         for f in ["--max-peers", "--behind-proxy"] {
             if present(f) {
@@ -2137,6 +2154,34 @@ fn run_cmd(args: &[String]) {
         }
     }
 
+    // The opt-in RPC restrictions. Same sugar-over-env shape as the trusted
+    // proxies above, and validated now for the same reason: a restriction the
+    // operator asked for and mistyped must stop the boot, not be dropped.
+    if run_switch(args, "--rpc-read-only") {
+        unsafe { std::env::set_var(rpc::RPC_READ_ONLY_ENV, "1") };
+    }
+    if let Some(path) = arg_value(args, "--rpc-api-key-file") {
+        unsafe { std::env::set_var(rpc::RPC_API_KEY_FILE_ENV, path) };
+    }
+    if let Some(value) = arg_value(args, "--rpc-rate-limit") {
+        if let Err(why) = rpc::Access::parse_rate(&value) {
+            eprintln!("run: --rpc-rate-limit: {why}");
+            exit(2);
+        }
+        unsafe { std::env::set_var(rpc::RPC_RATE_LIMIT_ENV, value) };
+    }
+    match rpc::Access::from_env() {
+        Ok(access) => {
+            for line in access.summary() {
+                println!("{line}");
+            }
+        }
+        Err(why) => {
+            eprintln!("run: RPC access settings: {why}");
+            exit(2);
+        }
+    }
+
     // Metrics/health (audit C-R6-2). OPT-IN: no flag, no listener, so an
     // unflagged fleet binary behaves byte-for-byte as before. Same refusal
     // rule as --rpc-port: a malformed port stops the boot rather than
@@ -2157,6 +2202,21 @@ fn run_cmd(args: &[String]) {
         eprintln!("run: {error}");
         exit(2);
     });
+    // Optional bearer token for /health and /metrics; same sugar-over-env
+    // shape as the RPC options, validated before anything binds.
+    if let Some(path) = arg_value(args, "--metrics-token-file") {
+        unsafe { std::env::set_var(metrics::METRICS_TOKEN_FILE_ENV, path) };
+    }
+    match metrics::bearer_token_from_env() {
+        Ok(Some(_)) if metrics_port.is_some() => {
+            println!("metrics: /health and /metrics require an Authorization: Bearer token");
+        }
+        Ok(_) => {}
+        Err(why) => {
+            eprintln!("run: --metrics-token-file: {why}");
+            exit(2);
+        }
+    }
 
     // `--peers host:port=<identity>` pins the mesh identity expected at that
     // address; the dialer gets the bare address and the pin travels with the
@@ -2244,8 +2304,6 @@ fn run_cmd(args: &[String]) {
         metrics_bind,
         metrics_port,
         mesh,
-        // Node-local L2 brake (not consensus): off unless a key is named.
-        l2_brake_key: arg_value(args, "--l2-brake-key").map(PathBuf::from),
     };
     if let Err(e) = engine::run(cfg) {
         eprintln!("bloch-pos: {e}");
@@ -2497,6 +2555,14 @@ mod transport_tests {
         let plan = decide_transport(&argv("--transport devnet --listen 16400 --max-peers 32 --behind-proxy")).unwrap();
         assert_eq!(plan.transport, engine::Transport::Devnet);
         assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
+        // P3: a plan that runs libp2p says its key exchange is classical; a
+        // devnet-only plan does not carry that line.
+        for transport in ["libp2p", "dual --listen 16400"] {
+            let plan = decide_transport(&argv(&format!("--transport {transport}"))).unwrap();
+            assert!(plan.warnings.iter().any(|w| w.contains("NOT post-quantum")), "{transport}: {:?}", plan.warnings);
+        }
+        let devnet = decide_transport(&argv("--transport devnet --listen 16400")).unwrap();
+        assert!(devnet.warnings.iter().all(|w| !w.contains("post-quantum")), "{:?}", devnet.warnings);
         assert!(plan.warnings.iter().any(|w| w.contains("--max-peers")));
         assert!(plan.warnings.iter().any(|w| w.contains("--behind-proxy")));
     }

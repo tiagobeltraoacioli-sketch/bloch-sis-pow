@@ -950,7 +950,6 @@ fn kind_of(tx: &PosTransaction) -> TxKind {
         PosTransaction::L2Deposit(_) => TxKind::L2Deposit,
         PosTransaction::L2DataAvailability(_) => TxKind::L2DataAvailability,
         PosTransaction::L2WithdrawClaim(_) => TxKind::L2WithdrawClaim,
-        PosTransaction::L2ForcedTransaction(_) => TxKind::L2ForcedTransaction,
         PosTransaction::Transfer { .. } => TxKind::Transfer,
         PosTransaction::TransferV2 { .. } => TxKind::TransferV2,
         PosTransaction::Deposit { .. } => TxKind::Deposit,
@@ -1024,14 +1023,6 @@ fn transfer_parts(tx: &PosTransaction) -> (Vec<OutPoint>, Vec<(u64, ScriptHash)>
                 outs, c.tx_bytes, c.tip_millisat_per_gas,
             )
         }
-        // L2 forced transaction (0x1C): spends its funding inputs; change,
-        // surcharge refund and treasury surcharge (vouts 0, 1, 2) depend on
-        // the forced-queue depth at inclusion, so they come from the replay
-        // receipt (`created_output_bound` = 3), never from a declaration.
-        PosTransaction::L2ForcedTransaction(f) => (
-            f.inputs.iter().map(|i| OutPoint { txid: i.txid, vout: i.vout }).collect(),
-            Vec::new(), f.tx_bytes, f.tip_millisat_per_gas,
-        ),
         // Post-quantum rescue reveal (0x1A): spends every output of the
         // revealed key (both script forms) and creates ONE output at vout 0
         // for `destination_script_hash` worth inputs minus fee. The value is
@@ -1085,8 +1076,6 @@ fn created_output_bound(tx: &PosTransaction) -> usize {
         // and change at vout 1 (claim).
         PosTransaction::L2Deposit(_) | PosTransaction::L2DataAvailability(_) => 1,
         PosTransaction::L2WithdrawClaim(_) => 2,
-        // Change, refund and treasury surcharge (l2_forced::{CHANGE,REFUND,TREASURY}_VOUT).
-        PosTransaction::L2ForcedTransaction(_) => 3,
         PosTransaction::RescueReveal(_) => 1,
         PosTransaction::WithdrawalCredentialRotation(_)
         | PosTransaction::RescueCommit(_)

@@ -58,6 +58,7 @@ fn golden() -> Transaction {
         proof_policy: [0xa5; 32],
         statement: golden_statement(),
         proof: std::array::from_fn(|i| (i * 7 + 3) as u8),
+        authorization: None,
     }
 }
 

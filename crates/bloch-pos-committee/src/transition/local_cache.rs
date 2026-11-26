@@ -13,13 +13,14 @@ const L2_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::L2;
 /// checkpoint roots (`params::HF1_CLAIM_FINALITY_EPOCH`).
 /// Written only when non-empty, so every earlier cache keeps its bytes.
 const L2_CHECKPOINT_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::L2_CHECKPOINTS;
-/// Marks the optional section after [L2CP] holding the L2 forced-inclusion
-/// queue (`params::L2_FORCED_INCLUSION_EPOCH`). Written only once enabled.
-const L2_FORCED_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::L2_FORCED;
-/// Marks the optional section after [L2FI] holding the leaves paid under the
-/// next L2 program (`l2_settlement::withdrawal::PaidLeaves`). Written only
-/// when non-empty, so every earlier cache keeps its bytes.
-const L2_PAID_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::L2_PAID;
+/// Marks the optional section after it holding the L2 settler set
+/// (`params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH`). Written only when
+/// a set is installed, so every earlier cache keeps its bytes.
+const L2_SETTLER_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::L2_SETTLERS;
+/// Marks the optional section after it holding the attested release lane's
+/// accounting (`params::L2_ATTESTED_RELEASE_LANE_ACTIVATION_EPOCH`). Written
+/// only once the lane has been used.
+const L2_ATTESTED_RELEASE_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::L2_ATTESTED_RELEASE;
 /// Marks the optional trailing post-quantum rescue-commitment section. Written
 /// only when the map is non-empty (never before the emergency gate).
 const PQ_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::PQ;
@@ -42,6 +43,10 @@ const KES_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::KES;
 /// when non-empty (never below the gate), so every earlier cache keeps its
 /// bytes.
 const COMMISSION_UPDATE_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::COMMISSION_UPDATES;
+/// Marks the optional section after it: credential-rotation epochs of the
+/// current epoch (`params::CREDENTIAL_ROTATION_LIMIT_ACTIVATION_EPOCH`).
+/// Written only when non-empty (never below the gate).
+const CREDENTIAL_ROTATION_SECTION: &[u8; 16] = crate::wire_alloc::local_cache::CREDENTIAL_ROTATIONS;
 /// One cached KES key: depth, root, start period.
 type CachedKes = (u8, [u8; 32], u64);
 /// One cached KES entry: key in force, successor, history (key, end period).
@@ -164,7 +169,7 @@ impl CommittedState {
     /// or allocating a second encoded payload. Restore the original destination
     /// length if serialization fails; existing prefix bytes remain untouched.
     pub fn append_local_cache(&self, bytes: &mut Vec<u8>) -> Result<(), String> {
-        let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, funded_delegation_owners, funded_delegation_lifecycle, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat, l2_settlement, pq_rescue_commits, commission_update_epochs, kes, kes_enforced_from } = self;
+        let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, funded_delegation_owners, funded_delegation_lifecycle, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat, l2_settlement, pq_rescue_commits, commission_update_epochs, credential_rotation_epochs, kes, kes_enforced_from } = self;
         let value = CachedStateRef {
             admission_network_domain,
             slot,
@@ -238,18 +243,18 @@ impl CommittedState {
                     return Err(error.to_string());
                 }
             }
-            if let Some(queue) = l2.forced_queue() {
-                bytes.extend_from_slice(L2_FORCED_SECTION);
+            if !l2.settlers().is_empty() {
+                bytes.extend_from_slice(L2_SETTLER_SECTION);
                 if let Err(error) = bincode::DefaultOptions::new().with_limit(LIMIT)
-                    .serialize_into(&mut *bytes, queue) {
+                    .serialize_into(&mut *bytes, l2.settlers()) {
                     bytes.truncate(original_len);
                     return Err(error.to_string());
                 }
             }
-            if !l2.paid_leaves().is_empty() {
-                bytes.extend_from_slice(L2_PAID_SECTION);
+            if *l2.attested_release() != crate::l2_settlement::withdrawal::ReleaseWindow::default() {
+                bytes.extend_from_slice(L2_ATTESTED_RELEASE_SECTION);
                 if let Err(error) = bincode::DefaultOptions::new().with_limit(LIMIT)
-                    .serialize_into(&mut *bytes, l2.paid_leaves()) {
+                    .serialize_into(&mut *bytes, l2.attested_release()) {
                     bytes.truncate(original_len);
                     return Err(error.to_string());
                 }
@@ -327,6 +332,18 @@ impl CommittedState {
                 return Err("local cache payload exceeds its limit".into());
             }
         }
+        if !credential_rotation_epochs.is_empty() {
+            bytes.extend_from_slice(CREDENTIAL_ROTATION_SECTION);
+            if let Err(error) = bincode::DefaultOptions::new().with_limit(LIMIT)
+                .serialize_into(&mut *bytes, credential_rotation_epochs) {
+                bytes.truncate(original_len);
+                return Err(error.to_string());
+            }
+            if bytes.len() - original_len > LIMIT as usize {
+                bytes.truncate(original_len);
+                return Err("local cache payload exceeds its limit".into());
+            }
+        }
         Ok(())
     }
 
@@ -334,7 +351,7 @@ impl CommittedState {
     // oracle: equality catches changes to field order and eUTXO sequence framing.
     #[cfg(test)]
     pub(super) fn encode_local_cache_owned_reference(&self) -> Result<Vec<u8>, String> {
-        let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, funded_delegation_owners, funded_delegation_lifecycle, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat, l2_settlement: _, pq_rescue_commits: _, commission_update_epochs: _, kes: _, kes_enforced_from: _ } = self;
+        let CommittedState { head: _, eutxos, admission_network_domain, slot, epoch, validators, reveals_used, randao_mix, boundary_mixes, genesis_mix, genesis_cohort, genesis_principal_sat, written_off_sat, funded_validators, stake_low_water, randao_generations, finality_engine, previous_justified, pending_votes, latest_messages, fc_equivocators, fc_recent_votes, current_participation, previous_participation, deposit_history, pubkey_index, delegations, funded_delegation_owners, funded_delegation_lifecycle, pending_fee_rewards, slashing, delegator_slash_losses, delegator_fee_rewards, validator_fee_rewards, delegator_issuance_rewards, current_proposed, base_fee_millisat_per_gas, block_gas_used, block_tx_bytes, taint_root, coherence_accumulator_root, coherence_nullifier_root, evm, issued_sat, l2_settlement: _, pq_rescue_commits: _, commission_update_epochs: _, credential_rotation_epochs: _, kes: _, kes_enforced_from: _ } = self;
         let value = CachedState {
             admission_network_domain: admission_network_domain.clone(),
             slot: slot.clone(),
@@ -393,7 +410,7 @@ impl CommittedState {
         let value: CachedState = bincode::DefaultOptions::new().with_limit(LIMIT)
             .deserialize_from(&mut rest).map_err(|e| e.to_string())?;
         // Optional sections, in their only legal order
-        // (`wire_alloc::local_cache::ORDER`): L2 [L2CP] [L2FI] [L2PL], KES, PQ, FSET, FFGO.
+        // (`wire_alloc::local_cache::ORDER`): L2 [L2CP], KES, PQ, FSET, FFGO.
         let mut l2_settlement = None;
         if let Some(mut section) = rest.strip_prefix(L2_SECTION.as_slice()) {
             let mut l2: crate::l2_settlement::State = bincode::DefaultOptions::new().with_limit(LIMIT)
@@ -407,20 +424,23 @@ impl CommittedState {
                 l2.restore_checkpoint_roots(roots);
                 section = roots_section;
             }
-            if let Some(mut forced_section) = section.strip_prefix(L2_FORCED_SECTION.as_slice()) {
-                let queue: crate::l2_settlement::forced::Queue = bincode::DefaultOptions::new().with_limit(LIMIT)
-                    .deserialize_from(&mut forced_section).map_err(|e| e.to_string())?;
-                l2.restore_forced_queue(queue);
-                section = forced_section;
-            }
-            if let Some(mut paid_section) = section.strip_prefix(L2_PAID_SECTION.as_slice()) {
-                let paid: crate::l2_settlement::withdrawal::PaidLeaves = bincode::DefaultOptions::new().with_limit(LIMIT)
-                    .deserialize_from(&mut paid_section).map_err(|e| e.to_string())?;
-                if paid.is_empty() {
-                    return Err("empty cached L2 paid-leaf section".into());
+            if let Some(mut settler_section) = section.strip_prefix(L2_SETTLER_SECTION.as_slice()) {
+                let keys: Vec<Vec<u8>> = bincode::DefaultOptions::new().with_limit(LIMIT)
+                    .deserialize_from(&mut settler_section).map_err(|e| e.to_string())?;
+                if keys.is_empty() {
+                    return Err("empty cached L2 settler section".into());
                 }
-                l2.restore_paid_leaves(paid);
-                section = paid_section;
+                l2.restore_settlers(keys);
+                section = settler_section;
+            }
+            if let Some(mut lane_section) = section.strip_prefix(L2_ATTESTED_RELEASE_SECTION.as_slice()) {
+                let window: crate::l2_settlement::withdrawal::ReleaseWindow = bincode::DefaultOptions::new().with_limit(LIMIT)
+                    .deserialize_from(&mut lane_section).map_err(|e| e.to_string())?;
+                if window == crate::l2_settlement::withdrawal::ReleaseWindow::default() {
+                    return Err("empty cached L2 attested-release section".into());
+                }
+                l2.restore_attested_release(window);
+                section = lane_section;
             }
             l2_settlement = Some(l2.from_local_cache()?);
             rest = section;
@@ -489,6 +509,19 @@ impl CommittedState {
                     epochs
                 }
             };
+        let credential_rotation_epochs: BTreeMap<u32, u64> =
+            match rest.strip_prefix(CREDENTIAL_ROTATION_SECTION.as_slice()) {
+                None => BTreeMap::new(),
+                Some(mut section) => {
+                    let epochs: BTreeMap<u32, u64> = bincode::DefaultOptions::new().with_limit(LIMIT)
+                        .deserialize_from(&mut section).map_err(|e| e.to_string())?;
+                    if epochs.is_empty() {
+                        return Err("empty cached credential-rotation section".into());
+                    }
+                    rest = section;
+                    epochs
+                }
+            };
         if !rest.is_empty() {
             return Err("unexpected bytes after the cached state".into());
         }
@@ -552,6 +585,7 @@ impl CommittedState {
             l2_settlement,
             pq_rescue_commits,
             commission_update_epochs,
+            credential_rotation_epochs,
             kes,
             kes_enforced_from,
         };

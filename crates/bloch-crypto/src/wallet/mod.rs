@@ -326,9 +326,13 @@ impl Wallet {
         // Chain-id (Roadmap #8) derived from the wallet's own network — the
         // signer and the node validator must fold the SAME domain into the sighash.
         let chain_id = crate::core::ChainId::for_network(self.network);
+        refuse_seeded_signing().map_err(WalletError::Crypto)?;
         for i in 0..tx.inputs.len() {
             let sighash = tx.sighash(i, chain_id);
-            let sig = crypto::sign(&self.keypair.secret, &sighash)
+            // Verify-before-release: a faulty lattice signature can leak key
+            // material, so it is checked under this wallet's own public key
+            // and withheld on failure (the node keystore already does this).
+            let sig = crypto::hardening::sign_verified(&self.keypair.secret, pubkey, &sighash)
                 .map_err(|e| WalletError::Crypto(e.to_string()))?;
             // FIX: consensus verification parses script_sig with
             // `parse_script_sig` (length-prefixed [4B sig_len][sig][4B pk_len]
@@ -758,11 +762,64 @@ impl Drop for BorrowedKeystorePayload<'_> {
     }
 }
 
+/// Whether this build may sign on the platform it was compiled for (review
+/// F2): `Ok` on an architecture where the Falcon signer's constant-time
+/// argument has been reviewed, or on any other when the build opted in with
+/// the `allow-unvetted-signing-arch` feature; otherwise the reason.
+///
+/// A wallet UI can call this once at start-up to tell the user, instead of
+/// learning it from the first failed signature.
+pub fn signing_platform_status() -> Result<(), String> {
+    platform_gate(
+        crypto::hardening::signing_platform_check(),
+        cfg!(feature = "allow-unvetted-signing-arch"),
+    )
+}
+
+fn platform_gate(vetted: Result<(), String>, build_opted_in: bool) -> Result<(), String> {
+    match vetted {
+        Ok(()) => Ok(()),
+        Err(_) if build_opted_in => Ok(()),
+        Err(why) => Err(format!(
+            "refusing to sign: {why}. A build that accepts this enables the bloch-crypto feature \
+             `allow-unvetted-signing-arch`"
+        )),
+    }
+}
+
+/// Wallet signing never runs under a seeded PQClean scope.
+///
+/// `pqcrypto_internals::with_seeded_rng_scope` exists for key generation. A
+/// signature made inside it draws Falcon's salt and sampler randomness from
+/// the seed, so two different messages are signed with the SAME randomness,
+/// which Falcon's security argument does not allow. The low-level
+/// [`crypto::sign`] stays usable under a seed for known-answer tests; the
+/// wallet's own signing entry points, which sign real spends, refuse.
+fn refuse_seeded_signing() -> Result<(), String> {
+    // The platform rule rides on the same door: both are "this wallet must
+    // not produce a signature here", checked before the secret is touched.
+    signing_platform_status()?;
+    if pqcrypto_internals::seeded_rng_active() {
+        return Err("refusing to sign inside a seeded RNG scope: wallet signatures must use \
+                    fresh randomness (the seeded scope is for key generation only)"
+            .into());
+    }
+    Ok(())
+}
+
 // ── Keypair ───────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Deserialize)]
+/// Legacy keypair: a secret key, its public key and its address.
+///
+/// Review F6: the secret is not a public field and the type is not `Clone`.
+/// Both made unwiped copies trivial to create by accident: `Drop` wipes only
+/// the instance being dropped, so every clone and every `kp.private_key`
+/// copied out of it lived on unwiped. Code outside this crate now reaches the
+/// secret through [`Keypair::expose_private_key`], which says what it does,
+/// and builds one with [`Keypair::from_parts`].
+#[derive(Deserialize)]
 pub struct Keypair {
-    pub private_key: Vec<u8>,
+    pub(crate) private_key: Vec<u8>,
     pub public_key:  Vec<u8>,
     pub address:     String,
 }
@@ -791,8 +848,38 @@ impl Drop for Keypair {
 }
 
 impl Keypair {
+    /// Build a keypair from its parts. The secret is moved in, not copied.
+    pub fn from_parts(private_key: Vec<u8>, public_key: Vec<u8>, address: String) -> Self {
+        Keypair { private_key, public_key, address }
+    }
+
+    /// The secret key bytes. Every copy made from this borrow is the
+    /// caller's to wipe; prefer [`Self::sign`], which needs no copy.
+    pub fn expose_private_key(&self) -> &[u8] {
+        &self.private_key
+    }
+
     pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, String> {
-        self.with_enveloped_secret(|sk| crypto::sign(sk, msg))
+        let sig = self.with_enveloped_secret(|sk| crypto::sign(sk, msg))?;
+        self.release_if_valid(msg, sig)
+    }
+
+    /// The error [`Self::sign`] and [`Self::sign_fitting`] return when the
+    /// produced signature fails verification under this keypair's public key.
+    pub const SIGNATURE_WITHHELD: &'static str =
+        "produced signature does not verify under the signer's own public key \
+         (fault, or mismatched keypair); signature withheld";
+
+    /// Verify-before-release: a signature leaves this type only if it verifies
+    /// under the keypair's own public key, with the same compatibility
+    /// verifier [`Self::verify`] exposes. A faulty lattice signature can leak
+    /// key material, so on failure it is dropped and never returned.
+    fn release_if_valid(&self, msg: &[u8], sig: Vec<u8>) -> Result<Vec<u8>, String> {
+        if Self::verify(&self.public_key, msg, &sig) {
+            Ok(sig)
+        } else {
+            Err(Self::SIGNATURE_WITHHELD.into())
+        }
     }
 
     /// Like [`Self::sign`], but re-signs with fresh randomness until the
@@ -800,13 +887,15 @@ impl Keypair {
     /// [`crypto::sign_fitting`]). Use it for any field whose length bound is
     /// below [`crypto::max_signature_len`].
     pub fn sign_fitting(&self, msg: &[u8], max_len: usize) -> Result<Vec<u8>, String> {
-        self.with_enveloped_secret(|sk| crypto::sign_fitting(sk, msg, max_len))
+        let sig = self.with_enveloped_secret(|sk| crypto::sign_fitting(sk, msg, max_len))?;
+        self.release_if_valid(msg, sig)
     }
 
     fn with_enveloped_secret(
         &self,
         sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, crypto::CryptoError>,
     ) -> Result<Vec<u8>, String> {
+        refuse_seeded_signing()?;
         // Legacy v2 keystores stored the RAW private key (no 4-byte suite envelope),
         // while newer keys and crypto::sign use the enveloped form. If this key is
         // un-enveloped, wrap it under the SAME suite the (enveloped) public key
@@ -1888,6 +1977,71 @@ mod legacy_sign_tests {
         // And a wrong key must still be rejected (no weakening).
         let (other_env, _) = crypto::generate_keypair();
         assert!(!crypto::verify(&other_env[4..], sighash, &sig), "a different pubkey must NOT verify");
+    }
+}
+
+#[cfg(test)]
+mod verify_before_release {
+    use super::*;
+
+    /// A signature that does not verify under the keypair's own public key is
+    /// withheld, on both signing entry points; a matched pair still signs.
+    #[test]
+    fn keypair_withholds_a_signature_its_own_public_key_rejects() {
+        let good = generate_keypair(false);
+        let msg = b"verify-before-release";
+        let sig = good.sign(msg).expect("a matched keypair signs");
+        assert!(Keypair::verify(&good.public_key, msg, &sig));
+        let max = crypto::max_signature_len();
+        assert!(good.sign_fitting(msg, max).is_ok());
+
+        let other = generate_keypair(false);
+        let mismatched = Keypair {
+            private_key: good.private_key.clone(),
+            public_key: other.public_key.clone(),
+            address: other.address.clone(),
+        };
+        let refusal = mismatched.sign(msg).expect_err("the signature must be withheld");
+        assert!(refusal.contains("signature withheld"), "{refusal}");
+        assert!(mismatched.sign_fitting(msg, max).is_err());
+        assert!(mismatched.sign_message(b"hello").is_err());
+    }
+
+    /// F2: a vetted platform signs; an unvetted one signs only when the build
+    /// opted in, and the refusal names the feature. This host is vetted, so
+    /// the wallet's own entry points sign.
+    #[test]
+    fn signing_on_an_unvetted_platform_needs_the_build_to_opt_in() {
+        assert_eq!(platform_gate(Ok(()), false), Ok(()));
+        assert_eq!(platform_gate(Ok(()), true), Ok(()));
+        assert_eq!(platform_gate(Err("unvetted wasm32".into()), true), Ok(()));
+        let refusal = platform_gate(Err("unvetted wasm32".into()), false).unwrap_err();
+        assert!(refusal.contains("unvetted wasm32") && refusal.contains("allow-unvetted-signing-arch"), "{refusal}");
+        assert!(crypto::hardening::VETTED_SIGNING_ARCHES.contains(&crypto::hardening::target_arch()));
+        assert_eq!(signing_platform_status(), Ok(()));
+    }
+
+    /// F3: the wallet's signing entry points refuse under a seeded scope and
+    /// work again the moment it ends; nothing deterministic is released.
+    #[test]
+    fn wallet_signing_refuses_inside_a_seeded_scope() {
+        let keypair = generate_keypair(false);
+        let (wallet, _) = Wallet::generate(Network::Mainnet).unwrap();
+        let tx = || {
+            let utxos = vec![Utxo { txid: [1; 32], index: 0,
+                output: TxOutput { value: 1000, script_pubkey: wallet.address().hash().to_vec() } }];
+            wallet.build_tx(utxos, &Address::from_hash([42; 20], Network::Mainnet), 900, 100)
+        };
+        pqcrypto_internals::with_seeded_rng_scope(&[5u8; 32], || {
+            let refusal = keypair.sign(b"m").expect_err("no seeded wallet signature");
+            assert!(refusal.contains("seeded RNG scope"), "{refusal}");
+            assert!(keypair.sign_fitting(b"m", crypto::max_signature_len()).is_err());
+            assert!(keypair.sign_message(b"m").is_err());
+            let unsigned = tx().expect("building needs no signature");
+            assert!(matches!(wallet.sign_tx(unsigned), Err(WalletError::Crypto(why)) if why.contains("seeded RNG scope")));
+        });
+        assert!(keypair.sign(b"m").is_ok());
+        assert!(wallet.sign_tx(tx().unwrap()).is_ok());
     }
 }
 

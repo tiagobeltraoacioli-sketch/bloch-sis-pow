@@ -354,6 +354,9 @@ pub const TX_REFUSED_RETRYABLE: i64 = -32009;
 /// leaves (included, expires, or is itself evicted), not on any fixed
 /// schedule this response could name.
 pub const TX_REFUSED_SOURCE_CAP: i64 = -32010;
+/// `sendrawtransaction` on a node started with `--rpc-read-only`: this
+/// listener serves reads only, and no retry will change that.
+pub const WRITES_DISABLED: i64 = -32011;
 
 /// A JSON-RPC error object: a code a client can branch on and a message a human
 /// can act on. Both halves are required — a bare code makes an operator read
@@ -1741,7 +1744,7 @@ fn envelope(id: Json, outcome: RpcResult) -> String {
 /// "malformed input crashes the node" and "anyone can stop the validator" are
 /// the same sentence.
 pub fn handle_body(body: &str, backend: &dyn RpcBackend) -> String {
-    handle_body_from(body, backend, None)
+    handle_body_from(body, backend, None, false)
 }
 
 /// [`handle_body`] for one HTTP connection: the address it is attributed
@@ -1750,6 +1753,7 @@ fn handle_body_from(
     body: &str,
     backend: &dyn RpcBackend,
     source: Option<(IpAddr, &dyn Fn() -> bool, bool)>,
+    read_only: bool,
 ) -> String {
     let request = match parse_json(body) {
         Ok(v) => v,
@@ -1789,6 +1793,18 @@ fn handle_body_from(
         return envelope(id, Err(RpcError::invalid_request("`method` must be a string")));
     };
 
+    // Refused by name, before the transaction is decoded: a read-only
+    // listener does no work for a write.
+    if read_only && method == "sendrawtransaction" {
+        return envelope(
+            id,
+            Err(RpcError::new(
+                WRITES_DISABLED,
+                "this RPC endpoint is read-only (--rpc-read-only); sendrawtransaction is refused",
+            )),
+        );
+    }
+
     let params = request.get("params").filter(|p| !matches!(p, Json::Null));
     let outcome = route(method, params).and_then(|req| match source {
         Some((_, _, true)) if matches!(req, RpcRequest::SecurityStatus) => security_status_for_relayed(),
@@ -1818,7 +1834,9 @@ pub fn serve(
     // (limits the operator believes are per-client would not be) or anybody.
     let proxies = TrustedProxies::from_env()
         .map_err(|why| io::Error::new(io::ErrorKind::InvalidInput, why))?;
-    serve_behind(bind_addr, port, backend, proxies)
+    let access = Access::from_env()
+        .map_err(|why| io::Error::new(io::ErrorKind::InvalidInput, why))?;
+    serve_with(bind_addr, port, backend, proxies, access)
 }
 
 /// [`serve`] with the trusted-proxy list given rather than read from the
@@ -1829,6 +1847,18 @@ fn serve_behind(
     backend: Arc<dyn RpcBackend>,
     proxies: TrustedProxies,
 ) -> io::Result<SocketAddr> {
+    serve_with(bind_addr, port, backend, proxies, Access::default())
+}
+
+/// [`serve_behind`] with the access policy given as well.
+fn serve_with(
+    bind_addr: &str,
+    port: u16,
+    backend: Arc<dyn RpcBackend>,
+    proxies: TrustedProxies,
+    access: Access,
+) -> io::Result<SocketAddr> {
+    let access = Arc::new(access);
     let listener = TcpListener::bind((bind_addr, port))?;
     let local = listener.local_addr()?;
     let live = Arc::new(AtomicUsize::new(0));
@@ -1867,6 +1897,7 @@ fn serve_behind(
             let hosts = hosts.clone();
             let proxies = proxies.clone();
             let ip_limits = ip_limits.clone();
+            let access = access.clone();
             thread::spawn(move || {
                 let mut permit = permit;
                 let mut sock = sock;
@@ -1874,6 +1905,7 @@ fn serve_behind(
                     &mut sock,
                     backend.as_ref(),
                     &hosts,
+                    &access,
                     peer,
                     peer_is_proxy,
                     &mut |forwarded: &[String]| {
@@ -1969,6 +2001,7 @@ fn serve_connection(
     sock: &mut TcpStream,
     backend: &dyn RpcBackend,
     hosts: &HostPolicy,
+    access: &Access,
     peer: IpAddr,
     peer_is_proxy: bool,
     attribute: &mut dyn FnMut(&[String]) -> Result<IpAddr, HttpError>,
@@ -1981,10 +2014,12 @@ fn serve_connection(
     // Through a proxy (review RC-05): a declared one, or any forwarding
     // header at all.
     let mut relayed = peer_is_proxy;
-    let request = read_request(sock, hosts, &mut |forwarded, relay_header| {
+    let request = read_request(sock, hosts, &mut |forwarded, relay_header, api_key| {
         relayed |= relay_header;
         source = attribute(forwarded)?;
-        Ok(())
+        // After attribution, so the rate is charged to the client a trusted
+        // proxy names and not to the proxy.
+        access.admit(source, api_key)
     });
     match request {
         Ok(body) => {
@@ -1994,7 +2029,7 @@ fn serve_connection(
                 Ok(text) => {
                     let probe: &TcpStream = sock;
                     let gone: &dyn Fn() -> bool = &|| client_gone(probe);
-                    handle_body_from(text, backend, Some((source, gone, relayed)))
+                    handle_body_from(text, backend, Some((source, gone, relayed)), access.read_only)
                 }
                 Err(_) => envelope(Json::Null, Err(RpcError::parse_error("body is not UTF-8"))),
             };
@@ -2157,6 +2192,229 @@ fn valid_host_port_suffix(suffix: &str) -> bool {
         && port.parse::<u16>().is_ok()
 }
 
+// ─── Access policy: read-only mode, API key, request rate ──────────────────
+//
+// All three are OPT-IN and off by default, so a node started with the flags
+// it had yesterday serves exactly what it served yesterday. None of them is
+// transport security: the listener is still plain HTTP, so an API key
+// crossing a network that is not loopback or an already-encrypted hop is
+// readable on the path. They exist so that a port which IS reachable by more
+// than its operator is not, by construction, an open write door.
+
+/// `1` makes this listener refuse `sendrawtransaction` (`--rpc-read-only`).
+pub(crate) const RPC_READ_ONLY_ENV: &str = "BLOCH_RPC_READ_ONLY";
+/// Path of a file holding the API key every request must present in
+/// `X-API-Key` (`--rpc-api-key-file`). A file, not the key itself, so the
+/// secret is never in argv or in the process environment.
+pub(crate) const RPC_API_KEY_FILE_ENV: &str = "BLOCH_RPC_API_KEY_FILE";
+/// Requests per second allowed per source address (`--rpc-rate-limit`).
+pub(crate) const RPC_RATE_LIMIT_ENV: &str = "BLOCH_RPC_RATE_LIMIT";
+
+const API_KEY_HEADER: &str = "x-api-key";
+/// Bounds on the configured key: long enough not to be guessable, short
+/// enough to fit a header line with room to spare.
+const API_KEY_MIN_LEN: usize = 24;
+const API_KEY_MAX_LEN: usize = 256;
+/// The highest per-source rate that can be configured.
+const RATE_LIMIT_MAX_PER_SECOND: u32 = 10_000;
+/// Sources tracked by the rate limiter at once. When the table is full of
+/// sources that are still inside their window, a NEW source is refused
+/// rather than admitted unmetered.
+const RATE_TABLE_MAX: usize = 4_096;
+
+/// What this listener demands of a request beyond being well-formed.
+#[derive(Default)]
+pub(crate) struct Access {
+    read_only: bool,
+    /// SHA3-256 of the configured key; the key itself is not retained.
+    api_key: Option<[u8; 32]>,
+    rate: Option<RateLimit>,
+}
+
+impl Access {
+    /// Read the three settings from the environment. Anything present but
+    /// malformed is an error: a node whose operator asked for a restriction
+    /// must not start without it.
+    pub(crate) fn from_env() -> Result<Self, String> {
+        let var = |name: &str| match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid UTF-8")),
+        };
+        let read_only = match var(RPC_READ_ONLY_ENV)?.as_deref() {
+            None | Some("") | Some("0") => false,
+            Some("1") => true,
+            Some(other) => return Err(format!("{RPC_READ_ONLY_ENV} must be `1` or `0`, not `{other}`")),
+        };
+        let api_key = match var(RPC_API_KEY_FILE_ENV)? {
+            None => None,
+            Some(path) => {
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("cannot read the RPC API key file `{path}`: {e}"))?;
+                Some(Self::key_digest(Self::parse_api_key(&text)?))
+            }
+        };
+        let rate = match var(RPC_RATE_LIMIT_ENV)? {
+            None => None,
+            Some(value) => Some(RateLimit::new(Self::parse_rate(&value)?)),
+        };
+        Ok(Access { read_only, api_key, rate })
+    }
+
+    /// The key as the file holds it: one token, surrounding whitespace (the
+    /// trailing newline an editor adds) removed.
+    pub(crate) fn parse_api_key(text: &str) -> Result<&str, String> {
+        let key = text.trim();
+        if key.len() < API_KEY_MIN_LEN || key.len() > API_KEY_MAX_LEN {
+            return Err(format!(
+                "the RPC API key must be {API_KEY_MIN_LEN} to {API_KEY_MAX_LEN} characters \
+                 (got {})",
+                key.len()
+            ));
+        }
+        if !key.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err("the RPC API key must be printable ASCII with no spaces".into());
+        }
+        Ok(key)
+    }
+
+    pub(crate) fn parse_rate(value: &str) -> Result<u32, String> {
+        match value.parse::<u32>() {
+            Ok(n) if (1..=RATE_LIMIT_MAX_PER_SECOND).contains(&n) => Ok(n),
+            _ => Err(format!(
+                "the RPC rate limit must be a whole number of requests per second, \
+                 1 to {RATE_LIMIT_MAX_PER_SECOND} (got `{value}`)"
+            )),
+        }
+    }
+
+    pub(crate) fn key_digest(key: &str) -> [u8; 32] {
+        use sha3::{Digest, Sha3_256};
+        Sha3_256::digest(key.as_bytes()).into()
+    }
+
+    /// Whether `presented` hashes to `expected`, compared without an early
+    /// exit. Shared with the metrics listener's bearer token.
+    pub(crate) fn digest_matches(expected: &[u8; 32], presented: &str) -> bool {
+        let got = Self::key_digest(presented);
+        let mut difference = 0u8;
+        for (a, b) in expected.iter().zip(got.iter()) {
+            difference |= a ^ b;
+        }
+        std::hint::black_box(difference) == 0
+    }
+
+    /// Whether `presented` is the configured key. Both sides are hashed and
+    /// the digests compared without an early exit, so neither the length nor
+    /// a matching prefix of the key shows in the time this takes.
+    fn key_matches(&self, presented: Option<&str>) -> bool {
+        let Some(expected) = &self.api_key else { return true };
+        let Some(presented) = presented else { return false };
+        Self::digest_matches(expected, presented)
+    }
+
+    /// Judge one request head from `source`. The rate is charged first, so
+    /// wrong-key attempts are metered like any other request.
+    fn admit(&self, source: IpAddr, presented_key: Option<&str>) -> Result<(), HttpError> {
+        if let Some(rate) = &self.rate {
+            if !rate.take(source, Instant::now()) {
+                return Err(http_err(429, "request rate limit exceeded for this source address"));
+            }
+        }
+        if !self.key_matches(presented_key) {
+            return Err(http_err(401, "a valid X-API-Key header is required"));
+        }
+        Ok(())
+    }
+
+    /// One line per active restriction, for the startup log.
+    pub(crate) fn summary(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.read_only {
+            lines.push("RPC is read-only: sendrawtransaction is refused".to_string());
+        }
+        if self.api_key.is_some() {
+            lines.push("RPC requires an X-API-Key header on every request".to_string());
+        }
+        if let Some(rate) = &self.rate {
+            lines.push(format!(
+                "RPC rate limit: {} requests/s per source address (burst {})",
+                rate.per_second,
+                rate.burst()
+            ));
+        }
+        lines
+    }
+
+    pub(crate) fn is_authenticated(&self) -> bool {
+        self.api_key.is_some()
+    }
+
+    pub(crate) fn is_rate_limited(&self) -> bool {
+        self.rate.is_some()
+    }
+}
+
+/// A token bucket per source address ([`crate::connection_limit::limit_key`]:
+/// an IPv4 address or an IPv6 /64). Counted in thousandths of a request so
+/// the refill needs no floating point.
+struct RateLimit {
+    per_second: u32,
+    table: Mutex<std::collections::HashMap<IpAddr, (u64, Instant)>>,
+}
+
+impl RateLimit {
+    fn new(per_second: u32) -> Self {
+        RateLimit { per_second, table: Mutex::new(std::collections::HashMap::new()) }
+    }
+
+    /// Two seconds' worth: a client may be briefly bursty, not sustainedly so.
+    fn burst(&self) -> u64 {
+        u64::from(self.per_second).saturating_mul(2)
+    }
+
+    fn capacity_milli(&self) -> u64 {
+        self.burst().saturating_mul(1_000)
+    }
+
+    fn refilled(&self, tokens: u64, since: Instant, now: Instant) -> u64 {
+        let elapsed_ms = u64::try_from(now.saturating_duration_since(since).as_millis()).unwrap_or(u64::MAX);
+        tokens
+            .saturating_add(elapsed_ms.saturating_mul(u64::from(self.per_second)))
+            .min(self.capacity_milli())
+    }
+
+    /// Spend one request from `source`'s bucket; `false` when it is empty.
+    fn take(&self, source: IpAddr, now: Instant) -> bool {
+        let key = crate::connection_limit::limit_key(source);
+        let mut table = match self.table.lock() {
+            Ok(table) => table,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !table.contains_key(&key) && table.len() >= RATE_TABLE_MAX {
+            // Forget every source whose bucket has refilled: it is
+            // indistinguishable from one never seen.
+            let capacity = self.capacity_milli();
+            table.retain(|_, (tokens, since)| self.refilled(*tokens, *since, now) < capacity);
+            if table.len() >= RATE_TABLE_MAX {
+                return false;
+            }
+        }
+        let (tokens, since) = table.get(&key).copied().unwrap_or((self.capacity_milli(), now));
+        let available = self.refilled(tokens, since, now);
+        match available.checked_sub(1_000) {
+            Some(left) => {
+                table.insert(key, (left, now));
+                true
+            }
+            None => {
+                table.insert(key, (available, now));
+                false
+            }
+        }
+    }
+}
+
 // ─── Trusted proxies: whose word is taken for the client address ───────────
 
 /// Addresses of reverse proxies whose `X-Forwarded-For` is believed —
@@ -2295,7 +2553,7 @@ fn content_type_allowed(ct: Option<&str>) -> bool {
 fn read_request(
     sock: &mut TcpStream,
     hosts: &HostPolicy,
-    on_head: &mut dyn FnMut(&[String], bool) -> Result<(), HttpError>,
+    on_head: &mut dyn FnMut(&[String], bool, Option<&str>) -> Result<(), HttpError>,
 ) -> Result<Vec<u8>, HttpError> {
     let deadline = Instant::now().checked_add(IO_TIMEOUT)
         .ok_or_else(|| http_err(408, "request deadline out of range"))?;
@@ -2310,14 +2568,14 @@ fn read_request_until(
     hosts: &HostPolicy,
     deadline: Instant,
 ) -> Result<Vec<u8>, HttpError> {
-    read_request_attributed(sock, hosts, deadline, &mut |_, _| Ok(()))
+    read_request_attributed(sock, hosts, deadline, &mut |_, _, _| Ok(()))
 }
 
 fn read_request_attributed(
     sock: &mut TcpStream,
     hosts: &HostPolicy,
     deadline: Instant,
-    on_head: &mut dyn FnMut(&[String], bool) -> Result<(), HttpError>,
+    on_head: &mut dyn FnMut(&[String], bool, Option<&str>) -> Result<(), HttpError>,
 ) -> Result<Vec<u8>, HttpError> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
@@ -2365,6 +2623,7 @@ fn read_request_attributed(
     let mut origin: Option<String> = None;
     let mut host: Option<String> = None;
     let mut forwarded: Vec<String> = Vec::new();
+    let mut api_key: Option<String> = None;
     let mut relay_header = false;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
@@ -2402,13 +2661,17 @@ fn read_request_attributed(
             if host.replace(value.to_string()).is_some() {
                 return Err(http_err(400, "duplicate Host"));
             }
+        } else if name.eq_ignore_ascii_case(API_KEY_HEADER) {
+            if api_key.replace(value.to_string()).is_some() {
+                return Err(http_err(400, "duplicate X-API-Key"));
+            }
         } else if name.eq_ignore_ascii_case(FORWARDED_HEADER) {
             // Collected, not believed: whether any of it counts is decided by
             // who the TCP peer is (see `TrustedProxies`).
             forwarded.push(value.to_string());
         }
     }
-    on_head(&forwarded, relay_header)?;
+    on_head(&forwarded, relay_header, api_key.as_deref())?;
 
     // R1 A3-M4: the browser-request gate, before Content-Length is even
     // consulted — three header comparisons are cheaper than anything past
@@ -2486,12 +2749,14 @@ fn respond(sock: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
         411 => "Length Required",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
+        429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         503 => "Service Unavailable",
         _ => "Error",
@@ -2901,7 +3166,6 @@ impl PreparedSubmission {
             PosTransaction::L2Deposit(_) => "l2_deposit",
             PosTransaction::L2DataAvailability(_) => "l2_data_availability",
             PosTransaction::L2WithdrawClaim(_) => "l2_withdraw_claim",
-            PosTransaction::L2ForcedTransaction(_) => "l2_forced_transaction",
             PosTransaction::WithdrawalCredentialRotation(_) => "withdrawal_credential_rotation",
             PosTransaction::RescueCommit(_) => "pq_rescue_commit",
             PosTransaction::RescueReveal(_) => "pq_rescue_reveal",
@@ -3633,71 +3897,75 @@ pub fn kes_json(state: &bloch_pos_committee::transition::CommittedState) -> Json
     ])
 }
 
-/// One entry of `getl2settlement.head_resets`.
-pub fn head_reset_json(report: &bloch_pos_committee::l2_settlement::HeadResetReport) -> Json {
-    use bloch_pos_committee::l2_settlement::HeadResetRefusal;
-    let (at_or_above_count, against_tail) = match &report.refusal {
-        Some(HeadResetRefusal::PaidBeyondTarget { at_or_above_count, against_tail }) => (*at_or_above_count, against_tail.as_slice()),
-        _ => (false, &[][..]),
-    };
+/// `getl2settlement.program`: the program identities in force, which set
+/// they are, and the pinned switch of this build, if any.
+fn l2_program_json(l2: &bloch_pos_committee::l2_settlement::State) -> Json {
+    use bloch_pos_committee::l2_settlement::{mainnet, ProgramIdentities, SupplyCap};
+    use bloch_pos_committee::params::L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH as GATE;
+    let identities = |ids: &ProgramIdentities| vec![
+        ("configuration", Json::hex(&ids[0])), ("elf", Json::hex(&ids[1])),
+        ("vkey_koalabear", Json::hex(&ids[2])), ("vkey_bn254", Json::hex(&ids[3])),
+    ];
+    let cap = |cap: SupplyCap| Json::s(match cap {
+        SupplyCap::GrossMinted => "gross-minted",
+        SupplyCap::Outstanding => "outstanding",
+    }.to_string());
+    let switched = l2.program_switched();
+    let pending = l2.pending_program_switch();
+    let mut out = vec![("set", Json::s(if switched.is_some() { "switched" } else { "initial" }.to_string()))];
+    out.extend(identities(&l2.program()));
+    out.push(("proof_policy", Json::hex(&l2.policy().proof_policy)));
+    out.push(("supply_cap", cap(l2.supply_cap())));
+    // The switch this build pins for this L2: null when it pins none (every
+    // L2 but the mainnet one). `activation_epoch` null = the gate is inert;
+    // `final` false = the successor identities are candidate placeholders
+    // and the gate cannot be armed in this build.
+    out.push(("switch", switched.or(pending).map_or(Json::Null, |switch| {
+        let mut to = identities(&switch.to);
+        to.push(("supply_cap", cap(switch.supply_cap)));
+        Json::obj(vec![
+            ("activation_epoch", if GATE == u64::MAX { Json::Null } else { Json::u(GATE) }),
+            ("taken", Json::Bool(switched.is_some())),
+            ("final", Json::Bool(mainnet::PROGRAM_SWITCH_FINAL)),
+            ("to", Json::obj(to)),
+        ])
+    })));
+    Json::obj(out)
+}
+
+/// `getl2settlement.settler`: the settler set registered on this L2 (audit
+/// L2N-01, the L1 stop-gap). `registered` false = no set is installed and
+/// settlement is permissionless, which is the state of every L2 until the
+/// first epoch boundary behind L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH on
+/// a build that pins a set; `set_hash` is then null and `keys` empty.
+/// With a set: `set_hash` is `l2_settlement::settler::set_hash` (the value
+/// `bloch-pos l2-settler` prints and a rotation signs), and `keys` lists the
+/// set in order, `index` being the `signer` an authorization names. A
+/// settlement that rotates the set shows here from the block that accepts
+/// it, so a settler can compare its own set file with the chain instead of
+/// learning of a rotation from a refused settlement. Report only: nothing
+/// here feeds a rule.
+fn l2_settler_json(settlers: &[Vec<u8>]) -> Json {
+    use bloch_pos_committee::l2_settlement::settler;
+    use bloch_pos_committee::params::L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH as GATE;
+    use sha3::{Digest, Sha3_256};
+    let registered = !settlers.is_empty();
     Json::obj(vec![
-        ("gate", Json::s(report.gate.to_string())),
-        ("number", Json::u(report.number)),
-        ("forfeit", Json::Bool(report.forfeit)),
-        ("pending", Json::Bool(report.pending)),
-        ("would_apply", Json::Bool(report.refusal.is_none())),
-        ("refusal", report.refusal.as_ref().map_or(Json::Null, |why| Json::s(why.name().to_string()))),
-        // `paid_beyond_target` only: a claim at an index the target does not
-        // have, and the leaf indices paid against a record above the target
-        // (at most 64 listed; `paid_against_tail_count` is the whole number).
-        ("claimed_at_or_above_target_count", Json::Bool(at_or_above_count)),
-        ("paid_against_tail_count", Json::u(against_tail.len() as u64)),
-        ("paid_against_tail", Json::Arr(against_tail.iter().take(64).map(|index| Json::u(*index)).collect())),
+        // null = the gate is inert in this build.
+        ("activation_epoch", if GATE == u64::MAX { Json::Null } else { Json::u(GATE) }),
+        ("registered", Json::Bool(registered)),
+        ("set_hash", if registered { Json::hex(&settler::set_hash(settlers)) } else { Json::Null }),
+        ("max_keys", Json::u(settler::MAX_KEYS as u64)),
+        ("keys", Json::Arr(settlers.iter().enumerate().map(|(index, key)| Json::obj(vec![
+            ("index", Json::u(index as u64)),
+            // The identifier `bloch-pos l2-settler` prints for a key.
+            ("sha3", Json::hex(&Sha3_256::digest(key).into())),
+            ("key", Json::s(crate::codec::hex(key))),
+        ])).collect())),
     ])
 }
 
-/// The node's log line when a block moved the L2 program and a compiled
-/// head reset ran with it (review R308-2P-4): a refused reset is not silent.
-pub fn head_reset_log_line(report: &bloch_pos_committee::l2_settlement::HeadResetReport, slot: u64) -> String {
-    use bloch_pos_committee::l2_settlement::HeadResetRefusal;
-    let form = if report.forfeit { "forfeit" } else { "plain" };
-    match &report.refusal {
-        None => format!(
-            "L2 head reset APPLIED at slot {slot} with the {} program change: head moved back to L2 block {} ({form} form)",
-            report.gate, report.number
-        ),
-        Some(why) => {
-            let detail = match why {
-                HeadResetRefusal::PaidBeyondTarget { at_or_above_count, against_tail } => format!(
-                    "; claim at or above the target's leaf count: {at_or_above_count}; leaves paid against the tail: {} (first indices {:?})",
-                    against_tail.len(),
-                    &against_tail[..against_tail.len().min(16)]
-                ),
-                _ => String::new(),
-            };
-            format!(
-                "CRITICAL: L2 head reset REFUSED at slot {slot} with the {} program change: the program moved and the settled head did NOT \
-                 move back to L2 block {} ({form} form); reason: {}{detail}",
-                report.gate, report.number, why.name()
-            )
-        }
-    }
-}
-
 pub fn l2_settlement_json(state: &bloch_pos_committee::transition::CommittedState) -> Json {
-    l2_settlement_json_with(state, &|_, _| None)
-}
-
-/// A forced record's L2 envelope, read from the L1 block at `height` holding
-/// the transaction `txid`; `None` when that block is not readable here.
-pub type ForcedEnvelopeLookup<'a> = dyn Fn(u64, &[u8; 32]) -> Option<Vec<u8>> + 'a;
-
-/// [`l2_settlement_json`], with each due forced record's envelope read
-/// through `envelope` (the engine reads its canonical blocks).
-pub fn l2_settlement_json_with(
-    state: &bloch_pos_committee::transition::CommittedState,
-    envelope: &ForcedEnvelopeLookup<'_>,
-) -> Json {
     let Some(l2) = state.l2_settlement() else { return Json::Null; };
     let policy = l2.policy();
     let source = l2.frozen_source().map_or(Json::Null, |source| Json::obj(vec![
@@ -3718,26 +3986,21 @@ pub fn l2_settlement_json_with(
             crate::codec::hex32(&source.block), source.slot, source.height,
             crate::codec::hex32(&source.commitment), crate::codec::hex32(&source.inbox_root)))),
     ]));
-    let mut out = Json::obj(vec![
+    Json::obj(vec![
         ("asynchronous", Json::Bool(l2.asynchronous())), ("native_height", Json::u(l2.height())),
         ("network", Json::hex(&policy.identities[0])), ("genesis", Json::hex(&policy.identities[1])),
         ("chain_id", Json::u(policy.chain_id)), ("source", source),
-        // The program a settlement must prove now. It changes only at the
-        // compiled gate (`params::L2_NEXT_PROGRAM_EPOCH`).
-        ("program", Json::obj(vec![
-            ("configuration", Json::hex(&policy.identities[3])), ("elf_keccak", Json::hex(&policy.identities[4])),
-            ("vkey_koalabear", Json::hex(&policy.identities[5])), ("vkey_bn254", Json::hex(&policy.identities[6])),
-            ("proof_policy", Json::hex(&policy.proof_policy)),
-        ])),
-        // The compiled program changes still ahead of this L2, in order: empty
-        // while the gates are inert. A settler stops starting proofs that cannot
-        // land before the first entry; `program` above moves only at the gate.
-        ("program_schedule", Json::Arr(l2.program_schedule().iter().map(|(epoch, next)| Json::obj(vec![
-            ("epoch", Json::u(*epoch)),
-            ("configuration", Json::hex(&next.identities[0])), ("elf_keccak", Json::hex(&next.identities[1])),
-            ("vkey_koalabear", Json::hex(&next.identities[2])), ("vkey_bn254", Json::hex(&next.identities[3])),
-            ("proof_policy", Json::hex(&next.proof_policy)),
-        ])).collect())),
+        // The settlement program in force (audit L2N-01): what a settlement
+        // must name and the key its proof is verified under. "set" is
+        // "initial" until this L2 takes the pinned program switch at the
+        // first epoch boundary behind
+        // L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH, "switched" from that
+        // block on. "supply_cap" is the deposit cap that program enforces,
+        // which the L1 deposit rule follows (audits L1X-03, L2N-02).
+        ("program", l2_program_json(l2)),
+        // The registered settler set (audit L2N-01 stop-gap): absent until
+        // the settler-authorization gate installs one.
+        ("settler", l2_settler_json(l2.settlers())),
         // What this L2 admits, fixed at installation: a development genesis
         // follows the node's devnet features; the running-network flag day
         // ("activated") admits everything on every build.
@@ -3750,26 +4013,6 @@ pub fn l2_settlement_json_with(
             ("count", Json::u(l2.inbox().len() as u64)), ("consumed", Json::u(l2.consumed())),
             ("escrow_sat", Json::s(l2.escrow_sat().to_string())),
         ])),
-        // DA slots of the next block on this head: the registered key owns
-        // `reserved_per_block` of them once `params::L2_DA_RESERVED_SLOT_EPOCH`
-        // binds (`reserved_key` is then non-null). A settler whose funding key
-        // hash equals `reserved_key` cannot be crowded out by other DA.
-        ("data_availability_slots", {
-            use bloch_pos_committee::l2_settlement::da;
-            let reserved = da::reserved_key_at(epoch_of(state.slot()));
-            Json::obj(vec![
-                ("per_block", Json::u(da::MAX_PER_BLOCK as u64)),
-                ("open_per_block", Json::u(if reserved.is_some() { da::OPEN_PER_BLOCK } else { da::MAX_PER_BLOCK } as u64)),
-                ("reserved_per_block", Json::u(if reserved.is_some() { da::RESERVED_PER_BLOCK as u64 } else { 0 })),
-                ("reserved_key", reserved.as_ref().map_or(Json::Null, |k| Json::hex(k))),
-                ("reserved_slot_epoch", if bloch_pos_committee::params::L2_DA_RESERVED_SLOT_EPOCH == u64::MAX {
-                    Json::Null
-                } else {
-                    Json::u(bloch_pos_committee::params::L2_DA_RESERVED_SLOT_EPOCH)
-                }),
-                ("registered_key", da::registered_key().as_ref().map_or(Json::Null, |k| Json::hex(k))),
-            ])
-        }),
         // Retained L1 data-availability records (M3), oldest first.
         ("data_availability", Json::Arr(l2.data_availability().iter().map(|r| Json::obj(vec![
             ("l2_number", Json::u(r.l2_number)), ("commitment", Json::hex(&r.commitment)),
@@ -3865,79 +4108,5 @@ pub fn l2_settlement_json_with(
         ("accepted", l2.head().map_or(Json::Null, |(commitment, statement)| Json::obj(vec![
             ("commitment", Json::hex(&commitment)), ("statement", Json::s(crate::codec::hex(&statement))),
         ]))),
-    ]);
-    // L1 forced inclusion (candidate): present only once the queue is enabled,
-    // so the response keeps its exact fields while the gate is inert.
-    if let (Json::Obj(fields), Some(queue)) = (&mut out, l2.forced_queue()) {
-        fields.push(("forced".to_string(), l2_forced_json_with(queue, envelope)));
-    }
-    // The compiled head resets (one may ship with the swap, one with the
-    // rollback) and whether each would apply to this state NOW. Present only
-    // when the release compiles a reset, so the response keeps its exact
-    // fields otherwise. A refused reset leaves the head where it is while the
-    // program still moves, so read this before the gate: `would_apply: false`
-    // with `pending: true` means the gate will not move the head. After its
-    // gate (`pending: false`) an entry is only what a second run would do;
-    // the node logs the outcome at the gate (`head_reset_log_line`).
-    let resets = l2.head_reset_reports();
-    if let (Json::Obj(fields), false) = (&mut out, resets.is_empty()) {
-        fields.push(("head_resets".to_string(), Json::Arr(resets.iter().map(head_reset_json).collect())));
-    }
-    out
-}
-
-/// `getl2settlement.forced`: the queue, and the records the next settlement
-/// must consume, in order (`due`), with the `deposits_hash` slot they need.
-#[cfg(test)]
-pub(crate) fn l2_forced_json(queue: &bloch_pos_committee::l2_settlement::forced::Queue) -> Json {
-    l2_forced_json_with(queue, &|_, _| None)
-}
-
-/// One due record. `envelope` is the signed L2 envelope (hex) read from its
-/// L1 transaction, which a producer, settler or rebuilder needs to run it; it
-/// is `null` when the block is not readable here or the bytes do not hash to
-/// the record (never trusted: the guest checks the hash again).
-pub(crate) fn l2_forced_record_json(
-    r: &bloch_pos_committee::l2_settlement::forced::Record,
-    envelope: &ForcedEnvelopeLookup<'_>,
-) -> Json {
-    use sha3::{Digest, Keccak256};
-    let bytes = envelope(r.height, &r.l1_txid)
-        .filter(|bytes| <[u8; 32]>::from(Keccak256::digest(bytes)) == r.envelope_hash);
-    Json::obj(vec![
-        ("height", Json::u(r.height)), ("l1_txid", Json::hex(&r.l1_txid)),
-        ("envelope_hash", Json::hex(&r.envelope_hash)), ("gas_limit", Json::u(r.gas_limit)),
-        ("envelope", bytes.map_or(Json::Null, |b| Json::s(crate::codec::hex(&b)))),
-    ])
-}
-
-pub(crate) fn l2_forced_json_with(
-    queue: &bloch_pos_committee::l2_settlement::forced::Queue,
-    envelope: &ForcedEnvelopeLookup<'_>,
-) -> Json {
-    use bloch_pos_committee::l2_settlement::forced;
-    let record = |r: &forced::Record| l2_forced_record_json(r, envelope);
-    let pending = queue.pending().len() as u64;
-    let weight = queue.pending_weight();
-    Json::obj(vec![
-        ("queued", Json::u(queue.queued())), ("consumed", Json::u(queue.consumed())),
-        ("pending", Json::u(pending)), ("pending_weight", Json::u(weight)),
-        ("max_pending_weight", Json::u(forced::MAX_PENDING_WEIGHT)), ("root", Json::hex(&queue.root())),
-        ("due", Json::Arr(queue.due().iter().map(record).collect())),
-        ("due_hash", Json::hex(&forced::hash(queue.due()))),
-        // What the next weight unit (a transfer that closes no group) pays on
-        // top of its fee; null when full. Each unit is priced at its own
-        // position, and a record also pays for the room it leaves in the group
-        // it closes: `transfer_surcharge_sat` and `max_gas_surcharge_sat` are
-        // the exact charges now for 21k and 300k of declared gas. Wallets sign
-        // a maximum (`bloch-pos l2-forced prepare --pending-weight`) and get the
-        // rest back; the charge goes to the protocol treasury.
-        ("next_surcharge_sat", forced::surcharge_sat(weight, 1).map_or(Json::Null, |v| Json::sat(u128::from(v)))),
-        ("transfer_surcharge_sat", queue.surcharge_for(forced::MIN_GAS).map_or(Json::Null, |v| Json::sat(u128::from(v)))),
-        ("max_gas_surcharge_sat", queue.surcharge_for(forced::MAX_GAS).map_or(Json::Null, |v| Json::sat(u128::from(v)))),
-        // A record ending at position p is consumed by the ceil(p / 14)-th
-        // settlement anchored after it: the bound for a record queued now.
-        ("drain_settlements", Json::u(weight.div_ceil(forced::UNITS_PER_SETTLEMENT))),
-        ("treasury", forced::treasury().map_or(Json::Null, |t| Json::hex(&t))),
     ])
 }

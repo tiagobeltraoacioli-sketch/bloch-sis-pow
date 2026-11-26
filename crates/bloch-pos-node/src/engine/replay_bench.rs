@@ -672,7 +672,6 @@ pub(super) fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         mempool_admitted_at: BTreeMap::new(),
         mempool_expired: 0,
         mempool_evicted_low_fee: 0,
-        l2_brake: crate::l2_brake::BrakeCell::disabled(),
         // O cache de recusa (2026-08-30): o replay nao propoe, entao nunca
         // bane nada — o campo existe para o tipo, sempre vazio aqui.
         rejected: BTreeMap::new(),
@@ -703,6 +702,9 @@ pub(super) fn boot_engine(manifest: Manifest, dir: &Path) -> Engine {
         orphans_evicted: 0,
         orphans_admitted: 0,
         blocks_pruned: 0,
+        rejected_below_finality: 0,
+        finalized_sweep: None,
+        finalized_sweeps: 0,
         proposal_admission_seen: BTreeMap::new(),
         proposal_admission_counts: BTreeMap::new(),
         rejected_unsigned: 0,

@@ -70,6 +70,12 @@ struct Cli {
     testnet: bool,
     #[arg(long, global = true, default_value = "http://127.0.0.1:16210")]
     rpc: String,
+    /// Allow `--rpc` to name a host that is not this machine. The transport is
+    /// plain HTTP with no authentication: anyone on the path can read the
+    /// request and forge the node's answers, including the UTXO values that
+    /// `send` computes change from.
+    #[arg(long, global = true)]
+    allow_insecure_rpc: bool,
 }
 
 #[derive(Subcommand)]
@@ -190,7 +196,7 @@ pub fn main() {
 
         Cmd::Balance { address } => {
             print!("  {}querying node...{}\r", MUTED, RESET);
-            let resp = rpc_call(&cli.rpc, "getbalance",
+            let resp = rpc_call(&cli.rpc, cli.allow_insecure_rpc, "getbalance",
                 serde_json::json!([address]));
 
             match resp.get("error") {
@@ -232,7 +238,7 @@ pub fn main() {
 
             // 1. Fetch UTXOs via getutxos (returns full UTXO list for coin selection)
             print!("  {}fetching UTXOs...{}\r", MUTED, RESET);
-            let resp = rpc_call(&cli.rpc, "getutxos",
+            let resp = rpc_call(&cli.rpc, cli.allow_insecure_rpc, "getutxos",
                 serde_json::json!([kp.address]));
 
             if let Some(e) = resp.get("error") {
@@ -280,7 +286,7 @@ pub fn main() {
             let raw = tx.to_stratum_bytes(true);
 
             print!("  {}broadcasting via sendrawtransaction...{}\r", MUTED, RESET);
-            let resp2 = rpc_call(&cli.rpc, "sendrawtransaction",
+            let resp2 = rpc_call(&cli.rpc, cli.allow_insecure_rpc, "sendrawtransaction",
                 serde_json::json!([hex::encode(&raw)]));
 
             match resp2.get("error") {
@@ -376,7 +382,7 @@ pub fn main() {
             let mut total: u64 = 0;
             for (index, addr) in &verified.addresses {
                 let addr_str = addr.to_string();
-                let resp = rpc_call(&cli.rpc, "getbalance", serde_json::json!([addr_str]));
+                let resp = rpc_call(&cli.rpc, cli.allow_insecure_rpc, "getbalance", serde_json::json!([addr_str]));
                 match resp.get("error") {
                     Some(e) if !e.is_null() =>
                         label(&format!("index {}", index), &red(&format!("RPC error: {}", e))),
@@ -549,8 +555,46 @@ fn prompt_new_password() -> zeroize::Zeroizing<String> {
     }
 }
 
-fn rpc_call(endpoint: &str, method: &str, params: serde_json::Value) -> serde_json::Value {
+/// Whether an RPC authority (`host:port`, `[v6]:port` or a bare host) names
+/// this machine: `localhost` or a loopback IP literal. Names are not resolved,
+/// so a hostname that merely resolves to loopback does not count.
+fn rpc_authority_is_loopback(authority: &str) -> bool {
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((host, _)) => host,
+            None => return false,
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            // More than one colon without brackets is a bare IPv6 literal.
+            Some((host, _)) if !host.contains(':') => host,
+            _ => authority,
+        }
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The RPC transport is unauthenticated plain HTTP, so by default it is only
+/// used towards this machine; anything else needs `--allow-insecure-rpc`.
+fn checked_rpc_authority(endpoint: &str, allow_insecure: bool) -> Result<&str, String> {
     let authority = endpoint.strip_prefix("http://").unwrap_or(endpoint).trim_end_matches('/');
+    if allow_insecure || rpc_authority_is_loopback(authority) {
+        Ok(authority)
+    } else {
+        Err(format!(
+            "refusing plain-HTTP RPC to `{authority}`: it is not a loopback address, and this \
+             transport has no TLS and no authentication (a forged getutxos answer makes `send` \
+             overpay the fee). Use a local node or a local tunnel, or pass --allow-insecure-rpc"
+        ))
+    }
+}
+
+fn rpc_call(endpoint: &str, allow_insecure: bool, method: &str, params: serde_json::Value) -> serde_json::Value {
+    let authority = match checked_rpc_authority(endpoint, allow_insecure) {
+        Ok(authority) => authority,
+        Err(message) => err(&message),
+    };
     crate::wallet::http_rpc::call(authority, method, &params, None)
         .unwrap_or_else(|error| serde_json::json!({"error":error}))
 }
@@ -587,6 +631,24 @@ fn parse_send_utxos(response: &serde_json::Value) -> Result<Vec<(Vec<u8>, u32, c
 #[cfg(test)]
 mod audit_cli_input_tests {
     use super::*;
+
+    #[test]
+    fn rpc_to_a_non_loopback_host_needs_the_explicit_flag() {
+        for local in ["127.0.0.1:16210", "127.9.9.9:1", "localhost:16210", "LOCALHOST", "[::1]:16210", "::1"] {
+            assert!(rpc_authority_is_loopback(local), "{local}");
+        }
+        for remote in [
+            "10.0.0.5:16210", "node.example:16210", "0.0.0.0:16210", "[2001:db8::1]:16210",
+            "localhost.example:16210", "127.0.0.1.example:16210", "[::1", "",
+        ] {
+            assert!(!rpc_authority_is_loopback(remote), "{remote}");
+        }
+        assert_eq!(checked_rpc_authority("http://127.0.0.1:16210/", false), Ok("127.0.0.1:16210"));
+        assert!(checked_rpc_authority("http://10.0.0.5:16210", false)
+            .unwrap_err()
+            .contains("--allow-insecure-rpc"));
+        assert_eq!(checked_rpc_authority("http://10.0.0.5:16210", true), Ok("10.0.0.5:16210"));
+    }
     use crate::address::{Address, Network};
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use sha3::{Digest, Sha3_256};

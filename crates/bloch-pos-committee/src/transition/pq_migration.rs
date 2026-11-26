@@ -158,6 +158,9 @@ pub enum PqMigrationReject {
     NotHashBased,
     /// The rotation would not change the credential.
     Unchanged,
+    /// Audit L1S-02, behind `CREDENTIAL_ROTATION_LIMIT_ACTIVATION_EPOCH`:
+    /// this validator's credential was already rotated in this epoch.
+    AlreadyRotated,
     Signature,
     NewKeySignature,
     /// After the emergency, a lattice-key spend/rotation without a rescue.
@@ -455,6 +458,13 @@ impl CommittedState {
         if new_credential == current {
             return Err(R::Unchanged);
         }
+        // Audit L1S-02: the message pays no fee and "differs from the
+        // current credential" lets two keys rotate A -> B -> A without
+        // limit. One rotation per validator per epoch. Inert below the gate.
+        let limited = crate::params::credential_rotation_limit_active(self.epoch);
+        if limited && self.credential_rotation_epochs.get(&tx.validator) == Some(&self.epoch) {
+            return Err(R::AlreadyRotated);
+        }
         // After the emergency a lattice signature authorises nothing by
         // itself: the rotation must cite a commitment made while the key
         // was still secret.
@@ -490,6 +500,9 @@ impl CommittedState {
         }
         let record = self.validators.get_mut(&tx.validator).ok_or(R::Validator)?;
         record.withdrawal_credentials = new_credential.to_vec();
+        if limited {
+            self.credential_rotation_epochs.insert(tx.validator, self.epoch);
+        }
         Ok(Self::rotation_charge(self.epoch, tx))
     }
 

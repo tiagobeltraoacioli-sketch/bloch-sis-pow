@@ -172,7 +172,6 @@ What the binary now does when it meets a block it cannot apply:
 | `l2_deposit` | funding inputs | change at vout 0 when nonzero | `l2_escrow_in_sat` |
 | `l2_data_availability` | funding inputs | change at vout 0 when nonzero | none |
 | `l2_withdraw_claim` | funding inputs | release at vout 0, change at vout 1 when nonzero | `l2_escrow_out_sat` |
-| `l2_forced_transaction` (0x1C, December L2 line, inert) | funding inputs | change at vout 0, surcharge refund at vout 1, treasury surcharge at vout 2, each when nonzero; values from the replay receipt | none |
 
 The escrow is L2 state, not an output: vout 1 of a deposit names the inbox record
 and `/outpoint` answers 404 for it. Replay also verifies settlement proofs, with

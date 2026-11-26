@@ -143,8 +143,6 @@ pub mod l2_da;
 pub use l2_da::{L2DataAvailability, L2DataAvailabilityReject};
 pub mod l2_claim;
 pub use l2_claim::{L2WithdrawClaim, L2WithdrawClaimReject};
-pub mod l2_forced;
-pub use l2_forced::{L2ForcedTransaction, L2ForcedTransactionReject};
 pub mod pq_migration;
 pub use pq_migration::{
     PqMigrationReject, RescueCommit, RescueReveal, WithdrawalCredentialRotation,
@@ -330,9 +328,6 @@ pub enum PosTransaction {
     /// Release one settled, matured L2 withdrawal from escrow to its L1
     /// recipient (0x16, development networks with `devnet-l2-user-txs`).
     L2WithdrawClaim(L2WithdrawClaim),
-    /// Queue one L2 transaction for forced inclusion (0x1C). INERT until
-    /// `params::L2_FORCED_INCLUSION_EPOCH`.
-    L2ForcedTransaction(L2ForcedTransaction),
     /// Rotate a validator's withdrawal credential to a hash-based-suite key
     /// (0x18). INERT until `params::HF3_PQ_MIGRATION_EPOCH`.
     WithdrawalCredentialRotation(WithdrawalCredentialRotation),
@@ -748,7 +743,6 @@ impl PosTransaction {
             PosTransaction::L2Deposit(tx) => return tx.intent_root(),
             PosTransaction::L2DataAvailability(tx) => return tx.intent_root(),
             PosTransaction::L2WithdrawClaim(tx) => return tx.intent_root(),
-            PosTransaction::L2ForcedTransaction(tx) => return tx.intent_root(),
             PosTransaction::WithdrawalCredentialRotation(tx) => return tx.signing_root(),
             PosTransaction::RescueCommit(tx) => return tx.signing_root(),
             PosTransaction::RescueReveal(tx) => return tx.signing_root(),
@@ -925,7 +919,6 @@ impl PosTransaction {
             PosTransaction::L2Deposit(tx) => return tx.canonical_bytes(),
             PosTransaction::L2DataAvailability(tx) => return tx.canonical_bytes(),
             PosTransaction::L2WithdrawClaim(tx) => return tx.canonical_bytes(),
-            PosTransaction::L2ForcedTransaction(tx) => return tx.canonical_bytes(),
             PosTransaction::WithdrawalCredentialRotation(tx) => return tx.canonical_bytes(),
             PosTransaction::RescueCommit(tx) => return tx.canonical_bytes(),
             PosTransaction::RescueReveal(tx) => return tx.canonical_bytes(),
@@ -1153,9 +1146,6 @@ impl PosTransaction {
             l2_deposit::L2_DEPOSIT_TAG => PosTransaction::L2Deposit(L2Deposit::decode(&mut r)?),
             l2_da::L2_DATA_AVAILABILITY_TAG => PosTransaction::L2DataAvailability(L2DataAvailability::decode(&mut r)?),
             l2_claim::L2_WITHDRAW_CLAIM_TAG => PosTransaction::L2WithdrawClaim(L2WithdrawClaim::decode(&mut r)?),
-            l2_forced::L2_FORCED_TRANSACTION_TAG => {
-                PosTransaction::L2ForcedTransaction(L2ForcedTransaction::decode(&mut r)?)
-            }
             pq_migration::WITHDRAWAL_CREDENTIAL_ROTATION_TAG => PosTransaction::WithdrawalCredentialRotation(
                 WithdrawalCredentialRotation::decode(&mut r)?,
             ),
@@ -1378,7 +1368,6 @@ pub enum TxReject {
     L2Deposit(L2DepositReject),
     L2DataAvailability(L2DataAvailabilityReject),
     L2WithdrawClaim(L2WithdrawClaimReject),
-    L2ForcedTransaction(L2ForcedTransactionReject),
     /// A post-quantum migration rule (credential rotation, lattice-spend
     /// freeze, rescue commit/reveal) refused the transaction.
     PqMigration(PqMigrationReject),
@@ -1919,6 +1908,13 @@ pub struct CommittedState {
     /// and at the start of every epoch. An empty map adds no state-root
     /// leaf and no local-cache section.
     commission_update_epochs: BTreeMap<u32, u64>,
+    /// Validator → the epoch of its `WithdrawalCredentialRotation` in the
+    /// current epoch (audit L1S-02). Written only behind
+    /// `params::CREDENTIAL_ROTATION_LIMIT_ACTIVATION_EPOCH` and emptied at
+    /// every epoch boundary, exactly like `commission_update_epochs`: empty
+    /// on every state below the gate, no state-root leaf and no local-cache
+    /// section while empty.
+    credential_rotation_epochs: BTreeMap<u32, u64>,
     /// Forward-secure validator keys (`crate::kes`): registered once by wire
     /// 0x17, replaced only by a leaf-signed `KesRotate`. Each entry is the key
     /// in force and at most one successor (`crate::kes::KesEntry`). Committed
@@ -2542,6 +2538,7 @@ impl CommittedState {
             l2_settlement: None,
             pq_rescue_commits: BTreeMap::new(),
             commission_update_epochs: BTreeMap::new(),
+            credential_rotation_epochs: BTreeMap::new(),
             kes: BTreeMap::new(),
             kes_enforced_from: None,
             issued_sat: tokenomics_v4::GENESIS_ISSUED_SAT,
@@ -3320,6 +3317,7 @@ impl CommittedState {
         }
         crate::state_root::insert_pq_rescue_commits(&mut tree, &self.pq_rescue_commits);
         crate::state_root::insert_commission_update_epochs(&mut tree, &self.commission_update_epochs);
+        crate::state_root::insert_credential_rotation_epochs(&mut tree, &self.credential_rotation_epochs);
         tree
     }
 
@@ -3735,6 +3733,30 @@ impl CommittedState {
             )
     }
 
+    /// Node-local packing aid (audit L1S-02): the block capacity a ZERO-FEE
+    /// message takes in `epoch`, or `None` for a class that pays a base fee
+    /// and for L2 settlements (which are proposed alone). An upper bound for
+    /// every class but the credential rotation, which is exact: the
+    /// proposer budgets free messages with it. Not used by the transition.
+    pub fn zero_fee_capacity(epoch: u64, tx: &PosTransaction) -> Option<fee_market::TxCharge> {
+        match tx {
+            PosTransaction::Transfer { .. }
+            | PosTransaction::TransferV2 { .. }
+            | PosTransaction::FundedDeposit(_)
+            | PosTransaction::FundedDelegate(_)
+            | PosTransaction::FundedDelegationWithdraw(_)
+            | PosTransaction::L2Deposit(_)
+            | PosTransaction::L2DataAvailability(_)
+            | PosTransaction::L2WithdrawClaim(_)
+            | PosTransaction::RescueReveal(_)
+            | PosTransaction::L2Settlement(_)
+            | PosTransaction::L2SettlementAsync(_) => None,
+            PosTransaction::WithdrawalCredentialRotation(rotation) => Some(Self::rotation_charge(epoch, rotation)),
+            // No lifecycle message verifies more than two hybrid signatures.
+            _ => Some(Self::staking_tx_charge(epoch, 2, tx.canonical_bytes().len())),
+        }
+    }
+
     /// R7 M1: the charge a staking-class transaction owes for its own bytes
     /// and its own signature-verification cost. `free` (all zero) below
     /// [`Self::staking_tx_metering_active`] — matching the chain as it
@@ -3840,8 +3862,18 @@ impl CommittedState {
                 state.apply(settlement, *self.head.as_bytes(), self.slot, asynchronous, verifier).map_err(TxReject::L2Settlement)?;
                 // Protocol-only empty-inbox transaction: no synthetic fee credit.
                 // One verification reserves the complete block gas budget.
+                //
+                // Review B8 asked whether that is a monopoly that should be
+                // metered down. Measured (2026-11-25, aarch64, release): one
+                // SP1 Groth16 verification takes about 0.49 s against 0.2 ms
+                // for one hybrid signature verification, a ratio near 2,370.
+                // At `HYBRID_VERIFY_GAS` that is roughly 170 M gas, almost
+                // three times `BLOCK_GAS_LIMIT`. Charging what is used, the
+                // rule Ethereum and Solana price by, therefore gives the whole
+                // block: this charge is a floor on the real cost, not a
+                // surcharge. It can come down only when the verifier does.
                 Ok(fee_market::TxCharge { gas: fee_market::BLOCK_GAS_LIMIT,
-                    tx_bytes: (1 + 32 + settlement.statement.len() + crate::l2_settlement::PROOF_BYTES) as u64,
+                    tx_bytes: settlement.wire_len() as u64,
                     base_fee_sat: 0, priority_fee_sat: 0 })
             }
             PosTransaction::Withdraw { validator } => self.apply_withdrawal(*validator, tx),
@@ -3869,9 +3901,6 @@ impl CommittedState {
             PosTransaction::L2WithdrawClaim(claim) => self
                 .apply_l2_withdraw_claim(claim, base_fee_millisat_per_gas, verifier)
                 .map_err(TxReject::L2WithdrawClaim),
-            PosTransaction::L2ForcedTransaction(forced) => self
-                .apply_l2_forced_transaction(forced, base_fee_millisat_per_gas, verifier)
-                .map_err(TxReject::L2ForcedTransaction),
             PosTransaction::WithdrawalCredentialRotation(rotation) => self
                 .apply_withdrawal_credential_rotation(rotation, verifier)
                 .map_err(TxReject::PqMigration),
@@ -4335,10 +4364,15 @@ impl CommittedState {
         signature: &[u8],
         verifier: &dyn SignatureVerifier,
     ) -> Result<(), TxReject> {
+        // Read before the check: both are pure functions of this state.
+        let correction = self.kes_correction_open(validator);
         let public = self.check_kes_register(validator, depth, root, signature, verifier)?;
         // A rescue keeps the expired key in the history (review R-1), so
-        // evidence it signed stays provable.
+        // evidence it signed stays provable. A pre-bind correction (audit
+        // L1C-61) replaces a tree that never signed anything consensus
+        // accepts: the corrected entry is the new tree alone.
         let entry = match self.kes.get(&validator) {
+            Some(_) if correction => public.into(),
             Some(old) => old.replaced_by(public, crate::params::kes_period(self.epoch).unwrap_or(0)),
             None => public.into(),
         };
@@ -4379,7 +4413,24 @@ impl CommittedState {
             (true, Some(p)) => p.saturating_add(1),
             _ => 0,
         };
-        if let Some(entry) = self.kes.get(&validator) {
+        // Audit L1C-61, behind `KES_PREBIND_CORRECTION_ACTIVATION_EPOCH`
+        // (inert): the tree a pre-bind correction replaces. `None` on every
+        // other path, which is then exactly the code below as it was.
+        let corrected = self
+            .kes
+            .get(&validator)
+            .filter(|_| self.kes_correction_open(validator))
+            .map(|entry| entry.current);
+        if let Some(replaced) = corrected {
+            if replaced.root == *root {
+                return Err(TxReject::StakingRule);
+            }
+            start_period = crate::params::KES_CORRECTED_START_PERIOD;
+            // Never a tree that is already expired at inclusion.
+            if crate::kes::KesPublic::new(depth, *root, start_period).leaf_index(period.unwrap_or(0)).is_none() {
+                return Err(TxReject::StakingRule);
+            }
+        } else if let Some(entry) = self.kes.get(&validator) {
             // Registration is once-only, except as a RESCUE (readiness B3):
             // after KES binds, once the key in force has EXPIRED with no
             // successor pending, the static key may register a fresh tree,
@@ -4407,7 +4458,10 @@ impl CommittedState {
         // one captured from the chain cannot be rebroadcast into a later
         // rescue window once its tree has left the pruned history. Before the
         // flag day it is the legacy message, byte for byte.
-        let message = crate::kes::register_signing_root_at(&domain, validator, &public, self.epoch);
+        let message = match corrected {
+            Some(replaced) => crate::kes::correct_signing_root(&domain, validator, self.epoch, &replaced, &public),
+            None => crate::kes::register_signing_root_at(&domain, validator, &public, self.epoch),
+        };
         if !verifier.verify_with_key(&rec.pubkey, &message, signature) {
             return Err(TxReject::StakingRule);
         }
@@ -4517,6 +4571,27 @@ impl CommittedState {
         let bound = self.kes_enforced_from.is_some_and(|from| self.epoch >= from);
         let p = crate::params::kes_period(self.epoch).unwrap_or(0);
         bound && p >= entry.in_force(p).end_period() && entry.pending_at(p).is_none()
+    }
+
+    /// May `validator` CORRECT its registered tree with its static key now
+    /// (audit L1C-61, [`crate::params::KES_PREBIND_CORRECTION_ACTIVATION_EPOCH`])?
+    /// Only with the gate in force, while the bind is not yet decided, at
+    /// global period [`crate::params::KES_CORRECTED_START_PERIOD`] or later,
+    /// and for a first, uncorrected tree (start period 0, no successor, no
+    /// history): once per validator. The one rule `check_kes_register` and
+    /// the node's mempool dedupe share. Always false while the gate is
+    /// inert.
+    pub fn kes_correction_open(&self, validator: u32) -> bool {
+        if !crate::params::kes_prebind_correction_active(self.epoch) || self.kes_enforced_from.is_some() {
+            return false;
+        }
+        let Some(entry) = self.kes.get(&validator) else {
+            return false;
+        };
+        crate::params::kes_period(self.epoch).is_some_and(|p| p >= crate::params::KES_CORRECTED_START_PERIOD)
+            && entry.current.start_period == 0
+            && entry.next.is_none()
+            && entry.retired.is_empty()
     }
 
     /// The epoch KES enforcement bound on chain, if it has.
@@ -5205,7 +5280,14 @@ impl CommittedState {
         let mut exposure: Vec<Delegation> = Vec::with_capacity(self.delegations.len());
         for d in &self.delegations {
             let mut view = *d;
-            if registry.state_of(d) == delegation::StakeState::Inactive {
+            // L1S-01 (gated): past the nominal cool-down a position may still
+            // be draining behind the churn budget. It then still carries
+            // weight and earns, so it stays exposed; the activated amount
+            // below is zero once it has drained, which is all the mask was
+            // for.
+            if !crate::params::slash_draining_stake_active(self.epoch)
+                && registry.state_of(d) == delegation::StakeState::Inactive
+            {
                 view.eligible = false;
             }
             // R1 M6: price the penalty on ACTIVATED stake, never the nominal
@@ -6220,6 +6302,8 @@ impl CommittedState {
         // DET-3: the one-update-per-epoch record only speaks about the epoch
         // that just closed (no-op on the empty pre-gate map).
         st.commission_update_epochs.clear();
+        // L1S-02: the same for the one-rotation-per-epoch record.
+        st.credential_rotation_epochs.clear();
         // HF3 KES: enforcement is decided at the first boundary past the
         // compiled gate where registered keys cover the stake threshold
         // (review F-2), and takes effect `KES_BIND_DELAY_EPOCHS` later, so a
@@ -6247,27 +6331,29 @@ impl CommittedState {
                 }
             }
         }
-        // The next L2 program. Inert while `L2_NEXT_PROGRAM_EPOCH` is the
-        // sentinel; L2 bytes are unchanged below the gate and on any other L2.
-        if crate::params::l2_next_program_active(next_epoch) {
+        // Audit L2N-01 (gated): an installed L2 without a settler set
+        // installs the pinned one; from then on its settlements need a
+        // registered settler's authorization. Inert while
+        // `L2_SETTLER_AUTHORIZATION_ACTIVATION_EPOCH` is the sentinel.
+        if crate::params::l2_settler_authorization_active(next_epoch) {
             if let Some(l2) = st.l2_settlement.as_mut() {
-                l2.install_next_program();
+                if l2.settlers().is_empty() {
+                    if let Some(keys) = crate::l2_settlement::settler_set_for(l2.policy()) {
+                        l2.install_settlers(keys);
+                    }
+                }
             }
         }
-        // Its rollback, after the swap so that an order of the two gates is the
-        // only order. Inert while `L2_PROGRAM_ROLLBACK_EPOCH` is the sentinel.
-        if crate::params::l2_program_rollback_active(next_epoch) {
+        // Audit L2N-01, the proper fix (gated): an installed L2 whose policy
+        // names the program a pinned switch replaces names its successor
+        // from this boundary on. The boundary block's own transactions are
+        // already judged under the new program; there is no overlap. Inert
+        // while `L2_SETTLEMENT_PROGRAM_SWITCH_ACTIVATION_EPOCH` is the
+        // sentinel. After the installation above, so an L2 installed behind
+        // both gates switches at the same boundary.
+        if crate::params::l2_settlement_program_switch_active(next_epoch) {
             if let Some(l2) = st.l2_settlement.as_mut() {
-                l2.install_fallback_program();
-            }
-        }
-        // L1 forced inclusion, after the swap so that a gate at the swap's
-        // epoch sees the new configuration. Enables once, only on an L2 whose
-        // configuration implements it. Inert while
-        // `L2_FORCED_INCLUSION_EPOCH` is the sentinel: no queue, L2 bytes unchanged.
-        if crate::params::l2_forced_inclusion_active(next_epoch) {
-            if let Some(l2) = st.l2_settlement.as_mut() {
-                l2.enable_forced_inclusion();
+                l2.switch_program();
             }
         }
         // Claim finality on this chain (HF1_CLAIM_FINALITY_EPOCH):
@@ -6957,6 +7043,9 @@ impl<V: SignatureVerifier> Transition<V> {
         let mut priority_fees: u128 = 0;
         let mut block_gas: u64 = 0;
         let mut block_bytes: u64 = 0;
+        // L1S-02 (gated): the part of the usage that paid a fee.
+        let mut paid_gas: u64 = 0;
+        let mut paid_bytes: u64 = 0;
         // Satoshis this block bonds without spending an output. See the
         // conservation check at step 11b.
         // The parent is already committed. Pin it before transactions, and keep
@@ -6970,20 +7059,32 @@ impl<V: SignatureVerifier> Transition<V> {
         }
         // DA batches per block are capped like blobs: it bounds the retained
         // DA records (`l2_settlement::da::MAX_RECORDS`) independently of fees.
-        // Past `params::L2_DA_RESERVED_SLOT_EPOCH`, one of those slots is the
-        // registered key's (`da::block_admits`); below it this is the old cap.
-        if !crate::l2_settlement::da::block_admits(
-            block_epoch,
-            transactions.iter().filter_map(|tx| match tx {
-                PosTransaction::L2DataAvailability(da) => Some(da.funding_pubkey.as_slice()),
-                _ => None,
-            }),
-        ) {
+        if transactions.iter().filter(|tx| matches!(tx, PosTransaction::L2DataAvailability(_))).count()
+            > crate::l2_settlement::da::MAX_PER_BLOCK
+        {
             return Err(TransitionError::BlockGasLimitExceeded);
         }
-        // Forced L2 transactions per block are capped the same way.
-        if transactions.iter().filter(|tx| matches!(tx, PosTransaction::L2ForcedTransaction(_))).count()
-            > crate::l2_settlement::forced::MAX_PER_BLOCK
+        // L1X-04 (gated): on an L2 with a settler set, DA batches from other
+        // keys leave one place of the block to the settler. Judged on the
+        // set before the block's transactions; a settlement (the only thing
+        // that changes the set) takes its whole block, so the set cannot
+        // move under a DA batch.
+        if crate::params::l2_da_settler_slot_active(block_epoch) {
+            if let Some(l2) = st.l2_settlement.as_ref().filter(|l2| !l2.settlers().is_empty()) {
+                let others = transactions
+                    .iter()
+                    .filter(|tx| matches!(tx, PosTransaction::L2DataAvailability(batch) if !l2.is_settler_key(&batch.funding_pubkey)))
+                    .count();
+                if others > crate::l2_settlement::da::MAX_PER_BLOCK - crate::l2_settlement::da::RESERVED_FOR_SETTLER {
+                    return Err(TransitionError::BlockGasLimitExceeded);
+                }
+            }
+        }
+        // L1X-02 (gated): deposits per block are capped like DA batches, so
+        // the inbox cannot grow faster than settlements consume it.
+        if crate::params::l2_deposit_inflow_bound_active(block_epoch)
+            && transactions.iter().filter(|tx| matches!(tx, PosTransaction::L2Deposit(_))).count()
+                > crate::l2_settlement::MAX_DEPOSITS_PER_BLOCK
         {
             return Err(TransitionError::BlockGasLimitExceeded);
         }
@@ -7093,6 +7194,10 @@ impl<V: SignatureVerifier> Transition<V> {
                     priority_fees += charge.priority_fee_sat;
                     block_gas = block_gas.saturating_add(charge.gas);
                     block_bytes = block_bytes.saturating_add(charge.tx_bytes);
+                    if charge.base_fee_sat != 0 || charge.priority_fee_sat != 0 {
+                        paid_gas = paid_gas.saturating_add(charge.gas);
+                        paid_bytes = paid_bytes.saturating_add(charge.tx_bytes);
+                    }
                     // Bonding that funds itself from nothing, measured where
                     // it happens. `Deposit` and `Delegate` name an
                     // `amount_sat` and spend no output, so an admitted one
@@ -7173,8 +7278,25 @@ impl<V: SignatureVerifier> Transition<V> {
         // The fee-market leaf this block commits: the price it charged and the
         // usage the next block's controller reads.
         st.base_fee_millisat_per_gas = base_fee;
-        st.block_gas_used = block_gas;
-        st.block_tx_bytes = block_bytes;
+        if crate::params::fee_controller_paid_usage_active(block_epoch) {
+            // L1S-02: only usage that paid moves the next base fee. A
+            // settlement block is neutral (exactly at target): the
+            // settlement is free and displaced everything else, so it says
+            // nothing about demand in either direction.
+            let settles = transactions.iter().any(|tx| {
+                matches!(tx, PosTransaction::L2Settlement(_) | PosTransaction::L2SettlementAsync(_))
+            });
+            if settles {
+                st.block_gas_used = fee_market::BLOCK_GAS_TARGET;
+                st.block_tx_bytes = 0;
+            } else {
+                st.block_gas_used = paid_gas;
+                st.block_tx_bytes = paid_bytes;
+            }
+        } else {
+            st.block_gas_used = block_gas;
+            st.block_tx_bytes = block_bytes;
+        }
 
         // 11b. SUPPLY CONSERVATION — the invariant that says nothing minted
         //      from nothing (2026-09-03). The hard cap at step 3c watches the
@@ -16370,10 +16492,6 @@ mod tests {
             PosTransaction::L2Deposit(_) => {}
             // A DA batch only pays fees from its inputs; nothing is issued.
             PosTransaction::L2DataAvailability(_) => {}
-            // A forced L2 transaction pays fees from its inputs and moves the
-            // charged surcharge to a treasury output (the rest of its signed
-            // maximum back to the payer); nothing is issued.
-            PosTransaction::L2ForcedTransaction(_) => {}
             // A claim moves escrowed value (counted in the accounted
             // supply) to an output; its fee comes from the relayer's inputs.
             PosTransaction::L2WithdrawClaim(_) => {}

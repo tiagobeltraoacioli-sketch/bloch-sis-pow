@@ -44,20 +44,26 @@ pub(super) struct GossipVerifier<V> {
 }
 
 /// Independent per-slot allowances. Votes and transactions can never spend
-/// the units a block needs, and gossiped blocks can never spend the units
-/// reserved for directed sync and operator-configured peers.
+/// the units a block needs, gossiped blocks can never spend the units
+/// reserved for directed sync and operator-configured peers, and (audit
+/// L1N-02) transactions can never spend the units a vote needs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum VerificationLane {
-    /// Attestations, transactions and slashing evidence.
+    /// Transactions and slashing evidence.
     Relay,
+    /// Attestations (audit L1N-02). They used to share [`Self::Relay`] with
+    /// transactions, which anyone can have verified: eight source addresses
+    /// spent the whole allowance each slot with valid signatures that cost
+    /// them nothing, and every vote that still needed a check was dropped.
+    Vote,
     /// Blocks from ordinary gossip.
     GossipBlock,
     /// Blocks from directed sync or an operator-configured peer.
     DirectedBlock,
 }
 
-const LANES: usize = 3;
-const FAILURE_GROUPS: usize = 2;
+const LANES: usize = 4;
+const FAILURE_GROUPS: usize = 3;
 
 impl VerificationLane {
     fn index(self) -> usize {
@@ -65,15 +71,18 @@ impl VerificationLane {
             VerificationLane::Relay => 0,
             VerificationLane::GossipBlock => 1,
             VerificationLane::DirectedBlock => 2,
+            VerificationLane::Vote => 3,
         }
     }
 
-    /// Failures are counted per source for relay traffic and for blocks
-    /// separately, so invalid votes alone never close the block door.
+    /// Failures are counted per source for relay traffic, for blocks and for
+    /// votes separately, so invalid votes alone never close the block door
+    /// and a source's refused transactions never close its vote door.
     fn failure_group(self) -> usize {
         match self {
             VerificationLane::Relay => 0,
             VerificationLane::GossipBlock | VerificationLane::DirectedBlock => 1,
+            VerificationLane::Vote => 2,
         }
     }
 }
@@ -86,6 +95,10 @@ struct SlotBudget {
     /// Units of failed verification per source. An entry exists only after a
     /// reserved unit failed, so the map is bounded by the lane ceilings.
     failed_by_source: BTreeMap<[u8; 32], [usize; FAILURE_GROUPS]>,
+    /// Units this node's own submissions drew from their private headroom
+    /// after a lane ceiling was spent (audit L1N-02), per lane. No remote
+    /// source can add to it: see [`BudgetedVerifier::with_own_headroom`].
+    own_used: [usize; LANES],
 }
 
 /// One node-local admission view of [`GossipVerifier`]. Exhaustion is exposed
@@ -99,6 +112,11 @@ pub(super) struct BudgetedVerifier<'a, V> {
     source_cap: usize,
     lane: VerificationLane,
     failure_cap: usize,
+    /// Private units available once the lane ceiling is spent; zero for
+    /// everything but this node's own submissions.
+    own_headroom: usize,
+    /// Units this view reserved for real verifications.
+    reserved: Cell<usize>,
     limited: Cell<bool>,
     failure_limited: Cell<bool>,
 }
@@ -195,6 +213,8 @@ impl<V> GossipVerifier<V> {
             source_cap: usize::MAX,
             lane: VerificationLane::Relay,
             failure_cap: usize::MAX,
+            own_headroom: 0,
+            reserved: Cell::new(0),
             limited: Cell::new(false),
             failure_limited: Cell::new(false),
         }
@@ -227,6 +247,8 @@ impl<V> GossipVerifier<V> {
             source_cap,
             lane,
             failure_cap: usize::MAX,
+            own_headroom: 0,
+            reserved: Cell::new(0),
             limited: Cell::new(false),
             failure_limited: Cell::new(false),
         }
@@ -244,6 +266,7 @@ impl<V> GossipVerifier<V> {
         source: Option<[u8; 32]>,
         source_cap: usize,
         units: usize,
+        own_headroom: usize,
     ) -> bool {
         let mut budget = self.budget.borrow_mut();
         if budget.slot != Some(slot) {
@@ -251,6 +274,7 @@ impl<V> GossipVerifier<V> {
             budget.used = [0; LANES];
             budget.by_source.clear();
             budget.failed_by_source.clear();
+            budget.own_used = [0; LANES];
         }
         let lane = lane.index();
         let units = units.max(1);
@@ -259,7 +283,18 @@ impl<V> GossipVerifier<V> {
         }) {
             return false;
         }
-        if budget.used[lane].saturating_add(units) > cap { return false; }
+        if budget.used[lane].saturating_add(units) > cap {
+            // Audit L1N-02: the ceiling every source shares is spent. This
+            // node's own submission (no source, and a headroom only the
+            // engine's internal path asks for) still has a small private
+            // share, so remote traffic can never refuse the node its own
+            // work, e.g. the automatic KES rotation.
+            if source.is_none() && budget.own_used[lane].saturating_add(units) <= own_headroom {
+                budget.own_used[lane] = budget.own_used[lane].saturating_add(units);
+                return true;
+            }
+            return false;
+        }
         budget.used[lane] = budget.used[lane].saturating_add(units);
         if let Some(key) = source {
             let used = budget.by_source.entry(key).or_default();
@@ -299,6 +334,46 @@ impl<V> GossipVerifier<V> {
         let failed = budget.failed_by_source.entry(key).or_default();
         let group = lane.failure_group();
         failed[group] = failed[group].saturating_add(units.max(1));
+    }
+
+    /// Charge `units` of verification that ran, succeeded and admitted
+    /// nothing to the source that asked for it (audit L1N-02).
+    ///
+    /// A transaction whose signature is valid can still be refused afterwards
+    /// for a reason only this node's state decides (its input is reserved,
+    /// its source's pending share is full, the pool is full and its tip is
+    /// not above the lowest). That used to be free: no failure, no penalty,
+    /// no fee, so such input drained the allowance every source shares. It
+    /// now counts against the sender's failure allowance exactly like an
+    /// invalid signature: an honest source rarely causes one, and a source
+    /// that keeps causing them is ignored for the rest of the slot before any
+    /// further verification.
+    pub(super) fn note_refused_after_verification(
+        &self,
+        slot: u64,
+        lane: VerificationLane,
+        source: Option<[u8; 32]>,
+        units: usize,
+    ) {
+        if units == 0 { return; }
+        self.note_source_failure(slot, lane, source, units);
+    }
+
+    /// Units of failed (or verified-then-refused) work charged to `source`
+    /// in `lane`'s failure group in `slot`.
+    #[cfg(test)]
+    pub(super) fn source_failures_at(&self, slot: u64, lane: VerificationLane, source: [u8; 32]) -> usize {
+        let budget = self.budget.borrow();
+        if budget.slot != Some(slot) { return 0; }
+        budget.failed_by_source.get(&source).map_or(0, |failed| failed[lane.failure_group()])
+    }
+
+    /// Units this node's own submissions drew from their private headroom
+    /// in `lane` in `slot`.
+    #[cfg(test)]
+    pub(super) fn own_headroom_used_at(&self, slot: u64, lane: VerificationLane) -> usize {
+        let budget = self.budget.borrow();
+        if budget.slot == Some(slot) { budget.own_used[lane.index()] } else { 0 }
     }
 
     /// Remember that block `id` was parked in `slot` only because an
@@ -378,6 +453,19 @@ impl<'a, V> BudgetedVerifier<'a, V> {
         self
     }
 
+    /// Give this view `units` of private headroom, drawn on only after the
+    /// lane ceiling is spent and only when the view has no source (audit
+    /// L1N-02). The caller must be a path no remote input reaches: a frame
+    /// that merely arrived without attribution is not this node's own.
+    pub(super) fn with_own_headroom(mut self, units: usize) -> BudgetedVerifier<'a, V> {
+        self.own_headroom = units;
+        self
+    }
+
+    /// Units this view reserved for real verifications, whatever their
+    /// result. Known failures served from the cache reserve nothing.
+    pub(super) fn reserved_units(&self) -> usize { self.reserved.get() }
+
     /// Whether a verification was refused because this source spent its
     /// failure allowance (implies [`Self::limited`]), as opposed to a spent
     /// unit allowance.
@@ -391,11 +479,12 @@ impl<'a, V> BudgetedVerifier<'a, V> {
             return false;
         }
         if !self.owner.reserve_verification(
-            self.slot, self.lane, self.cap, self.source, self.source_cap, units,
+            self.slot, self.lane, self.cap, self.source, self.source_cap, units, self.own_headroom,
         ) {
             self.limited.set(true);
             return false;
         }
+        self.reserved.set(self.reserved.get().saturating_add(units.max(1)));
         true
     }
 

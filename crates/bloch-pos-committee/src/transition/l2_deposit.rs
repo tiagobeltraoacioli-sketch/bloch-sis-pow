@@ -10,10 +10,6 @@
 //! exactly that record on L2 (see `l2_settlement::expected_body_commitment`).
 //! The signature covers the complete witness-free intent, including the
 //! network domain, so it cannot be replayed on another network or rewritten.
-//!
-//! From `params::L2_REVENUE_EPOCH` (inert), the inputs also pay the L2
-//! protocol fee (`crate::l2_revenue`), created as output 2 to the treasury;
-//! the signed change already commits to it (exact conservation).
 
 use super::*;
 use crate::{
@@ -140,8 +136,7 @@ impl L2Deposit {
         })
     }
 
-    /// State-free checks (also run at the mempool door).
-    pub fn validate_shape(&self) -> Result<(), L2DepositReject> {
+    fn validate_shape(&self) -> Result<(), L2DepositReject> {
         use L2DepositReject as R;
         if self.funding_pubkey.len() != ADMISSION_PQ_KEY_BYTES
             || self.signature.is_empty()
@@ -206,6 +201,29 @@ impl CommittedState {
         if self.admission_network_domain != Some(tx.network_domain) {
             return Err(R::Network);
         }
+        // L1X-02 (gated): no deposit joins a full backlog. `self.epoch` is
+        // the committed epoch rolled to the judged block; in the node-local
+        // preflight it is the head's, which can only be more lenient at the
+        // flag-day boundary.
+        if crate::params::l2_deposit_inflow_bound_active(self.epoch)
+            && self.l2_settlement.as_ref().is_some_and(|l2| l2.deposit_backlog_full())
+        {
+            return Err(R::Inbox);
+        }
+        // L1X-03 (gated): the L2 can never mint a record past its supply
+        // cap, and every settlement must consume the next record, so such a
+        // deposit would stop the L2 for good. Which cap that is belongs to
+        // the settlement program in force (lifetime mint under the deployed
+        // program, outstanding supply after the L2N-01 program switch): the
+        // rule follows the program, whichever of the two gates came first.
+        if crate::params::l2_cumulative_deposit_cap_active(self.epoch)
+            && !self
+                .l2_settlement
+                .as_ref()
+                .is_some_and(|l2| l2.deposit_within_supply_cap(tx.amount_sat, u128::from(MAX_L2_DEPOSIT_SAT)))
+        {
+            return Err(R::Inbox);
+        }
         if tx.tip_millisat_per_gas > fee_market::MAX_TIP_MILLISAT_PER_GAS {
             return Err(R::TipAboveCeiling);
         }
@@ -222,22 +240,16 @@ impl CommittedState {
             spent = spent.checked_add(u128::from(utxo.value)).ok_or(R::Arithmetic)?;
         }
         let charge = fee_market::charge(tx.class(), tx.tx_bytes, base_fee, tx.tip_millisat_per_gas);
-        // L2 protocol fee (inert until `params::L2_REVENUE_EPOCH`): paid from
-        // the inputs on top of the amount, so the inbox record is unchanged.
-        let protocol_fee = self.l2_deposit_protocol_fee(tx.amount_sat);
         let required = u128::from(tx.amount_sat)
             .checked_add(u128::from(tx.change.value))
             .and_then(|v| v.checked_add(charge.base_fee_sat))
             .and_then(|v| v.checked_add(charge.priority_fee_sat))
-            .and_then(|v| v.checked_add(protocol_fee.map_or(0, |(fee, _)| u128::from(fee))))
             .ok_or(R::Arithmetic)?;
         if spent != required {
             return Err(R::Conservation);
         }
         let txid = PosTransaction::L2Deposit(tx.clone()).txid();
-        if self.eutxos.contains_key(&(txid, 0))
-            || (protocol_fee.is_some() && self.eutxos.contains_key(&(txid, crate::l2_revenue::TREASURY_VOUT)))
-        {
+        if self.eutxos.contains_key(&(txid, 0)) {
             return Err(R::OutputCollision);
         }
         Ok(charge)
@@ -251,9 +263,6 @@ impl CommittedState {
     ) -> Result<fee_market::TxCharge, L2DepositReject> {
         use L2DepositReject as R;
         let charge = self.check_l2_deposit(tx, base_fee)?;
-        // The same value `check_l2_deposit` put into the conservation rule
-        // (it depends on this state's epoch and compiled constants only).
-        let protocol_fee = self.l2_deposit_protocol_fee(tx.amount_sat);
         let txid = PosTransaction::L2Deposit(tx.clone()).txid();
         // Expensive check last.
         if !verifier.verify_with_key(&tx.funding_pubkey, &tx.intent_root(), &tx.signature) {
@@ -282,24 +291,6 @@ impl CommittedState {
                 script_hash: tx.change.script_hash,
             });
         }
-        if let Some((fee, treasury)) = protocol_fee {
-            self.eutxos.insert(EutxoEntry {
-                txid,
-                vout: crate::l2_revenue::TREASURY_VOUT,
-                value: fee,
-                script_hash: treasury,
-            });
-        }
         Ok(charge)
-    }
-
-    /// The L2 protocol fee a deposit of `amount_sat` pays in the next block
-    /// on this state, and the treasury it goes to; `None` before
-    /// `params::L2_REVENUE_EPOCH`. Tooling reads it to build the change.
-    pub fn l2_deposit_protocol_fee(&self, amount_sat: u64) -> Option<(u64, [u8; 32])> {
-        if !crate::l2_revenue::active(self.epoch) {
-            return None;
-        }
-        crate::l2_revenue::treasury().map(|t| (crate::l2_revenue::deposit_fee_sat(amount_sat), t))
     }
 }

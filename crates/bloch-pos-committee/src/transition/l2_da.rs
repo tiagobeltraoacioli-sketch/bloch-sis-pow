@@ -184,8 +184,7 @@ impl L2DataAvailability {
         })
     }
 
-    /// State-free checks (also run at the mempool door).
-    pub fn validate_shape(&self) -> Result<(), L2DataAvailabilityReject> {
+    fn validate_shape(&self) -> Result<(), L2DataAvailabilityReject> {
         use L2DataAvailabilityReject as R;
         if self.funding_pubkey.len() != ADMISSION_PQ_KEY_BYTES
             || self.signature.is_empty()

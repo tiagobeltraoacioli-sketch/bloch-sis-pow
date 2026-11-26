@@ -117,6 +117,73 @@ pub fn sign_ctx(sk: &[u8], message: &[u8], ctx: &[u8]) -> Option<[u8; SIGNATURE_
     Some(sig)
 }
 
+/// Generate an ML-DSA-65 keypair with PQClean `clean`, written straight into
+/// the caller's buffers. `false` if the C side reports failure, in which case
+/// the buffers must not be used.
+///
+/// Key generation draws exactly the 32 seed bytes FIPS 204 specifies from
+/// `randombytes`, so under a seeded stream the result is the key every other
+/// backend of the pinned crate derives from that seed. The point of this
+/// entry is ownership: the secret key exists only in `sk`, which the caller
+/// can hold in wiping storage, never in an upstream key type that is copied
+/// and dropped unwiped.
+pub fn keypair(pk: &mut [u8; PUBLIC_KEY_BYTES], sk: &mut [u8; SECRET_KEY_BYTES]) -> bool {
+    // SAFETY: both buffers have exactly the lengths the C side writes.
+    let rc = unsafe { ffi::PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair(pk.as_mut_ptr(), sk.as_mut_ptr()) };
+    rc == 0
+}
+
+/// Falcon-1024 on PQClean's integer-only `clean` implementation, on
+/// caller-owned buffers (review F5).
+pub mod falcon1024 {
+    use pqcrypto_falcon::ffi;
+
+    /// Falcon-1024 public key length.
+    pub const PUBLIC_KEY_BYTES: usize = ffi::PQCLEAN_FALCON1024_CLEAN_CRYPTO_PUBLICKEYBYTES;
+    /// Falcon-1024 secret key length.
+    pub const SECRET_KEY_BYTES: usize = ffi::PQCLEAN_FALCON1024_CLEAN_CRYPTO_SECRETKEYBYTES;
+    /// Longest detached signature the compact encoding can produce.
+    pub const SIGNATURE_MAX_BYTES: usize = ffi::PQCLEAN_FALCON1024_CLEAN_CRYPTO_BYTES;
+
+    /// Generate a keypair straight into the caller's buffers. `false` if the
+    /// C side reports failure, in which case the buffers must not be used.
+    /// Consumes `randombytes` exactly as the pinned crate's `keypair()` does:
+    /// it is the same C function.
+    pub fn keypair(pk: &mut [u8; PUBLIC_KEY_BYTES], sk: &mut [u8; SECRET_KEY_BYTES]) -> bool {
+        // SAFETY: both buffers have exactly the lengths the C side writes.
+        let rc = unsafe { ffi::PQCLEAN_FALCON1024_CLEAN_crypto_sign_keypair(pk.as_mut_ptr(), sk.as_mut_ptr()) };
+        rc == 0
+    }
+
+    /// Sign `message` reading the secret key from the caller's slice: no
+    /// copy of it is made on the Rust side. Returns the signature length
+    /// written to `sig`, or `None` if `sk` has the wrong length or the C
+    /// signer reports failure or an impossible length (upstream ignores that
+    /// return code; this does not).
+    pub fn sign(sk: &[u8], message: &[u8], sig: &mut [u8; SIGNATURE_MAX_BYTES]) -> Option<usize> {
+        if sk.len() != SECRET_KEY_BYTES {
+            return None;
+        }
+        let mut siglen: usize = 0;
+        // SAFETY: `sig` has SIGNATURE_MAX_BYTES capacity (the most the C side
+        // writes), `sk` length is checked above, `siglen` is a valid
+        // out-pointer and `message` is read for exactly its length.
+        let rc = unsafe {
+            ffi::PQCLEAN_FALCON1024_CLEAN_crypto_sign_signature(
+                sig.as_mut_ptr(),
+                &mut siglen,
+                message.as_ptr(),
+                message.len(),
+                sk.as_ptr(),
+            )
+        };
+        if rc != 0 || siglen == 0 || siglen > SIGNATURE_MAX_BYTES {
+            return None;
+        }
+        Some(siglen)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +234,46 @@ mod tests {
         let max = [7u8; MAX_CONTEXT_BYTES];
         let smax = sign_ctx(sk.as_bytes(), b"m", &max).unwrap();
         assert!(verify_ctx(pk.as_bytes(), b"m", &max, &smax));
+    }
+
+    /// F5: the caller-buffer entries are the pinned crates' own functions on
+    /// different storage. Under one seed they give byte-identical keys and
+    /// signatures; unseeded, their output verifies with the upstream verifier.
+    #[test]
+    fn caller_buffer_keygen_and_falcon_sign_match_the_pinned_crates() {
+        use pqcrypto_falcon::falcon1024 as up;
+        use pqcrypto_traits::sign::DetachedSignature as _;
+        let seed = [0x5Au8; 32];
+
+        let (upk, usk) = pqcrypto_internals::with_seeded_rng_scope(&seed, mldsa65::keypair);
+        let mut pk = [0u8; PUBLIC_KEY_BYTES];
+        let mut sk = [0u8; SECRET_KEY_BYTES];
+        assert!(pqcrypto_internals::with_seeded_rng_scope(&seed, || keypair(&mut pk, &mut sk)));
+        assert_eq!(&pk[..], upk.as_bytes());
+        assert_eq!(&sk[..], usk.as_bytes());
+
+        let (fupk, fusk) = pqcrypto_internals::with_seeded_rng_scope(&seed, up::keypair);
+        let mut fpk = [0u8; falcon1024::PUBLIC_KEY_BYTES];
+        let mut fsk = [0u8; falcon1024::SECRET_KEY_BYTES];
+        assert!(pqcrypto_internals::with_seeded_rng_scope(&seed, || falcon1024::keypair(&mut fpk, &mut fsk)));
+        assert_eq!(&fpk[..], fupk.as_bytes());
+        assert_eq!(&fsk[..], fusk.as_bytes());
+
+        let msg = b"caller-owned buffers";
+        let expected = pqcrypto_internals::with_seeded_rng_scope(&[9u8; 32], || up::detached_sign(msg, &fusk));
+        let mut sig = [0u8; falcon1024::SIGNATURE_MAX_BYTES];
+        let len = pqcrypto_internals::with_seeded_rng_scope(&[9u8; 32], || falcon1024::sign(&fsk, msg, &mut sig))
+            .expect("signs");
+        assert_eq!(&sig[..len], expected.as_bytes());
+
+        let len = falcon1024::sign(&fsk, msg, &mut sig).expect("signs unseeded");
+        let fresh = up::DetachedSignature::from_bytes(&sig[..len]).unwrap();
+        assert!(up::verify_detached_signature(&fresh, msg, &fupk).is_ok());
+        assert_ne!(&sig[..len], expected.as_bytes(), "unseeded signing is randomized");
+
+        for bad in [0usize, 1, falcon1024::SECRET_KEY_BYTES - 1, falcon1024::SECRET_KEY_BYTES + 1] {
+            let oversized = [0u8; falcon1024::SECRET_KEY_BYTES + 1];
+            assert_eq!(falcon1024::sign(&oversized[..bad], msg, &mut sig), None, "sk length {bad}");
+        }
     }
 }

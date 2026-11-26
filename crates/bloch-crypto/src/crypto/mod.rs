@@ -9,7 +9,9 @@
 //!   Signature:   3309 bytes
 
 use pqcrypto_mldsa::mldsa65;
-use pqcrypto_traits::sign::{DetachedSignature, PublicKey, SecretKey};
+use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
+#[cfg(test)]
+use pqcrypto_traits::sign::SecretKey;
 use sha3::{Sha3_256, Digest};
 use log::debug;
 
@@ -97,12 +99,30 @@ fn hybrid_secret_body(mldsa: &[u8], falcon: &[u8]) -> zeroize::Zeroizing<Vec<u8>
     body
 }
 
+/// Generate an ML-DSA-65 keypair into wiping storage (review F5).
+///
+/// The upstream `mldsa65::keypair()` returns a secret-key type that is copied
+/// out and then dropped unwiped. This runs PQClean `clean` key generation on
+/// buffers this crate owns, so the only copy of the secret is the one
+/// returned, and it wipes itself. Key generation is a function of the 32 seed
+/// bytes it draws, so the key is the one every backend derives.
+fn mldsa_keypair() -> (Vec<u8>, zeroize::Zeroizing<Vec<u8>>) {
+    let mut pk = [0u8; bloch_mldsa_clean::PUBLIC_KEY_BYTES];
+    let mut sk = zeroize::Zeroizing::new([0u8; bloch_mldsa_clean::SECRET_KEY_BYTES]);
+    if !bloch_mldsa_clean::keypair(&mut pk, &mut sk) {
+        // PQClean's keygen returns 0 unconditionally; a non-zero code would
+        // mean a different library is linked. Never hand back a zero key.
+        std::process::abort();
+    }
+    (pk.to_vec(), zeroize::Zeroizing::new(sk.to_vec()))
+}
+
 pub fn generate_keypair() -> (Vec<u8>, Vec<u8>) {
-    let (mpk, msk) = mldsa65::keypair();
+    let (mpk, msk) = mldsa_keypair();
     let (fpk, fsk) = falcon::keypair();
     let fsk = zeroize::Zeroizing::new(fsk);
-    let mut pk = mpk.as_bytes().to_vec(); pk.extend_from_slice(&fpk);
-    let sk = hybrid_secret_body(msk.as_bytes(), &fsk);
+    let mut pk = mpk; pk.extend_from_slice(&fpk);
+    let sk = hybrid_secret_body(&msk, &fsk);
     // Enveloped under suite 0x0001 (magic ‖ 01 00 ‖ body). The enveloped pk is
     // THE public key everywhere (keygen, address hashing, script_sig) so
     // addresses become suite-committing (design §2.4).
@@ -157,11 +177,11 @@ pub fn generate_keypair_from_seed(seed: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Cry
     // Both keygens consume the unchanged stream within a non-escaping scope.
     // Cleanup also removes any accidentally forgotten nested legacy guards.
     let ((mpk, msk), (fpk, fsk)) = pqcrypto_internals::with_seeded_rng_scope(&seed32, || {
-        (mldsa65::keypair(), falcon::keypair())
+        (mldsa_keypair(), falcon::keypair())
     });
     let fsk = zeroize::Zeroizing::new(fsk);
-    let mut pk = mpk.as_bytes().to_vec(); pk.extend_from_slice(&fpk);
-    let sk = hybrid_secret_body(msk.as_bytes(), &fsk);
+    let mut pk = mpk; pk.extend_from_slice(&fpk);
+    let sk = hybrid_secret_body(&msk, &fsk);
     Ok((wrap_envelope(SUITE_MLDSA65_FALCON1024, &pk),
         wrap_envelope(SUITE_MLDSA65_FALCON1024, &sk)))
 }
@@ -721,7 +741,7 @@ pub fn split_envelope(bytes: &[u8]) -> Option<(u16, &[u8])> {
 // * [`SignaturePolicy::CompatiblePinned`] — every byte form [`verify`]
 //   admits, but the ML-DSA half judged by the pinned PQClean `clean`
 //   verifier instead of the CPU-dispatching one (see `mldsa65_verify_legacy`).
-//   Consensus from the committee's `MLDSA_PIN_ACTIVATION_EPOCH` (inert).
+//   Consensus from the committee's `MLDSA_PIN_ACTIVATION_EPOCH` (armed, 7270).
 //
 // * [`SignaturePolicy::CanonicalUnbound`] — today's (context-free) signing
 //   math, but exactly one byte form: the suite header is mandatory, every
@@ -735,7 +755,7 @@ pub fn split_envelope(bytes: &[u8]) -> Option<(u16, &[u8])> {
 //   it commits to the exact ML-DSA half it travels with. Closes (a3) and (b).
 //   Becomes the consensus rule FOR CONSENSUS MESSAGES (votes, proposer
 //   signatures, slashing evidence, KES leaves; never transaction witnesses)
-//   at the committee's `SIG_CANONICAL_ACTIVATION_EPOCH` (inert, `u64::MAX`).
+//   at the committee's `SIG_CANONICAL_ACTIVATION_EPOCH` (armed, 7270).
 //
 // Public keys: an enveloped key must have the exact body length of its suite.
 // The raw legacy hybrid key (exact length, carry-over addresses) stays
@@ -1275,7 +1295,7 @@ mod tests {
 // guarded by the tripwire test + KAT below and scripts/falcon-clean-guard.sh.
 pub mod falcon {
     use pqcrypto_falcon::falcon1024;
-    use pqcrypto_traits::sign::{PublicKey, SecretKey, DetachedSignature};
+    use pqcrypto_traits::sign::{PublicKey, DetachedSignature};
     use super::CryptoError;
 
     /// Falcon-1024 public-key length (bytes).
@@ -1289,15 +1309,37 @@ pub mod falcon {
         pqcrypto_falcon::falconpadded1024::signature_bytes()
     }
 
+    /// Generate a Falcon-1024 keypair. The secret key is produced in wiping
+    /// storage owned here and copied once into the returned `Vec`, which the
+    /// caller owns (every caller in this crate wraps it in `Zeroizing`). The
+    /// upstream key type, copied and dropped unwiped, is no longer involved
+    /// (review F5). Same C function, so the same key for the same randomness.
     pub fn keypair() -> (Vec<u8>, Vec<u8>) {
-        let (pk, sk) = falcon1024::keypair();
-        (pk.as_bytes().to_vec(), sk.as_bytes().to_vec())
+        use bloch_mldsa_clean::falcon1024 as clean;
+        let mut pk = [0u8; clean::PUBLIC_KEY_BYTES];
+        let mut sk = zeroize::Zeroizing::new([0u8; clean::SECRET_KEY_BYTES]);
+        if !clean::keypair(&mut pk, &mut sk) {
+            // PQClean's keygen returns 0 unconditionally; a non-zero code
+            // would mean a different library is linked. Never hand back a
+            // zero key.
+            std::process::abort();
+        }
+        (pk.to_vec(), sk.to_vec())
     }
 
+    /// Sign with the secret key read in place from the caller's slice: no
+    /// per-signature copy of it is made (review F5). The bytes are those the
+    /// pinned crate's `detached_sign` produces; unlike it, a failure reported
+    /// by the C signer is an error here instead of an unchecked buffer.
     pub fn sign(secret_key_bytes: &[u8], message: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        let sk = falcon1024::SecretKey::from_bytes(secret_key_bytes)
-            .map_err(|_| CryptoError::InvalidKey("bad falcon secret key".into()))?;
-        Ok(falcon1024::detached_sign(message, &sk).as_bytes().to_vec())
+        use bloch_mldsa_clean::falcon1024 as clean;
+        if secret_key_bytes.len() != clean::SECRET_KEY_BYTES {
+            return Err(CryptoError::InvalidKey("bad falcon secret key".into()));
+        }
+        let mut sig = [0u8; clean::SIGNATURE_MAX_BYTES];
+        let len = clean::sign(secret_key_bytes, message, &mut sig)
+            .ok_or_else(|| CryptoError::SignFailed("falcon signer reported failure".into()))?;
+        Ok(sig[..len].to_vec())
     }
 
     /// Deterministic verification (consensus rule): malformed inputs → false.

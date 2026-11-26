@@ -4,7 +4,7 @@
 
 use crate::{codec, genesis::Manifest, keys::Keystore};
 use bloch_pos_committee::{
-    fee_market, l2_revenue,
+    fee_market,
     transition::{
         funded::ADMISSION_PQ_SIGNATURE_MAX, FundingInput, L2Deposit, PosTransaction, TransferOutput,
     },
@@ -15,17 +15,12 @@ use std::{fs::OpenOptions, io::{Read, Write}, path::Path};
 const HELP: &str = "Native L2 deposit: escrow BLCH for an EVM recipient on the L2 (offline; does not broadcast)
 
 prepare --genesis FILE --funding-pubkey HEX_FILE --input TXID:VOUT:SAT [--input ...]
-        --amount SAT --recipient HEX20 --base-fee MILLISAT_PER_GAS --tip MILLISAT_PER_GAS
-        [--epoch EPOCH] --out FILE
+        --amount SAT --recipient HEX20 --base-fee MILLISAT_PER_GAS --tip MILLISAT_PER_GAS --out FILE
 inspect --tx FILE
 sign --genesis TRUSTED_FILE --tx FILE --dir KEYSTORE_DIR --out NEW_FILE
 
 Change returns to the funding key. Consensus requires exact conservation at the
 including block's base fee (query getchaininfo next_base_fee_millisat_per_gas).
-From the L2 protocol-fee gate (getchaininfo hard_forks.l2_revenue) the inputs
-also pay the protocol fee (5 bps, floor 0.00005 BLCH, cap 1 BLCH) to the
-treasury as output 2; --epoch (the including block's epoch) is then required.
-The L2 recipient still receives exactly --amount.
 The network's L2 must admit deposits (getl2settlement profile): an asynchronous
 development genesis on a devnet-l2-deposits build, or a network past its L2 flag day.";
 
@@ -81,23 +76,13 @@ pub(crate) fn get<'a>(opts: &'a [(String, String)], flag: &str) -> Result<&'a st
     opts.iter().find(|(f, _)| f == flag).map(|(_, v)| v.as_str()).ok_or_else(|| format!("missing {flag}"))
 }
 
-/// The L2 protocol fee for `--epoch`: 0 while the gate is inert on this
-/// build; required once it is armed (a wrong guess only fails conservation).
-pub(crate) fn protocol_fee(opts: &[(String, String)], fee_at: impl Fn(u64) -> u64) -> Result<u64, String> {
-    match get(opts, "--epoch").ok() {
-        Some(text) => Ok(fee_at(text.parse().map_err(|_| "bad --epoch")?)),
-        None if !l2_revenue::gate_armed() => Ok(0),
-        None => Err("this build arms the L2 protocol fee: give --epoch (the including block's epoch, getchaininfo)".into()),
-    }
-}
-
 pub(crate) fn domain(genesis: &str) -> Result<[u8; 32], String> {
     let (manifest, _) = Manifest::load(Path::new(genesis)).map_err(|e| e.to_string())?;
     Ok(Sha3_256::digest(manifest.encode()).into())
 }
 
 fn prepare(args: &[String]) -> Result<(), String> {
-    let o = options(args, &["--genesis", "--funding-pubkey", "--input", "--amount", "--recipient", "--base-fee", "--tip", "--epoch", "--out"])?;
+    let o = options(args, &["--genesis", "--funding-pubkey", "--input", "--amount", "--recipient", "--base-fee", "--tip", "--out"])?;
     let funding_pubkey = codec::unhex(read_text(get(&o, "--funding-pubkey")?)?.trim())?;
     let mut inputs = Vec::new();
     let mut total: u128 = 0;
@@ -114,7 +99,6 @@ fn prepare(args: &[String]) -> Result<(), String> {
     let amount_sat: u64 = get(&o, "--amount")?.parse().map_err(|_| "bad --amount")?;
     let base_fee: u128 = get(&o, "--base-fee")?.parse().map_err(|_| "bad --base-fee")?;
     let tip: u128 = get(&o, "--tip")?.parse().map_err(|_| "bad --tip")?;
-    let protocol_fee = protocol_fee(&o, |epoch| l2_revenue::deposit_fee_at_epoch(epoch, amount_sat))?;
     let owner: [u8; 32] = Sha3_256::digest(&funding_pubkey).into();
     let mut tx = L2Deposit {
         network_domain: domain(get(&o, "--genesis")?)?,
@@ -131,12 +115,9 @@ fn prepare(args: &[String]) -> Result<(), String> {
     tx.tx_bytes = (tx.canonical_bytes().len() + ADMISSION_PQ_SIGNATURE_MAX) as u64;
     let charge = fee_market::charge(fee_market::TxClass::Eutxo { inputs: tx.inputs.len() as u32 }, tx.tx_bytes, base_fee, tip);
     let change = total
-        .checked_sub(u128::from(amount_sat) + charge.base_fee_sat + charge.priority_fee_sat + u128::from(protocol_fee))
+        .checked_sub(u128::from(amount_sat) + charge.base_fee_sat + charge.priority_fee_sat)
         .ok_or("inputs do not cover the amount plus fees")?;
     tx.change.value = u64::try_from(change).map_err(|_| "change exceeds u64")?;
-    if protocol_fee > 0 {
-        println!("  protocol fee   : {protocol_fee} sat to the L2 treasury (output 2)");
-    }
     inspect(&tx);
     write_tx(get(&o, "--out")?, &tx)
 }

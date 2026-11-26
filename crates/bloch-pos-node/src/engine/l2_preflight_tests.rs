@@ -338,46 +338,6 @@ mod funded_l2_transactions {
         assert!(node.rejected.is_empty(), "the probe refused nothing");
     }
 
-    /// Review R308-3P-1, restated on the merged door (agent 382, round 18;
-    /// reviewer 384 R384-REG-1). The December line tested its own copy of the
-    /// DA duplicate rule (`check_da_recordable`); the merge removed the copy,
-    /// and the released door (`check_l2_funded`) asks the transition's
-    /// `l2_data_availability_refusal_at`. At ADMISSION: once a batch is
-    /// recorded for an L2 block, a funded copy of it (same block, same
-    /// commitment) is refused with the door's retryable state answer, while a
-    /// batch with another commitment for the same block, funded and signed
-    /// the same way, is still admitted (consensus records it too).
-    #[test]
-    fn r308_3p_1_a_recorded_da_commitment_is_refused_at_admission() {
-        let _clock = validator_lifecycle::clock_at(3);
-        let funds = funds_of(3);
-        let (mut node, _dir) = engine(&funds);
-        let first = data_availability(&node, OWNER, (funds[0].txid, funds[0].vout), Some(funds[0].value));
-        assert_eq!(node.on_transaction(PosTransaction::L2DataAvailability(first)), Ok(Admitted::New));
-        node.propose(3);
-        assert_eq!(node.state.slot(), 3);
-        assert_eq!(da_records(&node), 1);
-
-        let copy = data_availability(&node, OWNER, (funds[1].txid, funds[1].vout), Some(funds[1].value));
-        assert_eq!(
-            node.on_transaction(PosTransaction::L2DataAvailability(copy)),
-            Err(Refusal::StateDependent(
-                "L2 data availability batch is settled, out of window, already recorded or the record set is full"
-            )),
-            "a funded copy of a recorded batch is not backed"
-        );
-
-        let mut other = data_availability(&node, OWNER, (funds[2].txid, funds[2].vout), Some(funds[2].value));
-        other.payload = batch(&[OWNER, 0xc1]);
-        other.signature = sign(&keypair(OWNER).1, &other.intent_root());
-        assert_eq!(
-            node.on_transaction(PosTransaction::L2DataAvailability(other)),
-            Ok(Admitted::New),
-            "another commitment for the recorded block is admitted"
-        );
-        assert_eq!(node.mempool.len(), 1);
-    }
-
     /// W1-1: an L2 transaction that pays for, and declares, far more bytes
     /// than it carries is refused at the door like a transfer that does, and
     /// is not selected if it is in the pool anyway.
@@ -450,6 +410,32 @@ mod funded_l2_transactions {
         assert!(node.mempool.contains_key(&honest_key), "left for the next block");
         assert!(!node.rejected.contains_key(&honest_key));
         assert_eq!(node.select_transactions(0), vec![honest]);
+    }
+
+    /// AUDIT-L1L2-20261123 L1X-02: once consensus bounds the deposit inflow
+    /// the proposer packs at most MAX_DEPOSITS_PER_BLOCK deposits, highest
+    /// tips first, and none beyond the room left in the backlog; other
+    /// transactions are not counted. Unbounded while the gate is inert.
+    #[test]
+    fn deposits_are_packed_within_the_consensus_inflow_bound() {
+        use bloch_pos_committee::l2_settlement::MAX_DEPOSITS_PER_BLOCK;
+        let _clock = validator_lifecycle::clock_at(3);
+        let funds = funds_of(4);
+        let (node, _dir) = engine(&funds);
+        let l2 = node.state.l2_settlement().unwrap();
+        let entry = |i: usize, tip: u128| {
+            let mut tx = deposit(&node, OWNER, (funds[i].txid, funds[i].vout), Some(funds[i].value), 0x42);
+            tx.tip_millisat_per_gas = tip;
+            let tx = PosTransaction::L2Deposit(tx);
+            (tx.canonical_bytes(), tx)
+        };
+        let all: Vec<(Vec<u8>, PosTransaction)> = (0..4).map(|i| entry(i, 10 - i as u128)).collect();
+        let pack = || Engine::pack_transactions_on(0, [0; 32], all.iter().map(|(k, tx)| (k, tx)).collect(), Some(l2));
+        assert_eq!(pack().len(), 4, "inert: every deposit that fits");
+        L2_DEPOSIT_INFLOW_FORCED.with(|c| c.set(true));
+        let bounded = pack();
+        L2_DEPOSIT_INFLOW_FORCED.with(|c| c.set(false));
+        assert_eq!(bounded, all[..MAX_DEPOSITS_PER_BLOCK].iter().map(|(_, tx)| tx.clone()).collect::<Vec<_>>());
     }
 
     /// W1-1: claims are packed once per leaf and within the escrow, as the
@@ -590,46 +576,5 @@ mod funded_l2_transactions {
         let valid = PosTransaction::L2Deposit(deposit(&node, OWNER, point, Some(funds[0].value), 0x42));
         assert_eq!(node.on_transaction_from(valid, Some([0xD2; 32])), Ok(Admitted::New));
         assert_eq!(node.gossip_verifier.budget_used_at(slot), spent + 1);
-    }
-
-    /// L2 audit list item B1 (review R308-3) on this release line: an L2
-    /// deposit, DA batch or withdrawal claim that nothing backs, at the
-    /// highest tip, from any number of keys and peers, takes no place in the
-    /// pool, so it cannot hold the pool against paying transactions. And item
-    /// B2: two entries of one key that spend one output hold one place, not
-    /// two. The paying transactions that follow are admitted and proposed.
-    ///
-    /// The same entries entered the pool of release 78d4921c on their
-    /// signature (see docs/L2-MEMPOOL-ADMISSION.md).
-    #[test]
-    fn r308_3_unbacked_l2_entries_at_the_highest_tip_take_no_place_in_the_pool() {
-        let _clock = validator_lifecycle::clock_at(3);
-        let funds = funds_of(2);
-        let (mut node, _dir) = engine(&funds);
-        let mut peer = 0u8;
-        for seed in 0..12u8 {
-            for tx in [
-                PosTransaction::L2Deposit(deposit(&node, 100 + seed, ABSENT, None, seed)),
-                PosTransaction::L2DataAvailability(data_availability(&node, 120 + seed, ABSENT, None)),
-                PosTransaction::L2WithdrawClaim(unpayable_claim(&node, 140 + seed)),
-            ] {
-                peer += 1;
-                assert!(refused(node.on_transaction_from(tx, Some([peer; 32]))), "seed {seed}");
-            }
-        }
-        assert_eq!(node.mempool.len(), 0, "nothing unbacked is pooled");
-
-        let point = (funds[0].txid, funds[0].vout);
-        let first = PosTransaction::L2Deposit(deposit(&node, OWNER, point, Some(funds[0].value), 1));
-        let second = PosTransaction::L2Deposit(deposit(&node, OWNER, point, Some(funds[0].value), 2));
-        assert_eq!(node.on_transaction(first.clone()), Ok(Admitted::New));
-        assert!(matches!(node.on_transaction(second), Err(Refusal::StateDependent(_))));
-        assert_eq!(node.mempool.len(), 1, "one funding output, one place");
-
-        let transfer = spend(&funds[1], 9_000, 0, node.state.next_base_fee_at(0));
-        assert_eq!(node.on_transaction(transfer.clone()), Ok(Admitted::New));
-        node.propose(3);
-        assert_eq!(node.tx_slot_index.get(&first.txid()), Some(&3));
-        assert_eq!(node.tx_slot_index.get(&transfer.txid()), Some(&3));
     }
 }

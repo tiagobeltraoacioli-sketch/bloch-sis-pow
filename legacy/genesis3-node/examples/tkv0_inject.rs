@@ -66,11 +66,7 @@ fn transfer_env(token_id: [u8; 32], assigns: &[(u32, u64)]) -> Vec<u8> {
 fn load_wallet(path: &str) -> Keypair {
     let txt = std::fs::read_to_string(path).expect("read wallet");
     let j: serde_json::Value = serde_json::from_str(&txt).unwrap();
-    Keypair {
-        private_key: hex::decode(j["private_key_hex"].as_str().unwrap()).unwrap(),
-        public_key: hex::decode(j["public_key_hex"].as_str().unwrap()).unwrap(),
-        address: j["address"].as_str().unwrap().to_string(),
-    }
+    Keypair::from_parts(hex::decode(j["private_key_hex"].as_str().unwrap()).unwrap(), hex::decode(j["public_key_hex"].as_str().unwrap()).unwrap(), j["address"].as_str().unwrap().to_string())
 }
 
 fn sign_tx(mut tx: Transaction, kp: &Keypair) -> Transaction {
@@ -114,7 +110,7 @@ fn main() {
         Some("genwallet") => {
             let kp = generate_keypair(true);
             let j = serde_json::json!({
-                "private_key_hex": hex::encode(&kp.private_key),
+                "private_key_hex": hex::encode(kp.expose_private_key()),
                 "public_key_hex": hex::encode(&kp.public_key),
                 "address": kp.address,
             });
