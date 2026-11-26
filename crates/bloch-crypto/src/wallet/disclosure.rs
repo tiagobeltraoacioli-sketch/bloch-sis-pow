@@ -309,8 +309,10 @@ impl DisclosureBundle {
         let is_testnet = matches!(network, Network::Testnet);
         let mut entries = Vec::with_capacity(keyed.len());
         for (index, pk, sk) in &keyed {
-            let sig = crypto::sign(sk, &digest)
-                .map_err(|e| DisclosureError::Crypto(e.to_string()))?;
+            // A disclosure bundle is published, so its signatures get the
+            // wallet's signing rules too (audit of 2026-11-26): the platform
+            // and seeded-scope refusals, and verify-before-release.
+            let sig = super::sign_for_wallet(sk, pk, &digest).map_err(DisclosureError::Crypto)?;
             entries.push(DisclosureEntry {
                 index: *index,
                 address: crypto::address_from_pubkey(pk, is_testnet),

@@ -2014,12 +2014,15 @@ fn serve_connection(
     // Through a proxy (review RC-05): a declared one, or any forwarding
     // header at all.
     let mut relayed = peer_is_proxy;
-    let request = read_request(sock, hosts, &mut |forwarded, relay_header, api_key| {
-        relayed |= relay_header;
-        source = attribute(forwarded)?;
+    let request = read_request(sock, hosts, &mut |head| match head {
+        Head::Parsed { forwarded, relay_header } => {
+            relayed |= relay_header;
+            source = attribute(forwarded)?;
+            Ok(())
+        }
         // After attribution, so the rate is charged to the client a trusted
-        // proxy names and not to the proxy.
-        access.admit(source, api_key)
+        // proxy names and not to the proxy; and after the browser gate.
+        Head::Gated { api_key } => access.admit(source, api_key),
     });
     match request {
         Ok(body) => {
@@ -2222,6 +2225,30 @@ const RATE_LIMIT_MAX_PER_SECOND: u32 = 10_000;
 /// rather than admitted unmetered.
 const RATE_TABLE_MAX: usize = 4_096;
 
+/// Read a file that holds a credential (the RPC API key, the metrics token).
+/// On Unix a file that group or others can read is refused, the rule
+/// `keys::read_keystore_file` applies to the validator keystore: a credential
+/// every local account can read is not one, and loading it anyway makes the
+/// leak look normal.
+pub(crate) fn read_secret_file(path: &str, what: &str) -> Result<String, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|e| format!("cannot read the {what} file `{path}`: {e}"))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "the {what} file `{path}` is readable by group or others (mode {mode:o}); \
+                 restrict it to its owner (chmod 600)"
+            ));
+        }
+    }
+    std::fs::read_to_string(path).map_err(|e| format!("cannot read the {what} file `{path}`: {e}"))
+}
+
 /// What this listener demands of a request beyond being well-formed.
 #[derive(Default)]
 pub(crate) struct Access {
@@ -2249,8 +2276,7 @@ impl Access {
         let api_key = match var(RPC_API_KEY_FILE_ENV)? {
             None => None,
             Some(path) => {
-                let text = std::fs::read_to_string(&path)
-                    .map_err(|e| format!("cannot read the RPC API key file `{path}`: {e}"))?;
+                let text = read_secret_file(&path, "RPC API key")?;
                 Some(Self::key_digest(Self::parse_api_key(&text)?))
             }
         };
@@ -2313,16 +2339,22 @@ impl Access {
         Self::digest_matches(expected, presented)
     }
 
-    /// Judge one request head from `source`. The rate is charged first, so
-    /// wrong-key attempts are metered like any other request.
+    /// Judge one request head from `source`. The key first, then the rate:
+    /// only a request that may be served spends from the bucket, so a caller
+    /// without the key cannot drain the allowance of a keyed client it shares
+    /// a source with (one NAT address, one IPv6 /64, one undeclared proxy).
+    /// A key of [`API_KEY_MIN_LEN`] characters compared by digest is not
+    /// something request-rate metering would protect anyway. The caller runs
+    /// this after the Host, Origin and Content-Type gates, so a browser
+    /// request that is refused there spends nothing either.
     fn admit(&self, source: IpAddr, presented_key: Option<&str>) -> Result<(), HttpError> {
+        if !self.key_matches(presented_key) {
+            return Err(http_err(401, "a valid X-API-Key header is required"));
+        }
         if let Some(rate) = &self.rate {
             if !rate.take(source, Instant::now()) {
                 return Err(http_err(429, "request rate limit exceeded for this source address"));
             }
-        }
-        if !self.key_matches(presented_key) {
-            return Err(http_err(401, "a valid X-API-Key header is required"));
         }
         Ok(())
     }
@@ -2356,8 +2388,12 @@ impl Access {
 }
 
 /// A token bucket per source address ([`crate::connection_limit::limit_key`]:
-/// an IPv4 address or an IPv6 /64). Counted in thousandths of a request so
-/// the refill needs no floating point.
+/// an IPv4 address or an IPv6 /64). Counted in millionths of a request and
+/// refilled per microsecond, so the refill needs no floating point and a
+/// client that sends faster than one request per millisecond is still
+/// credited for the time between its requests (audit of 2026-11-26: with
+/// millisecond granularity and the timestamp reset on every call, a steady
+/// stream above 1 kHz was never refilled at all).
 struct RateLimit {
     per_second: u32,
     table: Mutex<std::collections::HashMap<IpAddr, (u64, Instant)>>,
@@ -2373,15 +2409,19 @@ impl RateLimit {
         u64::from(self.per_second).saturating_mul(2)
     }
 
-    fn capacity_milli(&self) -> u64 {
-        self.burst().saturating_mul(1_000)
+    /// One request, in the bucket's unit.
+    const REQUEST: u64 = 1_000_000;
+
+    fn capacity(&self) -> u64 {
+        self.burst().saturating_mul(Self::REQUEST)
     }
 
+    /// `per_second` requests a second is `per_second` millionths a microsecond.
     fn refilled(&self, tokens: u64, since: Instant, now: Instant) -> u64 {
-        let elapsed_ms = u64::try_from(now.saturating_duration_since(since).as_millis()).unwrap_or(u64::MAX);
+        let elapsed_us = u64::try_from(now.saturating_duration_since(since).as_micros()).unwrap_or(u64::MAX);
         tokens
-            .saturating_add(elapsed_ms.saturating_mul(u64::from(self.per_second)))
-            .min(self.capacity_milli())
+            .saturating_add(elapsed_us.saturating_mul(u64::from(self.per_second)))
+            .min(self.capacity())
     }
 
     /// Spend one request from `source`'s bucket; `false` when it is empty.
@@ -2394,15 +2434,15 @@ impl RateLimit {
         if !table.contains_key(&key) && table.len() >= RATE_TABLE_MAX {
             // Forget every source whose bucket has refilled: it is
             // indistinguishable from one never seen.
-            let capacity = self.capacity_milli();
+            let capacity = self.capacity();
             table.retain(|_, (tokens, since)| self.refilled(*tokens, *since, now) < capacity);
             if table.len() >= RATE_TABLE_MAX {
                 return false;
             }
         }
-        let (tokens, since) = table.get(&key).copied().unwrap_or((self.capacity_milli(), now));
+        let (tokens, since) = table.get(&key).copied().unwrap_or((self.capacity(), now));
         let available = self.refilled(tokens, since, now);
-        match available.checked_sub(1_000) {
+        match available.checked_sub(Self::REQUEST) {
             Some(left) => {
                 table.insert(key, (left, now));
                 true
@@ -2550,10 +2590,20 @@ fn content_type_allowed(ct: Option<&str>) -> bool {
 /// field values in order and whether the head carries any forwarding header
 /// ([`is_relay_header`]). It is where a connection from a trusted proxy is
 /// re-charged to its client; an `Err` from it is the response.
+/// The two moments `read_request` reports about a request head.
+enum Head<'a> {
+    /// The head is parsed: who the connection is attributed to is decided
+    /// here, before any gate, so the connection limits see every request.
+    Parsed { forwarded: &'a [String], relay_header: bool },
+    /// The Host, Origin and Content-Type gates passed: the access policy
+    /// (API key, request rate) is judged here.
+    Gated { api_key: Option<&'a str> },
+}
+
 fn read_request(
     sock: &mut TcpStream,
     hosts: &HostPolicy,
-    on_head: &mut dyn FnMut(&[String], bool, Option<&str>) -> Result<(), HttpError>,
+    on_head: &mut dyn FnMut(Head<'_>) -> Result<(), HttpError>,
 ) -> Result<Vec<u8>, HttpError> {
     let deadline = Instant::now().checked_add(IO_TIMEOUT)
         .ok_or_else(|| http_err(408, "request deadline out of range"))?;
@@ -2568,14 +2618,14 @@ fn read_request_until(
     hosts: &HostPolicy,
     deadline: Instant,
 ) -> Result<Vec<u8>, HttpError> {
-    read_request_attributed(sock, hosts, deadline, &mut |_, _, _| Ok(()))
+    read_request_attributed(sock, hosts, deadline, &mut |_| Ok(()))
 }
 
 fn read_request_attributed(
     sock: &mut TcpStream,
     hosts: &HostPolicy,
     deadline: Instant,
-    on_head: &mut dyn FnMut(&[String], bool, Option<&str>) -> Result<(), HttpError>,
+    on_head: &mut dyn FnMut(Head<'_>) -> Result<(), HttpError>,
 ) -> Result<Vec<u8>, HttpError> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
@@ -2671,7 +2721,7 @@ fn read_request_attributed(
             forwarded.push(value.to_string());
         }
     }
-    on_head(&forwarded, relay_header, api_key.as_deref())?;
+    on_head(Head::Parsed { forwarded: &forwarded, relay_header })?;
 
     // R1 A3-M4: the browser-request gate, before Content-Length is even
     // consulted — three header comparisons are cheaper than anything past
@@ -2693,6 +2743,7 @@ fn read_request_attributed(
     if !content_type_allowed(content_type.as_deref()) {
         return Err(http_err(415, "Content-Type must be application/json"));
     }
+    on_head(Head::Gated { api_key: api_key.as_deref() })?;
 
     let Some(len) = content_length else {
         return Err(http_err(411, "Content-Length is required"));

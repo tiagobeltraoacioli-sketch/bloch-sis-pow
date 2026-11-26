@@ -359,7 +359,10 @@ mod tests {
         h.update(SEARCH_COUNTER.to_le_bytes());
         let signing_seed: [u8; 32] = h.finalize().into();
         assert_eq!(hex(&signing_seed), SIGNING_SEED_HEX);
-        pqcrypto_internals::with_seeded_rng_scope(&signing_seed, || {
+        // A pinned signature needs a deterministic signer, and the wallet
+        // refuses to sign under a plain seeded scope: this is the explicit
+        // known-answer scope.
+        bloch_crypto::wallet::with_seeded_signing_for_known_answer_tests(&signing_seed, || {
             sign_checked(&mut p, &draft, 5000, root, || Ok(key)).unwrap()
         });
 

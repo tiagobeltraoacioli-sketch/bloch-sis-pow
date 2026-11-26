@@ -332,8 +332,14 @@ impl Wallet {
             // Verify-before-release: a faulty lattice signature can leak key
             // material, so it is checked under this wallet's own public key
             // and withheld on failure (the node keystore already does this).
-            let sig = crypto::hardening::sign_verified(&self.keypair.secret, pubkey, &sighash)
-                .map_err(|e| WalletError::Crypto(e.to_string()))?;
+            let sig = crypto::hardening::sign_verified_with(
+                crypto::sign,
+                signature_verifies_for_release,
+                &self.keypair.secret,
+                pubkey,
+                &sighash,
+            )
+            .map_err(|e| WalletError::Crypto(e.to_string()))?;
             // FIX: consensus verification parses script_sig with
             // `parse_script_sig` (length-prefixed [4B sig_len][sig][4B pk_len]
             // [pk]). This previously wrote a RAW `sig||pubkey`, which
@@ -787,6 +793,55 @@ fn platform_gate(vetted: Result<(), String>, build_opted_in: bool) -> Result<(),
     }
 }
 
+/// The check a wallet signature must pass before it is released: the
+/// compatibility verifier [`Keypair::verify`] exposes, or the spend verifier
+/// with suite 0x0003 enabled.
+///
+/// The second arm is not a loosening. `crypto::sign` signs suite 0x0003
+/// (SLH-DSA-SHAKE-128s ‖ Falcon-1024) keys, and none of the three verifiers
+/// behind `Keypair::verify` knows that suite, so with them alone every correct
+/// 0x0003 signature was withheld as "fault, or mismatched keypair" (audit of
+/// 2026-11-26). Each arm still requires every half of its suite to verify
+/// under the given public key, so a faulty signature passes neither.
+fn signature_verifies_for_release(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    Keypair::verify(public_key, message, signature) || crypto::verify_spend(public_key, message, signature, true)
+}
+
+thread_local! {
+    static SEEDED_SIGNING_FOR_KATS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `operation` under a seeded PQClean scope in which this thread's wallet
+/// signing entry points DO sign. For known-answer fixtures only: a signature
+/// made here is a function of the seed, so two different messages signed
+/// under one seed share Falcon's salt and sampler randomness. Nothing that
+/// signs a real spend may use it. Everything else about wallet signing still
+/// applies inside (the platform rule, verify-before-release).
+///
+/// It exists because a fixture that pins exact signature bytes needs a
+/// deterministic signer, and the plain `with_seeded_rng_scope` is refused by
+/// [`Keypair::sign`] precisely so that it cannot happen by accident.
+pub fn with_seeded_signing_for_known_answer_tests<T>(seed: &[u8; 32], operation: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SEEDED_SIGNING_FOR_KATS.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(SEEDED_SIGNING_FOR_KATS.with(|flag| flag.replace(true)));
+    pqcrypto_internals::with_seeded_rng_scope(seed, operation)
+}
+
+/// One wallet signature under every wallet signing rule, for the wallet's own
+/// modules that hold key bytes rather than a [`Keypair`] (disclosure
+/// bundles): refused on an unvetted platform or under a seeded scope, and
+/// released only if it verifies under `public_key`.
+pub(crate) fn sign_for_wallet(secret_key: &[u8], public_key: &[u8], message: &[u8]) -> Result<Vec<u8>, String> {
+    refuse_seeded_signing()?;
+    crypto::hardening::sign_verified_with(crypto::sign, signature_verifies_for_release, secret_key, public_key, message)
+        .map_err(|e| e.to_string())
+}
+
 /// Wallet signing never runs under a seeded PQClean scope.
 ///
 /// `pqcrypto_internals::with_seeded_rng_scope` exists for key generation. A
@@ -799,7 +854,7 @@ fn refuse_seeded_signing() -> Result<(), String> {
     // The platform rule rides on the same door: both are "this wallet must
     // not produce a signature here", checked before the secret is touched.
     signing_platform_status()?;
-    if pqcrypto_internals::seeded_rng_active() {
+    if pqcrypto_internals::seeded_rng_active() && !SEEDED_SIGNING_FOR_KATS.with(|flag| flag.get()) {
         return Err("refusing to sign inside a seeded RNG scope: wallet signatures must use \
                     fresh randomness (the seeded scope is for key generation only)"
             .into());
@@ -875,7 +930,7 @@ impl Keypair {
     /// verifier [`Self::verify`] exposes. A faulty lattice signature can leak
     /// key material, so on failure it is dropped and never returned.
     fn release_if_valid(&self, msg: &[u8], sig: Vec<u8>) -> Result<Vec<u8>, String> {
-        if Self::verify(&self.public_key, msg, &sig) {
+        if signature_verifies_for_release(&self.public_key, msg, &sig) {
             Ok(sig)
         } else {
             Err(Self::SIGNATURE_WITHHELD.into())
@@ -2042,6 +2097,34 @@ mod verify_before_release {
         });
         assert!(keypair.sign(b"m").is_ok());
         assert!(wallet.sign_tx(tx().unwrap()).is_ok());
+
+        // The explicit known-answer scope signs, deterministically, and ends
+        // with the scope (also when nested inside a plain seeded scope).
+        let a = with_seeded_signing_for_known_answer_tests(&[5u8; 32], || keypair.sign(b"m").unwrap());
+        let b = with_seeded_signing_for_known_answer_tests(&[5u8; 32], || keypair.sign(b"m").unwrap());
+        assert_eq!(a, b);
+        assert!(Keypair::verify(&keypair.public_key, b"m", &a));
+        pqcrypto_internals::with_seeded_rng_scope(&[5u8; 32], || {
+            assert!(with_seeded_signing_for_known_answer_tests(&[6u8; 32], || keypair.sign(b"m")).is_ok());
+            assert!(keypair.sign(b"m").is_err(), "the permission ended with its scope");
+        });
+    }
+
+    /// Audit of 2026-11-26: a suite 0x0003 (SLH-DSA ‖ Falcon) key signs through
+    /// the wallet. Its correct signature used to be withheld, because no
+    /// verifier behind `Keypair::verify` knows that suite. A mismatched 0x0003
+    /// pair is still withheld.
+    #[test]
+    fn suite_0x0003_keys_sign_and_a_mismatched_pair_is_still_withheld() {
+        let (pk, sk) = crypto::slhdsa_suite::generate_keypair_from_seed(&[0x33; 32]).unwrap();
+        let (other_pk, _) = crypto::slhdsa_suite::generate_keypair_from_seed(&[0x34; 32]).unwrap();
+        let msg = [0x5A; 32];
+        let good = Keypair::from_parts(sk.to_vec(), pk.clone(), crypto::address_from_pubkey(&pk, false));
+        let sig = good.sign(&msg).expect("a correct 0x0003 signature is released");
+        assert!(crypto::verify_spend(&pk, &msg, &sig, true));
+        assert!(!Keypair::verify(&pk, &msg, &sig), "the legacy verifiers do not know the suite");
+        let bad = Keypair::from_parts(sk.to_vec(), other_pk.clone(), crypto::address_from_pubkey(&other_pk, false));
+        assert_eq!(bad.sign(&msg).unwrap_err(), Keypair::SIGNATURE_WITHHELD);
     }
 }
 
