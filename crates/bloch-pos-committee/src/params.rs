@@ -1257,6 +1257,18 @@ pub mod rehearsal {
     }
 }
 
+/// The flag day of 2026-12-03 (owner decision 2026-11-25, written at mainnet
+/// epoch 9373: seven days, 630 epochs, rounded up to the next ten). Epoch
+/// 10010 starts at unix 1786656679 + 960 x 10010 = 1796266279, 2026-12-03
+/// 02:51:19 UTC. Three gates share it: [`ANCESTRY_SEED_ACTIVATION_EPOCH`],
+/// [`STAKING_TX_METERING_ACTIVATION_EPOCH`] and
+/// [`STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH`]. Runbook and tag-time
+/// checklist: docs/FLAG-DAY-E10010.md.
+pub const FLAG_DAY_E10010_EPOCH: u64 = 10_010;
+/// Where the `flag-day-e10010-rehearsal` qualification build puts the same
+/// three gates: the third epoch of a chain started at genesis.
+pub const FLAG_DAY_E10010_REHEARSAL_EPOCH: u64 = 2;
+
 /// Flag day for the **seed look-ahead** (`CommittedState::seed_for_epoch`).
 ///
 /// Below this epoch the seed for `E` is the mix at the close of `E − 1` — the
@@ -1294,7 +1306,15 @@ pub mod rehearsal {
 /// never fired, and it fails SILENTLY. The gate reads the epoch derived from the
 /// BLOCK, never a local clock: reading node-local mutable state is what caused
 /// the 2026-08-08 `expected_bits` consensus split.
-pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = u64::MAX;
+///
+/// ARMED at 10010 ([`FLAG_DAY_E10010_EPOCH`], owner decision 2026-11-25,
+/// docs/FLAG-DAY-E10010.md). `the_replay_compatibility_gates_are_inert_until_armed`
+/// pins the value.
+#[cfg(not(feature = "flag-day-e10010-rehearsal"))]
+pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = FLAG_DAY_E10010_EPOCH;
+/// QUALIFICATION BUILD (`flag-day-e10010-rehearsal`): armed at epoch 2.
+#[cfg(feature = "flag-day-e10010-rehearsal")]
+pub const ANCESTRY_SEED_ACTIVATION_EPOCH: u64 = FLAG_DAY_E10010_REHEARSAL_EPOCH;
 
 /// Flag day for **inactivity-leak recovery and the quorum-denominator floor**
 /// ([`INACTIVITY_LEAK_RECOVERY_QUOTIENT`], [`MIN_QUORUM_DENOMINATOR_NUM`]).
@@ -2093,9 +2113,14 @@ pub const FORKCHOICE_EQUIVOCATION_HORIZON_SLOTS: u64 = SLOTS_PER_EPOCH;
 /// the old rules accepted may now hit `BlockGasLimitExceeded` or
 /// `BlockByteLimitExceeded` on staking bytes alone) on a body the old rules
 /// accept, so the whole fleet must run a binary carrying this rule before
-/// any epoch is named. Ships INERT at `u64::MAX`;
-/// `staking_tx_metering_gate_is_inert` pins the value.
-pub const STAKING_TX_METERING_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// any epoch is named. ARMED at 10010 ([`FLAG_DAY_E10010_EPOCH`], owner
+/// decision 2026-11-25, docs/FLAG-DAY-E10010.md; it shipped inert at
+/// `u64::MAX`); `staking_tx_metering_gate_is_inert` pins the armed value.
+#[cfg(not(feature = "flag-day-e10010-rehearsal"))]
+pub const STAKING_TX_METERING_ACTIVATION_EPOCH: u64 = FLAG_DAY_E10010_EPOCH;
+/// QUALIFICATION BUILD (`flag-day-e10010-rehearsal`): armed at epoch 2.
+#[cfg(feature = "flag-day-e10010-rehearsal")]
+pub const STAKING_TX_METERING_ACTIVATION_EPOCH: u64 = FLAG_DAY_E10010_REHEARSAL_EPOCH;
 
 /// HF3 flag day for the optional signature suite 0x0003
 /// (SLH-DSA-SHAKE-128s ‖ Falcon-1024; suite 0x0001 stays the default). In
@@ -2426,9 +2451,14 @@ pub fn sig_canonical_active(epoch: u64) -> bool {
 /// epoch onward, so the whole fleet must run a binary that carries this rule
 /// first. Any verifier outside this repository that checks static-key duty
 /// signatures (light-client guests, bridges) must carry it too. Wallets and
-/// exchanges are not affected. Ships INERT at `u64::MAX`;
-/// `static_key_network_binding_gate_is_inert` pins the value.
-pub const STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = u64::MAX;
+/// exchanges are not affected. ARMED at 10010 ([`FLAG_DAY_E10010_EPOCH`],
+/// owner decision 2026-11-25, docs/FLAG-DAY-E10010.md);
+/// `static_key_network_binding_gate_is_inert` pins the armed value.
+#[cfg(not(feature = "flag-day-e10010-rehearsal"))]
+pub const STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = FLAG_DAY_E10010_EPOCH;
+/// QUALIFICATION BUILD (`flag-day-e10010-rehearsal`): armed at epoch 2.
+#[cfg(feature = "flag-day-e10010-rehearsal")]
+pub const STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH: u64 = FLAG_DAY_E10010_REHEARSAL_EPOCH;
 
 #[cfg(test)]
 thread_local! {

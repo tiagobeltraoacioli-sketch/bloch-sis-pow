@@ -1400,17 +1400,25 @@ mod static_network_binding_tests {
         h(&[STATIC_KEY, message]).to_vec()
     }
 
-    /// TRIPWIRE. Arming is a founder decision and a validator-facing flag
-    /// day (read the constant's docs). Whoever arms it updates this test in
-    /// the same commit.
+    /// TRIPWIRE. Armed at 10010 (owner decision 2026-11-25, the 2026-12-03
+    /// flag day, docs/FLAG-DAY-E10010.md). The name is kept as the tripwire's
+    /// handle; what it pins is the armed epoch and the rule on both sides of
+    /// it. Changing the epoch is a flag day: update this in the same commit.
     #[test]
     fn static_key_network_binding_gate_is_inert() {
-        assert_eq!(crate::params::STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH, u64::MAX);
-        for epoch in [0, 1, 8_620, 1_000_000, u64::MAX - 1, u64::MAX] {
-            assert!(!crate::params::static_key_network_binding_active(epoch), "{epoch}");
-            // Inert: the static key signs the bare root, with or without a domain.
-            assert_eq!(static_message(Some(HERE), 4, epoch, &[9; 32]), Some([9; 32]));
-            assert_eq!(static_message(None, 4, epoch, &[9; 32]), Some([9; 32]));
+        assert_eq!(crate::params::STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH, 10_010);
+        for epoch in [0, 1, 8_620, 10_009, 10_010, 1_000_000, u64::MAX - 1, u64::MAX] {
+            let armed = epoch >= 10_010;
+            assert_eq!(crate::params::static_key_network_binding_active(epoch), armed, "{epoch}");
+            if armed {
+                // Bound to the network, and refused when none is named.
+                assert_ne!(static_message(Some(HERE), 4, epoch, &[9; 32]), Some([9; 32]));
+                assert_eq!(static_message(None, 4, epoch, &[9; 32]), None);
+            } else {
+                // Below: the static key signs the bare root, with or without a domain.
+                assert_eq!(static_message(Some(HERE), 4, epoch, &[9; 32]), Some([9; 32]));
+                assert_eq!(static_message(None, 4, epoch, &[9; 32]), Some([9; 32]));
+            }
         }
     }
 

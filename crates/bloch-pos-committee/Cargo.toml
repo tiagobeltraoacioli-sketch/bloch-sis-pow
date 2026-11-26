@@ -46,6 +46,12 @@ l2-activation-rehearsal-mainnet-policy = ["l2-activation-rehearsal"]
 # params::MLDSA_PIN_ACTIVATION_EPOCH = 0 so a full-history replay judges every
 # ML-DSA half with the pinned FIPS 204 verifier. Replay copies only; never ship.
 mldsa-pin-replay-qualification = []
+# QUALIFICATION BUILDS ONLY, never ship it. Moves the three gates of the
+# 2026-12-03 flag day (docs/FLAG-DAY-E10010.md: ANCESTRY_SEED,
+# STAKING_TX_METERING, STATIC_KEY_NETWORK_BINDING) from epoch 10010 to epoch 2,
+# so a test chain that starts at genesis crosses the boundary in its third
+# epoch and the rules are exercised on both sides of it.
+flag-day-e10010-rehearsal = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }

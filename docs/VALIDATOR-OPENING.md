@@ -45,9 +45,10 @@ Implementation reference: `21a9311` (ADR-041), merged in `22b8b7f`.
 - The lifecycle boundary also makes every lifecycle transaction consume the
   existing block gas and byte budgets. This includes `ExitV2`,
   `RandaoRecommit`, and `SlashingEvidence`, even though the standalone
-  `STAKING_TX_METERING_ACTIVATION_EPOCH` remains inert: the charge deliberately
-  opens when `WITHDRAWAL_ACTIVATION_EPOCH` opens. This does not charge a money
-  fee and does not add a transaction-count cap.
+  `STAKING_TX_METERING_ACTIVATION_EPOCH` was still inert at that boundary: the
+  charge deliberately opens when `WITHDRAWAL_ACTIVATION_EPOCH` opens. This does
+  not charge a money fee. The transaction-count cap is separate: it comes with
+  the standalone gate, armed at epoch 10010 (`docs/FLAG-DAY-E10010.md`).
 
 These are implementation findings, not deployment or independent-audit claims.
 The September 8 admission review describes an older base; its reproductions

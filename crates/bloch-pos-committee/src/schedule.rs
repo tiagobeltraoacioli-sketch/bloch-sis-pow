@@ -50,8 +50,9 @@
 //!   it uses the close of `E − 1 − MIN_SEED_LOOKAHEAD_EPOCHS` (see
 //!   [`crate::committees::MIN_SEED_LOOKAHEAD_EPOCHS`]), widening the exposure
 //!   window to about two epochs (~32 min) but preventing proposers in `E − 1`
-//!   from re-sorting epoch `E`. The gate is `u64::MAX` in this source, so the
-//!   second rule is not active in a shipped build. This module will happily
+//!   from re-sorting epoch `E`. The gate is armed at epoch 10010 in this source
+//!   (docs/FLAG-DAY-E10010.md), so the second rule is active from that epoch
+//!   on and the first governs every epoch below it. This module will happily
 //!   compute any epoch you hand it a mix for — selecting the correct mix is the
 //!   transition's job, not a capability hidden by the scheduler.
 //! - **A proposer is an index, not a network address.** Everything returned

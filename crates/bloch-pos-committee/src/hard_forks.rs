@@ -603,9 +603,22 @@ mod tests {
         assert!(check_gates_above_anchored_history(&[("params::A_EPOCH", M)], M).is_ok());
         // As shipped: the two gates armed at 8620 left the list when the
         // release anchor was re-baked at epoch 8742 (the list's maintenance
-        // rule), so no listed gate is armed and any anchor passes.
+        // rule). Three listed gates are armed at 10010 (the 2026-12-03 flag
+        // day, docs/FLAG-DAY-E10010.md): above the 8742 anchor, so it passes,
+        // and an anchor re-baked at or past 10010 before they leave the list
+        // is refused.
         assert!(check_gates_above_anchored_history(GATES_UNARMED_IN_CANONICAL_HISTORY, 8_742).is_ok());
-        assert_eq!(gates_armed_at_or_below(GATES_UNARMED_IN_CANONICAL_HISTORY, M - 1), []);
+        assert!(check_gates_above_anchored_history(GATES_UNARMED_IN_CANONICAL_HISTORY, 10_009).is_ok());
+        assert!(check_gates_above_anchored_history(GATES_UNARMED_IN_CANONICAL_HISTORY, 10_010).is_err());
+        assert_eq!(gates_armed_at_or_below(GATES_UNARMED_IN_CANONICAL_HISTORY, 10_009), []);
+        assert_eq!(
+            gates_armed_at_or_below(GATES_UNARMED_IN_CANONICAL_HISTORY, M - 1),
+            [
+                ("params::ANCESTRY_SEED_ACTIVATION_EPOCH", 10_010),
+                ("params::STAKING_TX_METERING_ACTIVATION_EPOCH", 10_010),
+                ("params::STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH", 10_010),
+            ]
+        );
         for gone in ["params::ATTESTATION_SLOT_EPOCH_BINDING_ACTIVATION_EPOCH", "params::KES_FIRST_KEY_FLOOR_ACTIVATION_EPOCH"] {
             assert!(GATES_UNARMED_IN_CANONICAL_HISTORY.iter().all(|(name, _)| *name != gone), "{gone}");
         }

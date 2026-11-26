@@ -126,14 +126,25 @@ fn the_duty_signer_produces_bound_leaf_signatures_consensus_accepts() {
 }
 
 /// The block-admission proof cache is keyed by the same authority before
-/// enforcement as it always was: SHA3 of the static key.
+/// enforcement as it always was: SHA3 of the static key. From the static-key
+/// network binding (epoch 10010, docs/FLAG-DAY-E10010.md) the static
+/// authority also names the network, so no verdict cached under the bare-root
+/// rule is reused across that gate.
 #[test]
 fn the_block_admission_authority_is_the_static_key_hash_while_unarmed() {
     let (engine, _dir) = perf_support::proposing_engine();
     let pk = KeyLookup::pubkey(&*engine.state, 0).unwrap().to_vec();
     let expected: [u8; 32] = Sha3_256::digest(&pk).into();
-    for epoch in [0, 1, 1 << 40] {
-        assert_eq!(kes::authority_fingerprint(&*engine.state, 0, epoch), Some(expected));
+    let gate = bloch_pos_committee::params::STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH;
+    if gate > 1 {
+        for epoch in [0, 1, gate - 1] {
+            assert_eq!(kes::authority_fingerprint(&*engine.state, 0, epoch), Some(expected));
+        }
+    }
+    for epoch in [gate, 1 << 40] {
+        let bound = kes::authority_fingerprint(&*engine.state, 0, epoch);
+        assert!(bound.is_some() && bound != Some(expected), "{epoch}");
+        assert_eq!(bound, kes::authority_fingerprint(&*engine.state, 0, gate));
     }
     assert_eq!(kes::authority_fingerprint(&*engine.state, 99, 0), None);
 }

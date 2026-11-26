@@ -8151,15 +8151,26 @@ mod tests {
         }
     }
 
+    /// Armed at 10010 (the 2026-12-03 flag day, docs/FLAG-DAY-E10010.md):
+    /// the last epoch below it reads the close of `E − 1`, the first epoch at
+    /// it reads the close of `E − 2`, and so does every later one. (Before
+    /// arming this test pinned the closed gate at the synthetic boundary.)
     #[test]
     fn the_unarmed_ancestry_seed_gate_stays_closed_at_the_synthetic_boundary() {
         let (_transition, mut state, _chains) = setup(4);
         let legacy_mix = [0xA1; 32];
         let gated_mix = [0xB2; 32];
-        state.boundary_mixes.insert(u64::MAX - 1, legacy_mix);
-        state.boundary_mixes.insert(u64::MAX - 2, gated_mix);
+        state.boundary_mixes.insert(10_008, legacy_mix);
+        state.boundary_mixes.insert(10_007, [0xC3; 32]);
+        assert_eq!(state.seed_for_epoch(10_009), legacy_mix, "below the gate: the close of E - 1");
 
-        assert_eq!(state.seed_for_epoch(u64::MAX), legacy_mix);
+        state.boundary_mixes.insert(10_009, [0xD4; 32]);
+        assert_eq!(state.seed_for_epoch(10_010), legacy_mix, "at the gate: the close of E - 2 = 10008");
+        assert_eq!(state.seed_for_epoch(10_011), [0xD4; 32], "past the gate: the close of E - 2 = 10009");
+
+        state.boundary_mixes.insert(u64::MAX - 1, [0xE5; 32]);
+        state.boundary_mixes.insert(u64::MAX - 2, gated_mix);
+        assert_eq!(state.seed_for_epoch(u64::MAX), gated_mix);
     }
 
     /// **The retention claim, tested rather than argued.**
@@ -8547,8 +8558,19 @@ mod tests {
                 .unwrap_or([0; 32]);
                 return kes_rules::toy_kes_sign(p, period, &message);
             }
+            // The static key signs what `kes::static_message` says it signs:
+            // the bare root below the network-binding gate (every epoch a
+            // shipped build's fixtures reach), the root bound to the network
+            // and the proposer from it on (the rehearsal build crosses it).
+            let message = crate::kes::static_message(
+                crate::attestation::KeyLookup::kes_network_domain(pre),
+                p,
+                crate::epoch_of(h.slot),
+                &h.proposal_signing_root(),
+            )
+            .unwrap_or([0; 32]);
             match crate::attestation::KeyLookup::pubkey(pre, p) {
-                Some(pk) => toy_sign(pk, &h.proposal_signing_root()),
+                Some(pk) => toy_sign(pk, &message),
                 // A fixture whose registry has no such index: leave the stub
                 // and let the transition reject it, which is the honest
                 // outcome rather than a silently-passing block.
@@ -9137,13 +9159,16 @@ mod tests {
             ("transaction bytes", CommittedState::tx_bytes_bound_active(epoch)),
             ("attestation dedup", CommittedState::attestation_dedup_active(epoch)),
             ("rewards v2", CommittedState::rewards_v2_active(epoch)),
-            ("staking metering", CommittedState::staking_tx_metering_active(epoch)),
             ("sighash network binding", CommittedState::sighash_network_binding_active(epoch)),
         ];
 
         for (name, active) in verdicts {
             assert!(!active, "the {name} gate must treat MAX as an unarmed sentinel");
         }
+        // Staking metering left this list when it was armed at 10010
+        // (docs/FLAG-DAY-E10010.md); `staking_tx_metering_gate_is_inert`
+        // pins its epoch.
+        assert!(CommittedState::staking_tx_metering_active(epoch));
     }
 
     // -- REWARDS_V2_ACTIVATION_EPOCH (audit R1 M1 + M3 + M4, R7 M5) ----------
@@ -9896,20 +9921,24 @@ mod tests {
     /// post-gate block can hit `BlockGasLimitExceeded`/`BlockByteLimitExceeded`
     /// on a shape that used to be free. Whoever arms it deletes this test
     /// first, and reads the constant's docs while doing so.
+    ///
+    /// ARMED at 10010 (owner decision 2026-11-25, the 2026-12-03 flag day,
+    /// docs/FLAG-DAY-E10010.md). The name is kept as the tripwire's handle;
+    /// changing the epoch is a flag day and updates this in the same commit.
     #[test]
     fn staking_tx_metering_gate_is_inert() {
         assert_eq!(
             crate::params::STAKING_TX_METERING_ACTIVATION_EPOCH,
-            u64::MAX,
-            "arming staking-tx metering is a flag day; read the constant's docs",
+            10_010,
+            "re-arming staking-tx metering is a flag day; read the constant's docs",
         );
     }
 
     /// Same shape as every other gate's function-of-the-epoch-alone test.
     #[test]
     fn the_staking_tx_metering_gate_is_a_function_of_the_block_epoch_alone() {
-        for e in [0u64, 1, 1_766, 100_000, u64::MAX - 1, u64::MAX] {
-            assert!(!CommittedState::staking_tx_metering_active(e), "epoch {e} must be below");
+        for e in [0u64, 1, 1_766, 10_009, 10_010, 100_000, u64::MAX - 1, u64::MAX] {
+            assert_eq!(CommittedState::staking_tx_metering_active(e), e >= 10_010, "epoch {e}");
         }
     }
 
@@ -9923,7 +9952,9 @@ mod tests {
     #[test]
     fn lifecycle_gate_also_activates_staking_capacity_metering() {
         let gate = crate::params::WITHDRAWAL_ACTIVATION_EPOCH;
-        assert_eq!(crate::params::STAKING_TX_METERING_ACTIVATION_EPOCH, u64::MAX);
+        // The standalone metering gate is armed later (10010), so the
+        // lifecycle boundary below is still the one that starts the charge.
+        assert!(crate::params::STAKING_TX_METERING_ACTIVATION_EPOCH > gate);
 
         let before = CommittedState::staking_tx_charge(gate - 1, 1, 123);
         assert_eq!(before.gas, 0);
@@ -16620,12 +16651,16 @@ mod tests {
         // LEAK_RECOVERY_ACTIVATION_EPOCH left this list when it was scheduled;
         // after the epoch-2700 deadline was missed, the replacement tripwire
         // below pinned it to epoch 2880.
+        //
+        // ANCESTRY_SEED_ACTIVATION_EPOCH is armed at 10010 by owner decision
+        // of 2026-11-25: strictly in the future at writing (mainnet epoch
+        // 9373), and the runbook is docs/FLAG-DAY-E10010.md.
         for (name, value) in [
             ("ANCESTRY_SEED_ACTIVATION_EPOCH", crate::params::ANCESTRY_SEED_ACTIVATION_EPOCH),
         ] {
             assert_eq!(
                 value,
-                u64::MAX,
+                10_010,
                 "{name} has been armed. That is a deliberate act and it needs three things \
                  before this assertion may be updated: (1) the epoch must be STRICTLY IN THE \
                  FUTURE at tag time — an epoch already past arms silently and applies the rule \

@@ -18864,11 +18864,14 @@ mod duty_view_anchor {
     /// binary (`98d8fb06`) and the `assert_eq!` on the seeds fails.
     #[test]
     fn the_attester_and_the_judge_draw_the_same_committee_below_the_flag_day() {
-        assert_eq!(
-            bloch_pos_committee::params::ANCESTRY_SEED_ACTIVATION_EPOCH,
-            u64::MAX,
-            "this test describes the PRE-flag-day regime; if the gate has been armed, the              agreement it pins has to be re-derived rather than assumed"
-        );
+        // The gate is armed at 10010 (docs/FLAG-DAY-E10010.md). This fixture
+        // reaches epoch 3, so in a shipped build it is still the PRE-flag-day
+        // regime it describes; the regime above the gate is pinned by
+        // `the_attester_and_the_judge_agree_on_both_sides_of_the_flag_day`,
+        // which the rehearsal build drives across the boundary.
+        if bloch_pos_committee::params::ANCESTRY_SEED_ACTIVATION_EPOCH <= 3 {
+            return;
+        }
 
         let (mut engine, _dir) = engine_with_registry(8);
         for slot in 1..=(SLOTS_PER_EPOCH * 3) {
@@ -18906,6 +18909,63 @@ mod duty_view_anchor {
                 committees::committee_for_slot(&judge_seed, slot, &roster),
                 "slot {slot}: attester and judge disagree on who is in the committee"
             );
+        }
+    }
+
+    /// **The same agreement, on both sides of the flag day.**
+    ///
+    /// `the_attester_and_the_judge_draw_the_same_committee_below_the_flag_day`
+    /// says that an armed gate needs the agreement re-derived, not assumed.
+    /// This is that derivation: one chain, grown epoch by epoch, with the
+    /// seed a validator attests under compared at every epoch with the seed
+    /// its peers judge it against.
+    ///
+    /// In a shipped build every epoch it reaches is below the gate (10010).
+    /// In the `flag-day-e10010-rehearsal` build the three gates of that flag
+    /// day are at epoch 2, so the chain crosses them: the proposer draw moves
+    /// to the look-ahead seed, the static key starts signing the
+    /// network-bound message, and the transaction-count bound is in force.
+    /// The head advancing through every epoch is the proof that producer and
+    /// transition agree about all three, because `propose` adopts a block
+    /// only after the real transition accepted it.
+    #[test]
+    fn the_attester_and_the_judge_agree_on_both_sides_of_the_flag_day() {
+        let gate = bloch_pos_committee::params::ANCESTRY_SEED_ACTIVATION_EPOCH;
+        let (mut engine, _dir) = engine_with_registry(8);
+        let last_epoch = 6u64;
+        for e in 0..=last_epoch {
+            for slot in (e * SLOTS_PER_EPOCH).max(1)..(e + 1) * SLOTS_PER_EPOCH {
+                engine.propose(slot);
+            }
+            let head_epoch = epoch_of(engine.state.slot());
+            assert_eq!(
+                head_epoch, e,
+                "the chain stopped growing in epoch {e} (gate at {gate}): this node's own blocks are \
+                 no longer adopted, so producer and transition disagree"
+            );
+            let rolled = engine.rolled_to(e);
+            let roster = rolled.active_validators();
+            let attester_seed = Engine::seed_for(&rolled, e);
+            let target = engine.checkpoint_root(e);
+            let judge_seed = engine
+                .seed_for_attestation(&target, e)
+                .expect("the checkpoint of this node's own epoch is on its own branch");
+            assert_eq!(
+                attester_seed, judge_seed,
+                "epoch {e} (gate at {gate}): attester and judge read different boundaries"
+            );
+            for slot in e * SLOTS_PER_EPOCH..(e + 1) * SLOTS_PER_EPOCH {
+                assert_eq!(
+                    committees::committee_for_slot(&attester_seed, slot, &roster),
+                    committees::committee_for_slot(&judge_seed, slot, &roster),
+                    "slot {slot}: attester and judge disagree on who is in the committee"
+                );
+            }
+        }
+        if cfg!(feature = "flag-day-e10010-rehearsal") {
+            assert!(gate <= last_epoch, "the rehearsal build must cross the gate (at {gate})");
+        } else {
+            assert!(gate > last_epoch, "a shipped build reaches the gate only at {gate}");
         }
     }
 }
@@ -21137,18 +21197,31 @@ mod ingest_admission_tests {
             assert!(!msg.contains("A_EPOCH") && !msg.contains("C_EPOCH"), "{msg}");
             assert!(msg.contains("re-released with a future epoch"), "{msg}");
         }
-        // As shipped no listed gate is armed: the two armed 2026-11-13 at
-        // 8620 left the list when the release anchor was re-baked at epoch
-        // 8742, so the message is the plain one at every epoch.
-        for epoch in [8_619, 8_620, 8_742, M - 1] {
+        // As shipped: the two gates armed 2026-11-13 at 8620 left the list
+        // when the release anchor was re-baked at epoch 8742, and three are
+        // armed at 10010 (docs/FLAG-DAY-E10010.md). Below 10010 the message
+        // is the plain one; from it on the three are named.
+        for epoch in [8_619, 8_620, 8_742, 10_009] {
             assert_eq!(replay_failure_message(epoch), plain, "{epoch}");
         }
-        assert!(
+        for epoch in [10_010, M - 1] {
+            let msg = replay_failure_message(epoch);
+            assert!(msg.starts_with(plain), "{msg}");
+            for gate in [
+                "params::ANCESTRY_SEED_ACTIVATION_EPOCH = 10010",
+                "params::STAKING_TX_METERING_ACTIVATION_EPOCH = 10010",
+                "params::STATIC_KEY_NETWORK_BINDING_ACTIVATION_EPOCH = 10010",
+            ] {
+                assert!(msg.contains(gate), "{epoch}: {msg}");
+            }
+        }
+        assert_eq!(
             bloch_pos_committee::hard_forks::gates_armed_at_or_below(
                 bloch_pos_committee::hard_forks::GATES_UNARMED_IN_CANONICAL_HISTORY,
                 M - 1
             )
-            .is_empty()
+            .len(),
+            3
         );
         // Wiring: the production message is the tested one over the
         // canonical list, and boot replay fails with it.

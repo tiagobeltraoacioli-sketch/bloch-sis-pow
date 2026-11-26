@@ -58,8 +58,11 @@ fn fc14_source_prose_matches_the_live_protocol_shape() {
             "{name} describes seed selection without naming its activation gate"
         );
     }
+    // The gate was armed at 10010 (docs/FLAG-DAY-E10010.md); the prose must
+    // still say the look-ahead is gated, now with the epoch it starts at.
     assert!(
-        schedule.contains("second rule is not active in a shipped build"),
+        schedule.contains("second rule is active from that epoch")
+            && schedule.contains("first governs every epoch below it"),
         "schedule.rs again presents the post-F6 look-ahead as unconditional"
     );
     assert!(

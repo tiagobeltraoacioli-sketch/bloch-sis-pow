@@ -65,6 +65,8 @@ l2-activation-rehearsal-mainnet-policy = ["l2-activation-rehearsal", "bloch-pos-
 # QUALIFICATION BUILDS ONLY; see bloch-pos-committee (full-history replay
 # under the pinned ML-DSA rule, params::MLDSA_PIN_ACTIVATION_EPOCH docs).
 mldsa-pin-replay-qualification = ["bloch-pos-committee/mldsa-pin-replay-qualification"]
+# QUALIFICATION BUILDS ONLY, never ship it: see the committee feature.
+flag-day-e10010-rehearsal = ["bloch-pos-committee/flag-day-e10010-rehearsal"]
 # Weak-subjectivity anchors without recurring signatures (agents 208, 242).
 # OFF by default: without either feature the node behaves as fa980367.
 #
