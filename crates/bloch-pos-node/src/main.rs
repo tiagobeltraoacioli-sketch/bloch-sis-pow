@@ -1909,6 +1909,18 @@ pub(crate) fn decide_transport(args: &[String]) -> Result<TransportPlan, String>
     }
 
     let mut warnings = Vec::new();
+    if runs_libp2p {
+        // Review P3: said once per boot, so nobody reads "encrypted" as
+        // "post-quantum". The libp2p handshake is Noise over X25519; the
+        // hybrid ML-KEM-768 + X25519 handshake is on the TCP mesh.
+        warnings.push(
+            "libp2p sessions are encrypted with Noise over X25519 only, which is NOT post-quantum: \
+             traffic recorded today can be decrypted by a future quantum adversary. Blocks and votes \
+             stay protected by their own hybrid signatures. The post-quantum transport is the TCP mesh \
+             with --mesh-security require (ML-KEM-768 + X25519, ML-DSA-65 identities)"
+                .to_string(),
+        );
+    }
     if !runs_libp2p {
         for f in ["--max-peers", "--behind-proxy"] {
             if present(f) {
@@ -2543,6 +2555,14 @@ mod transport_tests {
         let plan = decide_transport(&argv("--transport devnet --listen 16400 --max-peers 32 --behind-proxy")).unwrap();
         assert_eq!(plan.transport, engine::Transport::Devnet);
         assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
+        // P3: a plan that runs libp2p says its key exchange is classical; a
+        // devnet-only plan does not carry that line.
+        for transport in ["libp2p", "dual --listen 16400"] {
+            let plan = decide_transport(&argv(&format!("--transport {transport}"))).unwrap();
+            assert!(plan.warnings.iter().any(|w| w.contains("NOT post-quantum")), "{transport}: {:?}", plan.warnings);
+        }
+        let devnet = decide_transport(&argv("--transport devnet --listen 16400")).unwrap();
+        assert!(devnet.warnings.iter().all(|w| !w.contains("post-quantum")), "{:?}", devnet.warnings);
         assert!(plan.warnings.iter().any(|w| w.contains("--max-peers")));
         assert!(plan.warnings.iter().any(|w| w.contains("--behind-proxy")));
     }

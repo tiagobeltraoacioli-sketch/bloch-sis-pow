@@ -3862,6 +3862,16 @@ impl CommittedState {
                 state.apply(settlement, *self.head.as_bytes(), self.slot, asynchronous, verifier).map_err(TxReject::L2Settlement)?;
                 // Protocol-only empty-inbox transaction: no synthetic fee credit.
                 // One verification reserves the complete block gas budget.
+                //
+                // Review B8 asked whether that is a monopoly that should be
+                // metered down. Measured (2026-11-25, aarch64, release): one
+                // SP1 Groth16 verification takes about 0.49 s against 0.2 ms
+                // for one hybrid signature verification, a ratio near 2,370.
+                // At `HYBRID_VERIFY_GAS` that is roughly 170 M gas, almost
+                // three times `BLOCK_GAS_LIMIT`. Charging what is used, the
+                // rule Ethereum and Solana price by, therefore gives the whole
+                // block: this charge is a floor on the real cost, not a
+                // surcharge. It can come down only when the verifier does.
                 Ok(fee_market::TxCharge { gas: fee_market::BLOCK_GAS_LIMIT,
                     tx_bytes: settlement.wire_len() as u64,
                     base_fee_sat: 0, priority_fee_sat: 0 })
